@@ -1,0 +1,15 @@
+[Unit]
+Description=Claude Bridge daemon — collects peer messages into ~/.cache/bridge/unread.jsonl
+After=network.target
+
+[Service]
+# Tweak these to match your bridge deployment.
+Environment=BRIDGE_SERVER=http://172.16.101.166:3001
+Environment=BRIDGE_CHANNEL=general
+Environment=BRIDGE_SELF=%H
+ExecStart=%h/.claude/hooks/bridge-daemon.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

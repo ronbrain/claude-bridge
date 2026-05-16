@@ -5,12 +5,13 @@ instances talk to each other in real time. One instance shares an
 endpoint or a finding, the other reads it on its next tick — no manual
 copy-paste between terminals.
 
-The repo ships two binaries:
+The repo ships three binaries:
 
 | Binary | Role |
 |---|---|
-| `bridge-server` | Central HTTP relay. Holds the channel state (messages, endpoints, findings). One per topology. |
-| `bridge-mcp` | Stdio MCP client. Each Claude Code instance runs one, points it at the server, exposes five tools to the model. |
+| `bridge-server` | Central HTTP relay. Holds messages, findings, artifacts, and presence state for every channel. One per topology. |
+| `bridge-mcp` | Stdio MCP client. Each Claude Code instance runs one, points it at the server, exposes nine tools to the model. |
+| `bridge` | Human CLI — talk to a channel from your terminal without spawning a Claude session. Same env-var contract as `bridge-mcp`. |
 
 ## Build
 
@@ -18,7 +19,11 @@ The repo ships two binaries:
 git clone https://github.com/ronbrain/claude-bridge.git
 cd claude-bridge
 cargo build --release
-sudo install -m 755 target/release/bridge-server target/release/bridge-mcp /usr/local/bin/
+sudo install -m 755 \
+  target/release/bridge-server \
+  target/release/bridge-mcp \
+  target/release/bridge \
+  /usr/local/bin/
 ```
 
 The binaries are static enough to copy between Linux x86_64 boxes
@@ -145,18 +150,85 @@ claude mcp add -s user bridge /usr/local/bin/bridge-mcp -- \
 Now both Claude Code instances see the same five tools on the
 `pentest` channel.
 
+## `bridge` CLI for humans
+
+When you want to participate from the terminal without spinning up a
+Claude session — quick check on the channel, send a note, run a
+triage from your editor — use the `bridge` binary. Same env-var
+contract as `bridge-mcp`:
+
+```sh
+export BRIDGE_SERVER=http://172.16.101.166:3001
+export BRIDGE_CHANNEL=general
+export BRIDGE_SELF=$(hostname)
+```
+
+```sh
+bridge send "deploying fix in 10"
+bridge tail 20
+bridge tail 50 --from saas --since 1778800000
+bridge peers
+bridge findings --status open --severity critical
+bridge triage <finding-id> fixed --note "shipped in v1.2.3"
+bridge upload ./poc.txt --notes "minimum repro for SQLi"
+bridge clear
+```
+
+Each subcommand has `--help` with the full flag list.
+
 ## Tools exposed to Claude
+
+Nine tools. All accept an optional `channel` arg to override the
+default for one call.
 
 | Tool | Purpose | Required args |
 |---|---|---|
 | `send_message` | Free-form note to the channel | `content` |
-| `read_messages` | Read everything in the channel | — |
-| `share_endpoint` | Hand off an HTTP endpoint for the other instance to test | `url`, `method` |
-| `report_finding` | Log a security finding with severity | `title`, `severity`, `detail` |
-| `clear_channel` | Reset the channel | — |
+| `read_messages` | Read recent messages; supports `since`, `from`, `limit` filters | — |
+| `list_peers` | Who's connected right now (heartbeat ≤120s) | — |
+| `share_endpoint` | Hand off an HTTP endpoint for the peer to test | `url`, `method` |
+| `report_finding` | Log a structured finding (separate stream from chat) | `title`, `severity`, `detail` |
+| `list_findings` | Query findings by `severity` / `status` / `from` | — |
+| `triage_finding` | Update a finding's status (`open` → `triaged` → `fixed`/`wontfix`) | `id`, `status` |
+| `share_artifact` | Upload a small file (≤10 MB) and share its download URL | `filename`, `content` |
+| `clear_channel` | Wipe message history (findings + artifacts survive) | — |
 
-All accept an optional `channel` arg to override the default for one
-call.
+### Findings lifecycle
+
+`report_finding` creates a `{status: open}` record in the findings
+stream and drops a chat ping so the peer's watcher wakes them. From
+there:
+
+```
+report_finding (open) → list_findings (triage queue) → triage_finding
+                                                       (open|triaged|fixed|wontfix)
+```
+
+`list_findings` filters compose:
+
+```
+list_findings(status: "open")                  # everything not yet acted on
+list_findings(severity: "critical")            # only criticals
+list_findings(status: "fixed", from: "saas")   # what saas has shipped
+```
+
+### Artifacts
+
+For payloads larger than fits comfortably in a chat message (request
+dumps, screenshots, pcap snippets, PoC scripts), use
+`share_artifact` instead of inlining:
+
+```
+share_artifact(
+  filename: "sqli-poc.sh",
+  content:  "#!/bin/sh\ncurl -X POST https://api.example.com/login -d 'a OR 1=1'",
+  notes:    "minimum repro for finding fe…",
+)
+```
+
+Hard cap 10 MB per artifact, 200 artifacts in memory globally
+(LRU-evicted by `created_at`). Use a presigned S3 / object-storage
+URL via `share_endpoint` for anything bigger.
 
 ### Typical usage
 
@@ -271,9 +343,77 @@ wait
 
 Caveat: the watcher only listens between turns. While Claude is
 actively processing your prompt, an incoming message doesn't wake
-anything (Claude is already awake). It'll surface on the next
-`read_messages` call — the bridge server keeps in-memory history
-until restart.
+anything (Claude is already awake). For full coverage during busy
+turns too, layer the daemon below.
+
+### Daemon — catches messages during busy turns
+
+The watcher above only listens when Claude is idle. The daemon
+variant runs as a systemd user service, long-polls the SSE stream
+forever, and appends new peer messages to
+`~/.cache/bridge/unread.jsonl`. A companion `UserPromptSubmit` hook
+drains that file at the start of every user turn — so even if a
+message arrived while Claude was mid-edit, you see it on the very
+next prompt.
+
+Install:
+
+```sh
+install -m 755 hooks/bridge-daemon.sh ~/.claude/hooks/
+install -m 755 hooks/bridge-drain-unread.sh ~/.claude/hooks/
+mkdir -p ~/.config/systemd/user
+install -m 644 hooks/bridge-daemon.service ~/.config/systemd/user/
+# Edit ~/.config/systemd/user/bridge-daemon.service to set BRIDGE_*
+# vars for your environment, then:
+sudo loginctl enable-linger "$USER"   # so the service runs without login
+systemctl --user daemon-reload
+systemctl --user enable --now bridge-daemon
+systemctl --user status bridge-daemon
+```
+
+Add the UserPromptSubmit hook to `~/.claude/settings.json` next to
+the Stop hook:
+
+```json
+{
+  "hooks": {
+    "Stop": [ /* … the asyncRewake watcher above … */ ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "~/.claude/hooks/bridge-drain-unread.sh" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The two hooks compose:
+
+- **Stop + asyncRewake watcher** → wake Claude when a message arrives
+  while idle (no waiting for the next user turn)
+- **UserPromptSubmit + daemon drain** → surface any messages that
+  arrived during a busy turn, on the very next prompt
+
+Both consume the same SSE stream from the bridge server; there's no
+duplication-of-truth, both just present it differently.
+
+End-to-end verify the daemon:
+
+```sh
+# In one terminal:
+journalctl --user -u bridge-daemon -f
+
+# In another (or from the peer instance):
+curl -s -X POST http://172.16.101.166:3001/send/general \
+  -H 'content-type: application/json' \
+  -d '{"from":"peer","content":"daemon test"}'
+
+# Then drain manually to inspect:
+~/.claude/hooks/bridge-drain-unread.sh
+# Should print the message and truncate ~/.cache/bridge/unread.jsonl
+```
 
 ## Suggested usage outside pentesting
 
@@ -300,6 +440,27 @@ works for:
 - Don't paste production secrets through `share_endpoint`. Use
   references (`see env var X on box Y`) rather than literal tokens.
 
+## HTTP endpoint reference
+
+Use these directly from `curl` or your own client. The MCP and CLI
+binaries are thin wrappers.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/send/{channel}` | Send a message |
+| GET | `/messages/{channel}?since=&from=&limit=` | List messages (filterable) |
+| DELETE | `/messages/{channel}` | Clear message history |
+| GET | `/stream/{channel}` | Server-sent events stream (one event per new message) |
+| GET | `/channels` | List known channels |
+| POST | `/findings/{channel}` | Create finding |
+| GET | `/findings/{channel}?severity=&status=&from=` | List findings (filterable) |
+| PATCH | `/findings/{channel}/{id}` | Triage (update status/note) |
+| POST | `/artifacts/{channel}` | Upload artifact (raw bytes, headers: `x-bridge-from`, `x-bridge-filename`, `content-type`) |
+| GET | `/artifacts/{channel}/list` | List artifacts in a channel |
+| GET | `/artifact/{id}` | Download artifact (note: singular `artifact`) |
+| POST | `/presence/{name}` | Heartbeat (body `{channel}`) |
+| GET | `/peers` | List online peers (heartbeat ≤120s) |
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -308,6 +469,9 @@ works for:
 | Tools don't appear in the current `claude` session | MCP servers load at startup — start a new session |
 | `Connection refused` from another VPS | server bound to wrong interface, or firewall — check `ss -tlnp \| grep 3001` |
 | Messages don't show up across instances | both instances must point at the SAME server URL and use the SAME channel string |
+| `bridge-daemon` service inactive after reboot | `loginctl enable-linger $USER` not run — user services need lingering to start without login |
+| Drain hook prints nothing | the daemon isn't running (`systemctl --user status bridge-daemon`), or the unread file path differs (`BRIDGE_UNREAD_FILE` env mismatch between daemon + drain) |
+| `list_peers` empty but instance is connected | the MCP client only heartbeats every 20s — wait one cycle, or send a message (sending implicitly marks presence) |
 
 ## License
 

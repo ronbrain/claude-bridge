@@ -1,9 +1,11 @@
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(name = "bridge-mcp", about = "Claude Bridge MCP server")]
 struct Args {
     /// Bridge server URL
@@ -72,13 +74,21 @@ fn tools_list() -> Value {
             },
             {
                 "name": "read_messages",
-                "description": "Read recent messages from the shared channel. Use this to see what the other instance has sent.",
+                "description": "Read recent messages from the shared channel. Use `since` (unix-seconds) and `from` to filter incrementally — pass the timestamp of the latest message you already saw to get only new ones.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "channel": { "type": "string", "description": "Channel to read (default: configured channel)" }
+                        "channel": { "type": "string" },
+                        "since": { "type": "number", "description": "Unix-seconds — only newer messages" },
+                        "from": { "type": "string", "description": "Filter to one sender" },
+                        "limit": { "type": "number", "description": "Max messages to return (default 100)" }
                     }
                 }
+            },
+            {
+                "name": "list_peers",
+                "description": "List the Claude Code instances currently connected to the bridge (last heartbeat within 120s). Use before sending — silence on the other end is sometimes the bridge being dead, not the peer ignoring you.",
+                "inputSchema": { "type": "object", "properties": {} }
             },
             {
                 "name": "share_endpoint",
@@ -98,37 +108,100 @@ fn tools_list() -> Value {
             },
             {
                 "name": "report_finding",
-                "description": "Report a security finding to the other instance. Use this after discovering a vulnerability.",
+                "description": "Report a security finding. Lands in the findings stream (separate from chat) with status=open; use list_findings to query and triage_finding to update.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "title":    { "type": "string", "description": "Short title of the finding" },
+                        "title":    { "type": "string" },
                         "severity": { "type": "string", "enum": ["critical", "high", "medium", "low", "info"] },
-                        "endpoint": { "type": "string", "description": "Affected endpoint" },
-                        "detail":   { "type": "string", "description": "Full description and proof" },
+                        "endpoint": { "type": "string" },
+                        "detail":   { "type": "string" },
                         "channel":  { "type": "string" }
                     },
                     "required": ["title", "severity", "detail"]
                 }
             },
             {
-                "name": "clear_channel",
-                "description": "Clear all messages from a channel to start fresh.",
+                "name": "list_findings",
+                "description": "List structured findings, optionally filtered. Use `status:\"open\"` to show what still needs work, or `severity:\"critical\"` to triage by impact.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "channel": { "type": "string" }
+                        "channel":  { "type": "string" },
+                        "severity": { "type": "string", "enum": ["critical", "high", "medium", "low", "info"] },
+                        "status":   { "type": "string", "enum": ["open", "triaged", "fixed", "wontfix"] },
+                        "from":     { "type": "string" }
                     }
+                }
+            },
+            {
+                "name": "triage_finding",
+                "description": "Update the status of a finding. Use after the SaaS team has looked at it (triaged), shipped a fix (fixed), or decided not to act (wontfix).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id":      { "type": "string" },
+                        "status":  { "type": "string", "enum": ["open", "triaged", "fixed", "wontfix"] },
+                        "note":    { "type": "string", "description": "Optional triage note" },
+                        "channel": { "type": "string" }
+                    },
+                    "required": ["id", "status"]
+                }
+            },
+            {
+                "name": "share_artifact",
+                "description": "Upload a small file (≤10 MB) to the bridge and share its download URL. Use for PoC payloads, request/response dumps, screenshots, traces. Returns the artifact id + URL the peer can GET.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "filename": { "type": "string" },
+                        "content":  { "type": "string", "description": "Raw text content or base64-encoded bytes" },
+                        "base64":   { "type": "boolean", "description": "Set true when `content` is base64" },
+                        "mime":     { "type": "string", "description": "MIME type (default text/plain or octet-stream)" },
+                        "notes":    { "type": "string" },
+                        "channel":  { "type": "string" }
+                    },
+                    "required": ["filename", "content"]
+                }
+            },
+            {
+                "name": "clear_channel",
+                "description": "Clear all messages from a channel to start fresh. Does NOT clear findings — those live in their own stream.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "channel": { "type": "string" } }
                 }
             }
         ]
     })
 }
 
+/// Fire the heartbeat in a background task — runs forever, swallowing
+/// transient HTTP errors. The server treats a peer as offline after
+/// 120s without one, so 20s gives ~6× headroom.
+fn spawn_heartbeat(args: Arc<Args>, client: reqwest::Client) {
+    tokio::spawn(async move {
+        let url = format!("{}/presence/{}", args.server, args.name);
+        loop {
+            let _ = client
+                .post(&url)
+                .json(&json!({ "channel": args.channel }))
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await;
+            tokio::time::sleep(Duration::from_secs(20)).await;
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let args = Arc::new(Args::parse());
     let client = reqwest::Client::new();
+
+    // Mark ourselves online before serving the first request — the
+    // peer's `list_peers` call right after we boot should see us.
+    spawn_heartbeat(args.clone(), client.clone());
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
@@ -159,7 +232,7 @@ async fn main() {
             "initialize" => ok(id, json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": "claude-bridge", "version": "0.1.0" }
+                "serverInfo": { "name": "claude-bridge", "version": "0.2.0" }
             })),
 
             "notifications/initialized" => continue,
@@ -200,9 +273,19 @@ async fn main() {
                             .as_str()
                             .unwrap_or(&args.channel)
                             .to_string();
-
+                        let mut qs: Vec<(&str, String)> = Vec::new();
+                        if let Some(s) = args_val["since"].as_u64() {
+                            qs.push(("since", s.to_string()));
+                        }
+                        if let Some(f) = args_val["from"].as_str() {
+                            qs.push(("from", f.to_string()));
+                        }
+                        if let Some(l) = args_val["limit"].as_u64() {
+                            qs.push(("limit", l.to_string()));
+                        }
                         let res = client
                             .get(format!("{}/messages/{}", args.server, channel))
+                            .query(&qs)
                             .send()
                             .await;
 
@@ -230,6 +313,33 @@ async fn main() {
                                 }
                             }
                             _ => text(id, "[bridge] ERROR: could not read messages"),
+                        }
+                    }
+
+                    "list_peers" => {
+                        let res = client.get(format!("{}/peers", args.server)).send().await;
+                        match res {
+                            Ok(r) => {
+                                let peers: Vec<Value> = r.json().await.unwrap_or_default();
+                                if peers.is_empty() {
+                                    text(id, "[bridge] no peers online (nobody heartbeating)")
+                                } else {
+                                    let formatted = peers
+                                        .iter()
+                                        .map(|p| {
+                                            format!(
+                                                "• {} — idle {}s on #{}",
+                                                p["name"].as_str().unwrap_or("?"),
+                                                p["idle_secs"].as_u64().unwrap_or(0),
+                                                p["channel"].as_str().unwrap_or("?")
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    text(id, formatted)
+                                }
+                            }
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
                         }
                     }
 
@@ -270,17 +380,184 @@ async fn main() {
                             .unwrap_or(&args.channel)
                             .to_string();
 
-                        let content = format!(
-                            "🔴 FINDING [{severity}]\nTitle: {title}\nEndpoint: {endpoint}\n\n{detail}"
-                        );
-
-                        let _ = client
-                            .post(format!("{}/send/{}", args.server, channel))
-                            .json(&json!({ "from": args.name, "content": content }))
+                        let res = client
+                            .post(format!("{}/findings/{}", args.server, channel))
+                            .json(&json!({
+                                "from": args.name,
+                                "severity": severity,
+                                "title": title,
+                                "detail": detail,
+                                "endpoint": endpoint
+                            }))
                             .send()
                             .await;
 
-                        text(id, format!("[bridge] finding '{}' reported ✓", title))
+                        match res {
+                            Ok(r) if r.status().is_success() => {
+                                let v: Value = r.json().await.unwrap_or(json!({}));
+                                let fid = v["id"].as_str().unwrap_or("?");
+                                // Also drop a short chat ping so the peer's
+                                // between-turn watcher wakes them up. The
+                                // finding itself lives in the structured stream.
+                                let ping = format!(
+                                    "🔴 finding [{}] {} — id={}",
+                                    severity, title, fid
+                                );
+                                let _ = client
+                                    .post(format!("{}/send/{}", args.server, channel))
+                                    .json(&json!({ "from": args.name, "content": ping }))
+                                    .send()
+                                    .await;
+                                text(id, format!("[bridge] finding reported (id {})", fid))
+                            }
+                            Ok(r) => {
+                                let status = r.status();
+                                let body = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] ERROR {status}: {body}"))
+                            }
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+
+                    "list_findings" => {
+                        let channel = args_val["channel"]
+                            .as_str()
+                            .unwrap_or(&args.channel)
+                            .to_string();
+                        let mut qs: Vec<(&str, String)> = Vec::new();
+                        for k in ["severity", "status", "from"] {
+                            if let Some(v) = args_val[k].as_str() {
+                                qs.push((k, v.to_string()));
+                            }
+                        }
+                        let res = client
+                            .get(format!("{}/findings/{}", args.server, channel))
+                            .query(&qs)
+                            .send()
+                            .await;
+                        match res {
+                            Ok(r) => {
+                                let fs: Vec<Value> = r.json().await.unwrap_or_default();
+                                if fs.is_empty() {
+                                    text(id, format!("[bridge] no findings in '{channel}' (with filters)"))
+                                } else {
+                                    let formatted = fs
+                                        .iter()
+                                        .map(|f| {
+                                            format!(
+                                                "• [{}] {} | {} | from={} | id={}\n   {}",
+                                                f["status"].as_str().unwrap_or("?"),
+                                                f["severity"].as_str().unwrap_or("?"),
+                                                f["title"].as_str().unwrap_or(""),
+                                                f["from"].as_str().unwrap_or("?"),
+                                                f["id"].as_str().unwrap_or("?"),
+                                                f["endpoint"].as_str().unwrap_or("(no endpoint)")
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    text(id, formatted)
+                                }
+                            }
+                            _ => text(id, "[bridge] ERROR: could not list findings"),
+                        }
+                    }
+
+                    "triage_finding" => {
+                        let id_param = args_val["id"].as_str().unwrap_or("").to_string();
+                        let status = args_val["status"].as_str().unwrap_or("").to_string();
+                        let note = args_val["note"].as_str().unwrap_or("").to_string();
+                        let channel = args_val["channel"]
+                            .as_str()
+                            .unwrap_or(&args.channel)
+                            .to_string();
+                        let res = client
+                            .patch(format!("{}/findings/{}/{}", args.server, channel, id_param))
+                            .json(&json!({ "status": status, "note": note }))
+                            .send()
+                            .await;
+                        match res {
+                            Ok(r) if r.status().is_success() =>
+                                text(id, format!("[bridge] finding {} → {}", id_param, status)),
+                            Ok(r) => {
+                                let s = r.status();
+                                let body = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] ERROR {s}: {body}"))
+                            }
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+
+                    "share_artifact" => {
+                        let filename = args_val["filename"].as_str().unwrap_or("artifact.bin").to_string();
+                        let content_str = args_val["content"].as_str().unwrap_or("");
+                        let is_b64 = args_val["base64"].as_bool().unwrap_or(false);
+                        let mime = args_val["mime"]
+                            .as_str()
+                            .unwrap_or(if is_b64 { "application/octet-stream" } else { "text/plain" })
+                            .to_string();
+                        let notes = args_val["notes"].as_str().unwrap_or("").to_string();
+                        let channel = args_val["channel"]
+                            .as_str()
+                            .unwrap_or(&args.channel)
+                            .to_string();
+
+                        // Decode if claimed base64; otherwise treat as raw text bytes.
+                        let bytes: Vec<u8> = if is_b64 {
+                            match decode_base64(content_str) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    let response = text(id, format!("[bridge] ERROR: bad base64: {e}"));
+                                    let mut out = serde_json::to_string(&response).unwrap();
+                                    out.push('\n');
+                                    let _ = writer.write_all(out.as_bytes()).await;
+                                    let _ = writer.flush().await;
+                                    continue;
+                                }
+                            }
+                        } else {
+                            content_str.as_bytes().to_vec()
+                        };
+
+                        let res = client
+                            .post(format!("{}/artifacts/{}", args.server, channel))
+                            .header("content-type", &mime)
+                            .header("x-bridge-from", &args.name)
+                            .header("x-bridge-filename", &filename)
+                            .body(bytes)
+                            .send()
+                            .await;
+                        match res {
+                            Ok(r) if r.status().is_success() => {
+                                let v: Value = r.json().await.unwrap_or(json!({}));
+                                let aid = v["id"].as_str().unwrap_or("?").to_string();
+                                let size = v["size"].as_u64().unwrap_or(0);
+                                // Drop a chat ping so the peer's between-turn
+                                // watcher wakes them up and they see the URL.
+                                let ping = format!(
+                                    "📎 artifact: {} ({} bytes)\nDownload: {}/artifact/{}\nNotes: {}",
+                                    filename, size, args.server, aid, notes
+                                );
+                                let _ = client
+                                    .post(format!("{}/send/{}", args.server, channel))
+                                    .json(&json!({ "from": args.name, "content": ping }))
+                                    .send()
+                                    .await;
+                                text(
+                                    id,
+                                    format!(
+                                        "[bridge] artifact uploaded (id {}, {} bytes): {}/artifact/{}",
+                                        aid, size, args.server, aid
+                                    ),
+                                )
+                            }
+                            Ok(r) => {
+                                let s = r.status();
+                                let body = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] ERROR {s}: {body}"))
+                            }
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
                     }
 
                     "clear_channel" => {
@@ -308,5 +585,69 @@ async fn main() {
         out.push('\n');
         let _ = writer.write_all(out.as_bytes()).await;
         let _ = writer.flush().await;
+    }
+}
+
+/// Tiny standard-base64 decoder. We avoid the `base64` crate dep
+/// because the rest of this binary is stdlib + reqwest + serde and
+/// adding a transitive dependency for ~30 lines is poor taste.
+fn decode_base64(s: &str) -> Result<Vec<u8>, String> {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut table = [255u8; 256];
+    for (i, &c) in T.iter().enumerate() {
+        table[c as usize] = i as u8;
+    }
+    let s: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if s.len() % 4 != 0 {
+        return Err(format!("length {} not a multiple of 4", s.len()));
+    }
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    for chunk in s.chunks(4) {
+        let mut v = [0u8; 4];
+        let mut pad = 0;
+        for (i, &c) in chunk.iter().enumerate() {
+            if c == b'=' {
+                pad += 1;
+                v[i] = 0;
+            } else {
+                v[i] = table[c as usize];
+                if v[i] == 255 {
+                    return Err(format!("bad char {:?}", c as char));
+                }
+            }
+        }
+        let triple =
+            ((v[0] as u32) << 18) | ((v[1] as u32) << 12) | ((v[2] as u32) << 6) | v[3] as u32;
+        out.push((triple >> 16) as u8);
+        if pad < 2 {
+            out.push((triple >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(triple as u8);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_round_trip() {
+        // hand-encoded "Hello, world!" → "SGVsbG8sIHdvcmxkIQ=="
+        assert_eq!(
+            decode_base64("SGVsbG8sIHdvcmxkIQ==").unwrap(),
+            b"Hello, world!".to_vec()
+        );
+        assert_eq!(decode_base64("YWI=").unwrap(), b"ab".to_vec());
+        assert_eq!(decode_base64("YQ==").unwrap(), b"a".to_vec());
+        assert_eq!(decode_base64("").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn base64_rejects_garbage() {
+        assert!(decode_base64("not_base64!").is_err());
+        assert!(decode_base64("ABC").is_err()); // length 3 not multiple of 4
     }
 }

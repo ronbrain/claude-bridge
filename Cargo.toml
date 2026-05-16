@@ -11,6 +11,10 @@ path = "src/bin/server.rs"
 name = "bridge-mcp"
 path = "src/bin/mcp.rs"
 
+[[bin]]
+name = "bridge"
+path = "src/bin/bridge.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
