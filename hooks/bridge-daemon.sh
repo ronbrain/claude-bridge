@@ -19,7 +19,10 @@ set -uo pipefail
 
 SERVER="${BRIDGE_SERVER:-http://172.16.101.166:3001}"
 CHANNEL="${BRIDGE_CHANNEL:-general}"
-SELF="${BRIDGE_SELF:-$(hostname)}"
+# `hostname -s` (short) keeps the peer name compact; the FQDN-version
+# can leak DNS suffixes into the channel and looks noisy in /peers.
+# Override BRIDGE_SELF explicitly for ambiguous-hostname boxes.
+SELF="${BRIDGE_SELF:-$(hostname -s 2>/dev/null || hostname)}"
 UNREAD_FILE="${BRIDGE_UNREAD_FILE:-$HOME/.cache/bridge/unread.jsonl}"
 
 mkdir -p "$(dirname "$UNREAD_FILE")"

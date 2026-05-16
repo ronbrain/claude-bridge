@@ -149,6 +149,18 @@ fn tools_list() -> Value {
                 }
             },
             {
+                "name": "delete_finding",
+                "description": "Hard-delete a finding. Use for false-positives or noisy reports — `triage_finding` only updates status, so a wontfix still pollutes unfiltered lists.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id":      { "type": "string" },
+                        "channel": { "type": "string" }
+                    },
+                    "required": ["id"]
+                }
+            },
+            {
                 "name": "share_artifact",
                 "description": "Upload a small file (≤10 MB) to the bridge and share its download URL. Use for PoC payloads, request/response dumps, screenshots, traces. Returns the artifact id + URL the peer can GET.",
                 "inputSchema": {
@@ -176,11 +188,16 @@ fn tools_list() -> Value {
     })
 }
 
-/// Fire the heartbeat in a background task — runs forever, swallowing
-/// transient HTTP errors. The server treats a peer as offline after
-/// 120s without one, so 20s gives ~6× headroom.
-fn spawn_heartbeat(args: Arc<Args>, client: reqwest::Client) {
-    tokio::spawn(async move {
+/// Fire the heartbeat in a background task — runs until the returned
+/// `AbortHandle` is invoked, swallowing transient HTTP errors. The
+/// server treats a peer as offline after 120s without a heartbeat,
+/// so 20s gives ~6× headroom.
+///
+/// The caller drops the handle when stdin closes (Claude Code shutting
+/// down the MCP), aborting the loop so we don't leave a zombie POSTer
+/// running until the OS reaps us.
+fn spawn_heartbeat(args: Arc<Args>, client: reqwest::Client) -> tokio::task::AbortHandle {
+    let h = tokio::spawn(async move {
         let url = format!("{}/presence/{}", args.server, args.name);
         loop {
             let _ = client
@@ -192,6 +209,7 @@ fn spawn_heartbeat(args: Arc<Args>, client: reqwest::Client) {
             tokio::time::sleep(Duration::from_secs(20)).await;
         }
     });
+    h.abort_handle()
 }
 
 #[tokio::main]
@@ -201,7 +219,9 @@ async fn main() {
 
     // Mark ourselves online before serving the first request — the
     // peer's `list_peers` call right after we boot should see us.
-    spawn_heartbeat(args.clone(), client.clone());
+    // Hold the abort handle so we can shut the background loop down
+    // cleanly when stdin closes (Claude Code is shutting us down).
+    let heartbeat = spawn_heartbeat(args.clone(), client.clone());
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
@@ -212,7 +232,10 @@ async fn main() {
     loop {
         line.clear();
         match reader.read_line(&mut line).await {
-            Ok(0) | Err(_) => break,
+            Ok(0) | Err(_) => {
+                heartbeat.abort();
+                break;
+            }
             Ok(_) => {}
         }
 
@@ -460,6 +483,28 @@ async fn main() {
                                 }
                             }
                             _ => text(id, "[bridge] ERROR: could not list findings"),
+                        }
+                    }
+
+                    "delete_finding" => {
+                        let id_param = args_val["id"].as_str().unwrap_or("").to_string();
+                        let channel = args_val["channel"]
+                            .as_str()
+                            .unwrap_or(&args.channel)
+                            .to_string();
+                        let res = client
+                            .delete(format!("{}/findings/{}/{}", args.server, channel, id_param))
+                            .send()
+                            .await;
+                        match res {
+                            Ok(r) if r.status().is_success() =>
+                                text(id, format!("[bridge] finding {} deleted", id_param)),
+                            Ok(r) => {
+                                let s = r.status();
+                                let body = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] ERROR {s}: {body}"))
+                            }
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
                         }
                     }
 

@@ -31,6 +31,71 @@ const ARTIFACT_LIMIT: usize = 200;
 /// client (20 s) with generous slack.
 const PEER_TTL_SECS: u64 = 120;
 
+// ── Per-input caps ────────────────────────────────────────────────
+// All bounded explicitly so a single misbehaving caller (or auth'd
+// bug) can't OOM the server. Numbers picked generously — covers
+// every legitimate use we've seen — but bounded.
+const MAX_CHANNEL_LEN: usize = 64;
+const MAX_FROM_LEN: usize = 64;
+const MAX_CONTENT_LEN: usize = 64 * 1024;
+const MAX_TITLE_LEN: usize = 256;
+const MAX_ENDPOINT_LEN: usize = 1024;
+const MAX_DETAIL_LEN: usize = 64 * 1024;
+const MAX_NOTE_LEN: usize = 4096;
+const MAX_FILENAME_LEN: usize = 256;
+const MAX_MIME_LEN: usize = 128;
+
+/// Channels are created lazily on first POST. Without a cap on how
+/// many can exist, a single client sending to /send/<uuid> in a loop
+/// would blow the server's memory through `senders`/`history`/
+/// `findings`/`artifacts` — all keyed by channel.
+const MAX_CHANNELS: usize = 256;
+
+fn cap(s: &str, max: usize, field: &str) -> Result<(), (StatusCode, String)> {
+    if s.len() > max {
+        Err((
+            StatusCode::BAD_REQUEST,
+            format!("{field} too long ({}>{max})", s.len()),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Sanitize a filename for the Content-Disposition header. Strips
+/// CR/LF (header-injection guard) and double quotes (we wrap the
+/// value in quotes), then truncates. Returns at least "artifact.bin"
+/// when the input degenerates to empty.
+fn safe_filename(raw: &str) -> String {
+    let s: String = raw
+        .chars()
+        .filter(|c| !c.is_control() && *c != '"' && *c != '\\')
+        .take(MAX_FILENAME_LEN)
+        .collect();
+    if s.is_empty() { "artifact.bin".into() } else { s }
+}
+
+/// Cleanup helper used by every write path. Evicts the
+/// oldest-by-arrival channel when at cap, so a single buggy client
+/// can't grow `senders`/`history`/`findings`/`artifacts` unbounded
+/// by spraying new channel names.
+fn ensure_channel_capacity(state: &AppState, channel: &str) {
+    if state.senders.contains_key(channel) {
+        return;
+    }
+    if state.senders.len() < MAX_CHANNELS {
+        return;
+    }
+    // Pick a victim — DashMap iteration order is unspecified, which
+    // is fine here: the cap is a leak guard, not a fairness contract.
+    if let Some(victim) = state.senders.iter().next().map(|kv| kv.key().clone()) {
+        state.senders.remove(&victim);
+        state.history.remove(&victim);
+        state.findings.remove(&victim);
+        tracing::warn!(victim, "channel cap reached; evicted oldest");
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     senders: Arc<DashMap<String, broadcast::Sender<Message>>>,
@@ -73,7 +138,12 @@ async fn send(
     Path(channel): Path<String>,
     State(state): State<AppState>,
     Json(req): Json<SendReq>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    cap(&channel, MAX_CHANNEL_LEN, "channel")?;
+    cap(&req.from, MAX_FROM_LEN, "from")?;
+    cap(&req.content, MAX_CONTENT_LEN, "content")?;
+    ensure_channel_capacity(&state, &channel);
+
     let msg = Message {
         id: Uuid::new_v4().to_string(),
         channel: channel.clone(),
@@ -102,7 +172,7 @@ async fn send(
 
     let _ = state.sender(&channel).send(msg);
 
-    Json(serde_json::json!({ "id": id, "ok": true }))
+    Ok(Json(serde_json::json!({ "id": id, "ok": true })))
 }
 
 #[derive(Deserialize, Default)]
@@ -192,24 +262,21 @@ async fn create_finding(
     State(state): State<AppState>,
     Json(req): Json<CreateFindingReq>,
 ) -> Result<Json<Finding>, (StatusCode, String)> {
+    cap(&channel, MAX_CHANNEL_LEN, "channel")?;
+    cap(&req.from, MAX_FROM_LEN, "from")?;
+    cap(&req.endpoint, MAX_ENDPOINT_LEN, "endpoint")?;
+    cap(&req.detail, MAX_DETAIL_LEN, "detail")?;
     if !SEVERITIES.contains(&req.severity.as_str()) {
         return Err((
             StatusCode::BAD_REQUEST,
             format!("severity must be one of {SEVERITIES:?}"),
         ));
     }
-    if req.title.is_empty() || req.title.len() > 256 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "title required, ≤256 chars".into(),
-        ));
+    if req.title.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "title required".into()));
     }
-    if req.detail.len() > 64 * 1024 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "detail ≤64 KB; attach a PoC via /artifacts for larger payloads".into(),
-        ));
-    }
+    cap(&req.title, MAX_TITLE_LEN, "title")?;
+    ensure_channel_capacity(&state, &channel);
     let now = now_secs();
     let finding = Finding {
         id: Uuid::new_v4().to_string(),
@@ -276,24 +343,52 @@ async fn triage_finding(
     State(state): State<AppState>,
     Json(req): Json<TriageReq>,
 ) -> Result<Json<Finding>, (StatusCode, String)> {
+    cap(&req.note, MAX_NOTE_LEN, "note")?;
     if !STATUSES.contains(&req.status.as_str()) {
         return Err((
             StatusCode::BAD_REQUEST,
             format!("status must be one of {STATUSES:?}"),
         ));
     }
+    // Distinguish "no such channel" (operator typo) from "channel
+    // exists but id unknown" (stale finding id from a cleared list).
     let mut entry = match state.findings.get_mut(&channel) {
         Some(e) => e,
-        None => return Err((StatusCode::NOT_FOUND, "channel has no findings".into())),
+        None => return Err((StatusCode::NOT_FOUND, format!("no findings on channel '{channel}'"))),
     };
     let found = entry.iter_mut().find(|f| f.id == id);
     let Some(f) = found else {
-        return Err((StatusCode::NOT_FOUND, "finding id not found".into()));
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("finding id '{id}' not found on channel '{channel}'"),
+        ));
     };
     f.status = req.status;
     f.note = req.note;
     f.updated_at = now_secs();
     Ok(Json(f.clone()))
+}
+
+/// Hard-delete a finding. Use this for false-positives or noisy
+/// reports that pollute the queue — `triage_finding` only updates
+/// status, so a `wontfix` still shows up in unfiltered lists.
+async fn delete_finding(
+    Path((channel, id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let mut entry = match state.findings.get_mut(&channel) {
+        Some(e) => e,
+        None => return Err((StatusCode::NOT_FOUND, format!("no findings on channel '{channel}'"))),
+    };
+    let before = entry.len();
+    entry.retain(|f| f.id != id);
+    if entry.len() == before {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("finding id '{id}' not found on channel '{channel}'"),
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ── Artifacts ───────────────────────────────────────────────────────
@@ -304,6 +399,7 @@ async fn upload_artifact(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    cap(&channel, MAX_CHANNEL_LEN, "channel")?;
     if body.len() > ARTIFACT_MAX_BYTES {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -313,18 +409,28 @@ async fn upload_artifact(
     let from = headers
         .get("x-bridge-from")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
-    let filename = headers
+        .unwrap_or("unknown");
+    cap(from, MAX_FROM_LEN, "x-bridge-from")?;
+    let from = from.to_string();
+
+    let raw_filename = headers
         .get("x-bridge-filename")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("artifact.bin")
-        .to_string();
+        .unwrap_or("artifact.bin");
+    cap(raw_filename, MAX_FILENAME_LEN, "x-bridge-filename")?;
+    // Strip control chars / quotes BEFORE we touch the header — keeps
+    // a malicious filename from injecting CR/LF into our response's
+    // Content-Disposition.
+    let filename = safe_filename(raw_filename);
+
     let mime = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
+        .unwrap_or("application/octet-stream");
+    cap(mime, MAX_MIME_LEN, "content-type")?;
+    let mime = mime.to_string();
+
+    ensure_channel_capacity(&state, &channel);
 
     // Soft eviction: when at capacity, drop the oldest entry by
     // created_at. Avoids growing indefinitely on a long-lived box.
@@ -370,12 +476,14 @@ async fn download_artifact(
     let mut resp = bytes.into_response();
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
-        header::HeaderValue::from_str(&art.mime).unwrap_or(header::HeaderValue::from_static("application/octet-stream")),
+        header::HeaderValue::from_str(&art.mime)
+            .unwrap_or(header::HeaderValue::from_static("application/octet-stream")),
     );
-    if let Ok(v) = header::HeaderValue::from_str(&format!(
-        "attachment; filename=\"{}\"",
-        art.filename.replace('"', "")
-    )) {
+    // Filename was already sanitized at upload time, but re-sanitize
+    // here too — defense in depth in case the in-memory record was
+    // ever crafted from a different code path.
+    let safe = safe_filename(&art.filename);
+    if let Ok(v) = header::HeaderValue::from_str(&format!("attachment; filename=\"{}\"", safe)) {
         resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
     }
     Ok(resp)
@@ -407,17 +515,31 @@ async fn heartbeat(
     Path(name): Path<String>,
     State(state): State<AppState>,
     Json(req): Json<PresenceReq>,
-) -> StatusCode {
+) -> Result<StatusCode, (StatusCode, String)> {
+    cap(&name, MAX_FROM_LEN, "name")?;
+    cap(&req.channel, MAX_CHANNEL_LEN, "channel")?;
     state.peers.insert(name, (now_secs(), req.channel));
-    StatusCode::NO_CONTENT
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_peers(State(state): State<AppState>) -> Json<Vec<Peer>> {
     let now = now_secs();
+    // Collect expired keys first, then drop them. Walking the map
+    // while removing causes deadlocks under DashMap; this two-pass
+    // approach keeps memory bounded across long-lived runs where
+    // peer names rotate (ephemeral hostnames, probes, etc.).
+    let expired: Vec<String> = state
+        .peers
+        .iter()
+        .filter(|kv| now.saturating_sub(kv.value().0) > PEER_TTL_SECS)
+        .map(|kv| kv.key().clone())
+        .collect();
+    for k in expired {
+        state.peers.remove(&k);
+    }
     let mut peers: Vec<Peer> = state
         .peers
         .iter()
-        .filter(|kv| now.saturating_sub(kv.value().0) <= PEER_TTL_SECS)
         .map(|kv| {
             let (last_seen, channel) = kv.value().clone();
             Peer {
@@ -452,6 +574,7 @@ async fn main() {
         .route("/findings/{channel}", post(create_finding))
         .route("/findings/{channel}", get(list_findings))
         .route("/findings/{channel}/{id}", patch(triage_finding))
+        .route("/findings/{channel}/{id}", delete(delete_finding))
         // Artifacts. Upload + list are channel-scoped under
         // /artifacts/<channel>; download is by global id under
         // /artifact/<id> (singular) so the route shapes don't collide

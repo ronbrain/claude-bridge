@@ -91,6 +91,10 @@ enum Cmd {
         #[arg(long)]
         note: Option<String>,
     },
+    /// Hard-delete a finding (for false-positives).
+    DeleteFinding {
+        id: String,
+    },
     /// Upload a file as a bridge artifact (≤10 MB).
     Upload {
         /// Path to the file.
@@ -238,6 +242,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         f["from"].as_str().unwrap_or("?")
                     );
                 }
+            }
+        }
+
+        Cmd::DeleteFinding { id } => {
+            let r = client
+                .delete(format!("{}/findings/{}/{}", c.server, c.channel, id))
+                .send()
+                .await?;
+            if r.status().is_success() {
+                println!("deleted {} ✓", id);
+            } else {
+                eprintln!("delete failed: {} — {}", r.status(), r.text().await.unwrap_or_default());
+                std::process::exit(1);
             }
         }
 
