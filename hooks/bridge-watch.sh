@@ -1,55 +1,81 @@
 #!/usr/bin/env bash
-# Long-polls the claude-bridge SSE stream and exits with code 2 the
-# moment a message from anyone OTHER than this instance arrives.
-# Claude's `asyncRewake` Stop hook treats exit code 2 as a signal to
-# re-wake the model with stdout as the additional context.
+# Long-polls one or more bridge channels via SSE and exits with code 2
+# the moment a message from anyone OTHER than this instance arrives.
+# Claude's `asyncRewake` Stop hook treats exit 2 as a wake signal with
+# stdout as additional context.
 #
-# Behavior:
-#   * Connects to /stream/<channel> on the remote bridge-server.
-#   * Filters out SSE keepalive lines (start with `:` or contain "ping").
-#   * Filters out our own messages (`from == $SELF`) so we don't
-#     ping-pong with ourselves.
-#   * On the first foreign message: print it and exit 2.
-#   * Any other exit (network glitch, server restart, user starts
-#     typing) is fine — the hook re-runs at the next Stop event.
+# Multi-channel: $BRIDGE_CHANNEL accepts a comma-separated list. Each
+# channel runs in its own subprocess; the first one to see a foreign
+# message drops its message into a slot file; the parent polls slots
+# and exits 2 with the message on stdout.
 
-set -euo pipefail
+set -uo pipefail
 
 SERVER="${BRIDGE_SERVER:-http://172.16.101.166:3001}"
-CHANNEL="${BRIDGE_CHANNEL:-general}"
+CHANNELS_RAW="${BRIDGE_CHANNEL:-general}"
 SELF="${BRIDGE_SELF:-sv-s-bcloud}"
 
-# `--no-buffer` flushes per-line so we react instantly instead of
-# waiting for the curl receive buffer to fill.
-# `--max-time 0` keeps the long-poll open until either a message
-# arrives or the asyncRewake watcher is cancelled by the next turn.
-#
-# Process substitution `< <(curl ...)` is intentional — piping curl
-# into `while` forks a subshell, and `exit 2` inside that subshell
-# only exits the subshell, NOT the parent script. The rewake signal
-# would be lost. Process sub keeps the `while` in the main shell.
-while IFS= read -r line; do
-    # SSE shape: `data: {json}` or `:ping` keepalive. Skip anything
-    # that isn't a data frame.
-    [[ "$line" == data:* ]] || continue
-    payload="${line#data: }"
+IFS=',' read -ra CHANNELS <<< "$CHANNELS_RAW"
+TRIMMED=()
+for c in "${CHANNELS[@]}"; do
+    c="${c// /}"
+    [[ -n "$c" ]] && TRIMMED+=("$c")
+done
+[[ ${#TRIMMED[@]} -eq 0 ]] && TRIMMED=("general")
 
-    # Skip the literal "ping" frame just in case axum uses .text() for
-    # keepalive in some path.
-    [[ "$payload" == "ping" ]] && continue
+SLOTDIR="$(mktemp -d /tmp/bridge-watch.XXXXXX)"
+PIDS=()
 
-    # Pull `from` field. If parsing fails (malformed JSON), skip.
-    from="$(printf '%s' "$payload" | jq -r '.from // empty' 2>/dev/null)"
-    [[ -z "$from" ]] && continue
-    [[ "$from" == "$SELF" ]] && continue
+cleanup() {
+    for pid in "${PIDS[@]:-}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    rm -rf "$SLOTDIR"
+}
+trap cleanup EXIT
 
-    # Got a real foreign message — surface it and exit 2 to rewake.
-    content="$(printf '%s' "$payload" | jq -r '.content // ""' 2>/dev/null)"
-    ts="$(printf '%s' "$payload" | jq -r '.timestamp // ""' 2>/dev/null)"
-    printf '[%s] %s on #%s:\n%s\n' "$ts" "$from" "$CHANNEL" "$content"
-    exit 2
-  done < <(curl -sN --no-buffer --max-time 0 "${SERVER}/stream/${CHANNEL}" 2>/dev/null)
+watch_one() {
+    local channel="$1"
+    local slot="$2"
+    while IFS= read -r line; do
+        [[ "$line" == data:* ]] || continue
+        local payload="${line#data: }"
+        [[ "$payload" == "ping" ]] && continue
 
-# Stream closed cleanly without a message (server restart, etc.) —
-# normal exit, no rewake.
+        local from
+        from="$(printf '%s' "$payload" | jq -r '.from // empty' 2>/dev/null)"
+        [[ -z "$from" ]] && continue
+        [[ "$from" == "$SELF" ]] && continue
+
+        local content ts
+        content="$(printf '%s' "$payload" | jq -r '.content // ""' 2>/dev/null)"
+        ts="$(printf '%s' "$payload" | jq -r '.timestamp // ""' 2>/dev/null)"
+        # Atomic write: build into a `.partial` then mv. The poller
+        # only reads slots that are fully formed, so it can't catch
+        # us mid-write.
+        printf '[%s] %s on #%s:\n%s\n' "$ts" "$from" "$channel" "$content" > "${slot}.partial"
+        mv "${slot}.partial" "$slot"
+        return 0
+    done < <(curl -sN --no-buffer --max-time 0 "${SERVER}/stream/${channel}" 2>/dev/null)
+}
+
+# Spawn one watcher per channel, each with its own slot file.
+i=0
+for c in "${TRIMMED[@]}"; do
+    watch_one "$c" "$SLOTDIR/$i" &
+    PIDS+=("$!")
+    i=$((i + 1))
+done
+
+# Poll. SSE messages are infrequent → 200ms interval is plenty
+# responsive without burning CPU. Cap at 6h as a sanity stop.
+deadline=$(( $(date +%s) + 21600 ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    for slot in "$SLOTDIR"/*; do
+        [[ -f "$slot" && ! "$slot" =~ \.partial$ ]] || continue
+        cat "$slot"
+        exit 2
+    done
+    sleep 0.2
+done
 exit 0
