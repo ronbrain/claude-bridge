@@ -23,7 +23,7 @@ use rusqlite::{params, Connection, Result as SqliteResult};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::{Artifact, Finding, Message};
+use crate::{Artifact, ChannelTopic, Finding, Message};
 
 #[derive(Clone)]
 pub struct Store {
@@ -189,6 +189,34 @@ impl Store {
         rows.collect()
     }
 
+    // ── Channel topics ──────────────────────────────────────────────
+
+    pub fn upsert_topic(&self, t: &ChannelTopic) -> SqliteResult<()> {
+        self.conn.lock().execute(
+            "INSERT OR REPLACE INTO channel_topics
+             (name, topic, updated_by, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![t.name, t.topic, t.updated_by, t.updated_at as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_topics(&self) -> SqliteResult<Vec<ChannelTopic>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT name, topic, updated_by, updated_at FROM channel_topics",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ChannelTopic {
+                name: r.get(0)?,
+                topic: r.get(1)?,
+                updated_by: r.get(2)?,
+                updated_at: r.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        rows.collect()
+    }
+
     // ── Artifacts ───────────────────────────────────────────────────
 
     pub fn insert_artifact(&self, art: &Artifact, bytes: &[u8]) -> SqliteResult<()> {
@@ -288,6 +316,13 @@ fn init(conn: &Connection) -> SqliteResult<()> {
         );
         CREATE INDEX IF NOT EXISTS artifacts_channel_ts
             ON artifacts (channel, created_at);
+
+        CREATE TABLE IF NOT EXISTS channel_topics (
+            name       TEXT PRIMARY KEY,
+            topic      TEXT NOT NULL DEFAULT '',
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL
+        );
         "#,
     )
 }

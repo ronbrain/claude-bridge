@@ -52,6 +52,18 @@ pub struct Artifact {
     pub created_at: u64,
 }
 
+/// Declared purpose of a channel. Set by `PUT /channels/{name}/topic`
+/// and surfaced via `GET /channels` so peers can discover proper
+/// routing before posting. Empty `topic` means "no purpose declared
+/// yet" — peers should treat it as a free-form channel.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChannelTopic {
+    pub name: String,
+    pub topic: String,
+    pub updated_by: String,
+    pub updated_at: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Peer {
     pub name: String,

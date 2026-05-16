@@ -6,7 +6,7 @@ use axum::{
     routing::{delete, get, patch, post},
     Json, Router,
 };
-use claude_bridge::{now_secs, store::Store, Artifact, Finding, Message, Peer, SEVERITIES, STATUSES};
+use claude_bridge::{now_secs, store::Store, Artifact, ChannelTopic, Finding, Message, Peer, SEVERITIES, STATUSES};
 use dashmap::DashMap;
 use futures::Stream;
 use serde::Deserialize;
@@ -44,6 +44,7 @@ const MAX_DETAIL_LEN: usize = 64 * 1024;
 const MAX_NOTE_LEN: usize = 4096;
 const MAX_FILENAME_LEN: usize = 256;
 const MAX_MIME_LEN: usize = 128;
+const MAX_TOPIC_LEN: usize = 512;
 
 /// Channels are created lazily on first POST. Without a cap on how
 /// many can exist, a single client sending to /send/<uuid> in a loop
@@ -113,6 +114,9 @@ struct AppState {
     /// NOT persisted — presence is a runtime concept; a peer
     /// presumed online after a server restart would be misleading.
     peers: Arc<DashMap<String, (u64, String)>>,
+    /// Declared channel purposes, keyed by channel name. Returned by
+    /// `GET /channels` so peers can discover routing before posting.
+    topics: Arc<DashMap<String, ChannelTopic>>,
     /// Optional sqlite store. `Some` when `BRIDGE_DB_PATH` is set
     /// in env; `None` keeps the legacy in-memory-only behaviour.
     /// Every write path forwards to the store when present.
@@ -127,6 +131,7 @@ impl AppState {
             findings: Arc::new(DashMap::new()),
             artifacts: Arc::new(DashMap::new()),
             peers: Arc::new(DashMap::new()),
+            topics: Arc::new(DashMap::new()),
             store,
         }
     }
@@ -181,6 +186,16 @@ impl AppState {
                 tracing::info!(count, "rehydrated artifacts from sqlite");
             }
             Err(e) => tracing::warn!(error = %e, "rehydrate artifacts failed"),
+        }
+        match store.load_topics() {
+            Ok(ts) => {
+                let count = ts.len();
+                for t in ts {
+                    self.topics.insert(t.name.clone(), t);
+                }
+                tracing::info!(count, "rehydrated channel topics from sqlite");
+            }
+            Err(e) => tracing::warn!(error = %e, "rehydrate topics failed"),
         }
     }
 }
@@ -315,8 +330,75 @@ async fn stream_channel(
     )
 }
 
-async fn list_channels(State(state): State<AppState>) -> Json<Vec<String>> {
-    Json(state.senders.iter().map(|e| e.key().clone()).collect())
+/// Return every known channel with its declared topic (empty when
+/// no purpose has been set). Includes channels that exist only as a
+/// declared topic with no traffic yet — that lets a peer discover
+/// "where should I post X" before any messages have appeared.
+async fn list_channels(State(state): State<AppState>) -> Json<Vec<ChannelTopic>> {
+    let mut seen: std::collections::BTreeMap<String, ChannelTopic> =
+        std::collections::BTreeMap::new();
+    for e in state.senders.iter() {
+        let name = e.key().clone();
+        seen.insert(
+            name.clone(),
+            ChannelTopic {
+                name,
+                topic: String::new(),
+                updated_by: String::new(),
+                updated_at: 0,
+            },
+        );
+    }
+    for kv in state.topics.iter() {
+        seen.insert(kv.key().clone(), kv.value().clone());
+    }
+    Json(seen.into_values().collect())
+}
+
+#[derive(Deserialize)]
+struct SetTopicReq {
+    from: String,
+    topic: String,
+}
+
+async fn set_topic(
+    Path(channel): Path<String>,
+    State(state): State<AppState>,
+    Json(req): Json<SetTopicReq>,
+) -> Result<Json<ChannelTopic>, (StatusCode, String)> {
+    cap(&channel, MAX_CHANNEL_LEN, "channel")?;
+    cap(&req.from, MAX_FROM_LEN, "from")?;
+    cap(&req.topic, MAX_TOPIC_LEN, "topic")?;
+    let t = ChannelTopic {
+        name: channel.clone(),
+        topic: req.topic,
+        updated_by: req.from,
+        updated_at: now_secs(),
+    };
+    state.topics.insert(channel.clone(), t.clone());
+    if let Some(store) = &state.store {
+        if let Err(e) = store.upsert_topic(&t) {
+            tracing::warn!(error = %e, "persist topic failed");
+        }
+    }
+    Ok(Json(t))
+}
+
+async fn get_topic(
+    Path(channel): Path<String>,
+    State(state): State<AppState>,
+) -> Json<ChannelTopic> {
+    let t = state
+        .topics
+        .get(&channel)
+        .map(|kv| kv.value().clone())
+        .unwrap_or_else(|| ChannelTopic {
+            name: channel,
+            topic: String::new(),
+            updated_by: String::new(),
+            updated_at: 0,
+        });
+    Json(t)
 }
 
 // ── Findings ────────────────────────────────────────────────────────
@@ -697,6 +779,7 @@ async fn main() {
         .route("/messages/{channel}", delete(clear_messages))
         .route("/stream/{channel}", get(stream_channel))
         .route("/channels", get(list_channels))
+        .route("/channels/{channel}/topic", get(get_topic).put(set_topic))
         // Findings
         .route("/findings/{channel}", post(create_finding))
         .route("/findings/{channel}", get(list_findings))

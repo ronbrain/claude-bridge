@@ -62,7 +62,7 @@ fn tools_list() -> Value {
         "tools": [
             {
                 "name": "send_message",
-                "description": "Send a message to the other Claude Code instance in real time. Use this to share findings, ask questions, or coordinate tasks.",
+                "description": "Send a message to the other Claude Code instance in real time. Use this to share findings, ask questions, or coordinate tasks. **Routing**: each channel has a declared `topic` describing what it's for — call `list_channels` first if unsure where a message belongs. The confirmation echoes the channel's current topic so you can catch misroutes immediately.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -177,6 +177,23 @@ fn tools_list() -> Value {
                 }
             },
             {
+                "name": "list_channels",
+                "description": "List every known channel with its declared topic (purpose). Use this BEFORE `send_message` when you're unsure which channel a message belongs in — posting pentest findings into an integration channel, or vice versa, pollutes the stream and forces a manual cleanup.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "set_channel_topic",
+                "description": "Declare or update the topic (purpose) of a channel. The topic is shown by `list_channels` and echoed in `send_message` confirmations, so peers can see what each channel is reserved for. Use a short one-liner.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channel": { "type": "string" },
+                        "topic":   { "type": "string", "description": "One-line purpose, e.g. \"Gezer↔Pale integration only — pentest goes to #pale-pentest\"" }
+                    },
+                    "required": ["channel", "topic"]
+                }
+            },
+            {
                 "name": "clear_channel",
                 "description": "Clear all messages from a channel to start fresh. Does NOT clear findings — those live in their own stream.",
                 "inputSchema": {
@@ -284,10 +301,88 @@ async fn main() {
                             .await;
 
                         match res {
-                            Ok(r) if r.status().is_success() =>
-                                text(id, format!("[bridge] sent to '{}' ✓", channel)),
+                            Ok(r) if r.status().is_success() => {
+                                // Fetch the channel topic so the
+                                // confirmation echoes what the channel
+                                // is for — catches misroutes on the
+                                // turn the send happens, not days later.
+                                let topic_resp = client
+                                    .get(format!("{}/channels/{}/topic", args.server, channel))
+                                    .send()
+                                    .await;
+                                let topic = match topic_resp {
+                                    Ok(r) => r
+                                        .json::<Value>()
+                                        .await
+                                        .ok()
+                                        .and_then(|v| v["topic"].as_str().map(|s| s.to_string()))
+                                        .unwrap_or_default(),
+                                    Err(_) => String::new(),
+                                };
+                                let msg = if topic.is_empty() {
+                                    format!("[bridge] sent to '{channel}' ✓ (no topic declared — call set_channel_topic if this channel has a specific purpose)")
+                                } else {
+                                    format!("[bridge] sent to '{channel}' ✓ — topic: {topic}")
+                                };
+                                text(id, msg)
+                            }
                             _ =>
                                 text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+
+                    "list_channels" => {
+                        let res = client
+                            .get(format!("{}/channels", args.server))
+                            .send()
+                            .await;
+                        match res {
+                            Ok(r) => {
+                                let chans: Vec<Value> = r.json().await.unwrap_or_default();
+                                if chans.is_empty() {
+                                    text(id, "[bridge] no channels yet")
+                                } else {
+                                    let formatted = chans
+                                        .iter()
+                                        .map(|c| {
+                                            let name = c["name"].as_str().unwrap_or("?");
+                                            let topic = c["topic"].as_str().unwrap_or("");
+                                            if topic.is_empty() {
+                                                format!("• #{name} — (no topic)")
+                                            } else {
+                                                format!("• #{name} — {topic}")
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    text(id, formatted)
+                                }
+                            }
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+
+                    "set_channel_topic" => {
+                        let channel = args_val["channel"].as_str().unwrap_or("").to_string();
+                        let topic = args_val["topic"].as_str().unwrap_or("").to_string();
+                        if channel.is_empty() {
+                            text(id, "[bridge] ERROR: channel required")
+                        } else {
+                            let res = client
+                                .put(format!("{}/channels/{}/topic", args.server, channel))
+                                .json(&json!({ "from": args.name, "topic": topic }))
+                                .send()
+                                .await;
+                            match res {
+                                Ok(r) if r.status().is_success() =>
+                                    text(id, format!("[bridge] #{channel} topic set: {topic}")),
+                                Ok(r) => {
+                                    let s = r.status();
+                                    let body = r.text().await.unwrap_or_default();
+                                    text(id, format!("[bridge] ERROR {s}: {body}"))
+                                }
+                                _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                            }
                         }
                     }
 
