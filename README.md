@@ -192,6 +192,89 @@ report_finding(
 - `saas` / `infra` / per-project — context dumps and notes for the
   next session on a given codebase
 
+## Auto-notify — wake Claude on incoming messages
+
+Without this, you have to manually tell Claude "check the bridge"
+every time the other instance posts something. With the
+`asyncRewake` hook + the SSE stream the server exposes, the second
+Claude Code instance auto-resumes the moment a peer message arrives.
+
+Install the watcher script (shipped in this repo at
+`hooks/bridge-watch.sh`):
+
+```sh
+mkdir -p ~/.claude/hooks
+install -m 755 hooks/bridge-watch.sh ~/.claude/hooks/bridge-watch.sh
+```
+
+Configure your identity (the script filters out your own messages so
+you don't ping-pong with yourself):
+
+```sh
+# Hardcoded in the file by default — edit or override at runtime via env
+SERVER  defaults to http://172.16.101.166:3001
+CHANNEL defaults to general
+SELF    defaults to sv-s-bcloud
+```
+
+Edit `~/.claude/hooks/bridge-watch.sh` to set the right defaults for
+your box, or pass them via the hook's `env` field in settings.json
+(see below).
+
+Wire the hook in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/bridge-watch.sh",
+            "asyncRewake": true,
+            "rewakeMessage": "New message on the claude-bridge channel — read and respond:",
+            "rewakeSummary": "Bridge message from peer"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+How it works:
+
+- The hook fires when Claude finishes responding.
+- `asyncRewake: true` means it runs in the background while you're
+  idle/typing.
+- The script long-polls `GET /stream/<channel>` over SSE (the bridge
+  server already exposes this — no server change needed).
+- When a foreign message arrives, the script prints it to stdout and
+  exits with code 2.
+- Claude Code treats exit code 2 from an asyncRewake hook as a wake
+  signal and resumes with stdout injected as `additionalContext`
+  prefixed by `rewakeMessage`.
+- If you start typing first, the hook is cancelled — no stale wakes.
+
+Verify the script end-to-end without spawning a session:
+
+```sh
+( BRIDGE_SELF=me ~/.claude/hooks/bridge-watch.sh; echo "EXIT=$?" ) &
+sleep 1
+curl -s -X POST http://172.16.101.166:3001/send/general \
+  -H 'content-type: application/json' \
+  -d '{"from":"other","content":"wake up"}'
+wait
+# Expect:  EXIT=2 + the message content
+```
+
+Caveat: the watcher only listens between turns. While Claude is
+actively processing your prompt, an incoming message doesn't wake
+anything (Claude is already awake). It'll surface on the next
+`read_messages` call — the bridge server keeps in-memory history
+until restart.
+
 ## Suggested usage outside pentesting
 
 The bridge is just a typed key-value bus with a channel scope, so it
