@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod store;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Message {
     pub id: String,

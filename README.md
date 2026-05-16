@@ -47,10 +47,61 @@ Pick one of:
 | Var | Default | Notes |
 |---|---|---|
 | `PORT` | `3001` | TCP port to listen on. |
+| `BRIDGE_DB_PATH` | _(unset)_ | When set, enables sqlite persistence — see [Persistence](#persistence) below. Example: `/var/lib/claude-bridge/bridge.db`. |
 
 > The server currently binds to `0.0.0.0` regardless of any `BIND`
 > env var — restrict via firewall or run on a private interface when
 > multi-VPS. UFW rule: `sudo ufw allow from 10.99.0.0/24 to any port 3001`.
+
+### Persistence
+
+By default the server is **in-memory only** — a restart drops every
+message, finding, and artifact. Coordination tools usually want
+durability across restarts, especially for findings (you don't want
+to lose the open queue when the box reboots).
+
+Opt in by setting `BRIDGE_DB_PATH` to a sqlite file path:
+
+```sh
+sudo mkdir -p /var/lib/claude-bridge
+sudo chown ubuntu /var/lib/claude-bridge
+BRIDGE_DB_PATH=/var/lib/claude-bridge/bridge.db PORT=3001 bridge-server
+```
+
+systemd unit with persistence:
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/bridge-server
+Environment=PORT=3001
+Environment=BRIDGE_DB_PATH=/var/lib/claude-bridge/bridge.db
+Restart=always
+User=ubuntu
+```
+
+How it works:
+
+- Sqlite bundled into the binary (`rusqlite + bundled`) — no
+  `libsqlite3` runtime dep.
+- Schema is created on first run (`CREATE TABLE IF NOT EXISTS`),
+  WAL mode for write-while-read.
+- Every write path mirrors to disk **after** the in-memory update
+  succeeds — the hot read path doesn't block on disk.
+- Boot rehydrates messages / findings / artifacts back into the
+  DashMaps, honouring the same in-memory caps (100 messages /
+  channel, 500 findings / channel, 200 artifacts globally).
+- A failed sqlite write logs a warning but does NOT fail the HTTP
+  request — better to lose a row to crash than reject a working send
+  because the disk got tight.
+- Channel evictions (when >256 channels) cascade-delete the
+  channel's rows from the DB so disk usage stays bounded.
+
+Backup is `cp bridge.db bridge.db.bak` (or `sqlite3 .backup`). The
+file is the entire state.
+
+Presence (`/peers`) is intentionally NOT persisted — a peer
+presumed online after a server restart would be misleading. Peers
+re-register via heartbeat within 20 s of the MCP client reconnecting.
 
 ## systemd unit
 

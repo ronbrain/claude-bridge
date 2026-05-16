@@ -6,7 +6,7 @@ use axum::{
     routing::{delete, get, patch, post},
     Json, Router,
 };
-use claude_bridge::{now_secs, Artifact, Finding, Message, Peer, SEVERITIES, STATUSES};
+use claude_bridge::{now_secs, store::Store, Artifact, Finding, Message, Peer, SEVERITIES, STATUSES};
 use dashmap::DashMap;
 use futures::Stream;
 use serde::Deserialize;
@@ -92,6 +92,12 @@ fn ensure_channel_capacity(state: &AppState, channel: &str) {
         state.senders.remove(&victim);
         state.history.remove(&victim);
         state.findings.remove(&victim);
+        // Drop persisted rows for the evicted channel too, otherwise
+        // the DB would grow forever while the in-memory map stays
+        // bounded.
+        if let Some(store) = &state.store {
+            let _ = store.drop_channel(&victim);
+        }
         tracing::warn!(victim, "channel cap reached; evicted oldest");
     }
 }
@@ -103,18 +109,25 @@ struct AppState {
     findings: Arc<DashMap<String, Vec<Finding>>>,
     artifacts: Arc<DashMap<String, (Artifact, Vec<u8>)>>,
     /// `name -> (last_seen_secs, channel)`. Updated by heartbeat
-    /// POST /presence/{name}; read by GET /peers.
+    /// POST /presence/{name}; read by GET /peers. Intentionally
+    /// NOT persisted — presence is a runtime concept; a peer
+    /// presumed online after a server restart would be misleading.
     peers: Arc<DashMap<String, (u64, String)>>,
+    /// Optional sqlite store. `Some` when `BRIDGE_DB_PATH` is set
+    /// in env; `None` keeps the legacy in-memory-only behaviour.
+    /// Every write path forwards to the store when present.
+    store: Option<Store>,
 }
 
 impl AppState {
-    fn new() -> Self {
+    fn new(store: Option<Store>) -> Self {
         Self {
             senders: Arc::new(DashMap::new()),
             history: Arc::new(DashMap::new()),
             findings: Arc::new(DashMap::new()),
             artifacts: Arc::new(DashMap::new()),
             peers: Arc::new(DashMap::new()),
+            store,
         }
     }
 
@@ -123,6 +136,52 @@ impl AppState {
             .entry(channel.to_string())
             .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0)
             .clone()
+    }
+
+    /// Rehydrate the DashMaps from disk on boot. Best-effort: a
+    /// corrupt/missing db just logs and returns; the server keeps
+    /// running with empty state.
+    fn rehydrate(&self) {
+        let Some(store) = &self.store else { return };
+        match store.load_messages(HISTORY_LIMIT) {
+            Ok(msgs) => {
+                let mut count = 0;
+                for m in msgs {
+                    self.history
+                        .entry(m.channel.clone())
+                        .or_default()
+                        .push(m.clone());
+                    // Pre-warm the broadcast sender so the first
+                    // subscriber after restart has a path.
+                    let _ = self.sender(&m.channel);
+                    count += 1;
+                }
+                tracing::info!(count, "rehydrated messages from sqlite");
+            }
+            Err(e) => tracing::warn!(error = %e, "rehydrate messages failed"),
+        }
+        match store.load_findings(FINDING_LIMIT) {
+            Ok(fs) => {
+                let mut count = 0;
+                for f in fs {
+                    self.findings.entry(f.channel.clone()).or_default().push(f);
+                    count += 1;
+                }
+                tracing::info!(count, "rehydrated findings from sqlite");
+            }
+            Err(e) => tracing::warn!(error = %e, "rehydrate findings failed"),
+        }
+        match store.load_artifacts(ARTIFACT_LIMIT) {
+            Ok(arts) => {
+                let mut count = 0;
+                for (art, bytes) in arts {
+                    self.artifacts.insert(art.id.clone(), (art, bytes));
+                    count += 1;
+                }
+                tracing::info!(count, "rehydrated artifacts from sqlite");
+            }
+            Err(e) => tracing::warn!(error = %e, "rehydrate artifacts failed"),
+        }
     }
 }
 
@@ -161,6 +220,18 @@ async fn send(
             let drain = h.len() - HISTORY_LIMIT;
             h.drain(0..drain);
         }
+    }
+
+    // Persistence — write-through after the in-memory update so the
+    // hot read path never blocks on disk. Failures are logged but
+    // don't 500 the client: better to lose a row to crash than to
+    // reject a working send because the disk got tight.
+    if let Some(store) = &state.store {
+        if let Err(e) = store.insert_message(&msg) {
+            tracing::warn!(error = %e, "persist message failed");
+        }
+        // Mirror the in-memory drain.
+        let _ = store.prune_messages(&channel, HISTORY_LIMIT);
     }
 
     // Implicit presence — sending is a sign of life. Saves a separate
@@ -218,6 +289,9 @@ async fn clear_messages(
     State(state): State<AppState>,
 ) -> StatusCode {
     state.history.remove(&channel);
+    if let Some(store) = &state.store {
+        let _ = store.clear_messages(&channel);
+    }
     StatusCode::OK
 }
 
@@ -299,6 +373,12 @@ async fn create_finding(
             f.drain(0..drain);
         }
     }
+    if let Some(store) = &state.store {
+        if let Err(e) = store.upsert_finding(&finding) {
+            tracing::warn!(error = %e, "persist finding failed");
+        }
+        let _ = store.prune_findings(&channel, FINDING_LIMIT);
+    }
     state
         .peers
         .insert(req.from, (now_secs(), channel.clone()));
@@ -366,7 +446,16 @@ async fn triage_finding(
     f.status = req.status;
     f.note = req.note;
     f.updated_at = now_secs();
-    Ok(Json(f.clone()))
+    let snapshot = f.clone();
+    // Drop the DashMap guard before touching disk so we don't hold
+    // the lock across a (sub-ms but still) blocking sqlite write.
+    drop(entry);
+    if let Some(store) = &state.store {
+        if let Err(e) = store.upsert_finding(&snapshot) {
+            tracing::warn!(error = %e, "persist triage failed");
+        }
+    }
+    Ok(Json(snapshot))
 }
 
 /// Hard-delete a finding. Use this for false-positives or noisy
@@ -387,6 +476,10 @@ async fn delete_finding(
             StatusCode::NOT_FOUND,
             format!("finding id '{id}' not found on channel '{channel}'"),
         ));
+    }
+    drop(entry);
+    if let Some(store) = &state.store {
+        let _ = store.delete_finding(&channel, &id);
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -442,6 +535,11 @@ async fn upload_artifact(
             .map(|kv| kv.key().clone())
         {
             state.artifacts.remove(&oldest);
+            // Mirror the eviction in sqlite so a long-running server
+            // doesn't accumulate evicted artifacts on disk.
+            if let Some(store) = &state.store {
+                let _ = store.delete_artifact(&oldest);
+            }
         }
     }
 
@@ -455,7 +553,13 @@ async fn upload_artifact(
         created_at: now_secs(),
     };
     let id = art.id.clone();
-    state.artifacts.insert(id.clone(), (art, body.to_vec()));
+    let bytes = body.to_vec();
+    if let Some(store) = &state.store {
+        if let Err(e) = store.insert_artifact(&art, &bytes) {
+            tracing::warn!(error = %e, "persist artifact failed");
+        }
+    }
+    state.artifacts.insert(id.clone(), (art, bytes));
     Ok(Json(serde_json::json!({
         "id": id,
         "filename": filename,
@@ -563,6 +667,29 @@ async fn main() {
     let port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
     let addr = format!("0.0.0.0:{}", port);
 
+    // Optional persistence. When BRIDGE_DB_PATH is set, the server
+    // mirrors every write to sqlite and rehydrates DashMaps on boot
+    // so a restart doesn't lose chat / findings / artifacts.
+    let store = match std::env::var("BRIDGE_DB_PATH") {
+        Ok(path) if !path.is_empty() => match Store::open(std::path::Path::new(&path)) {
+            Ok(s) => {
+                tracing::info!(path, "persistence enabled (sqlite)");
+                Some(s)
+            }
+            Err(e) => {
+                tracing::error!(path, error = %e, "could not open sqlite db; running in-memory only");
+                None
+            }
+        },
+        _ => {
+            tracing::info!("BRIDGE_DB_PATH unset — running in-memory only (state lost on restart)");
+            None
+        }
+    };
+
+    let state = AppState::new(store);
+    state.rehydrate();
+
     let app = Router::new()
         // Messages
         .route("/send/{channel}", post(send))
@@ -585,7 +712,7 @@ async fn main() {
         // Presence
         .route("/presence/{name}", post(heartbeat))
         .route("/peers", get(list_peers))
-        .with_state(AppState::new());
+        .with_state(state);
 
     tracing::info!("claude-bridge server on {}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

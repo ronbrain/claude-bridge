@@ -3,7 +3,9 @@ Description=Claude Bridge daemon — collects peer messages into ~/.cache/bridge
 After=network.target
 
 [Service]
-# Tweak these to match your bridge deployment.
+# Tweak these to match your bridge deployment. BRIDGE_DB_PATH is only
+# relevant to bridge-server, not to the daemon — included here as a
+# nudge to remind operators to set it on the server unit.
 Environment=BRIDGE_SERVER=http://172.16.101.166:3001
 Environment=BRIDGE_CHANNEL=general
 Environment=BRIDGE_SELF=%H

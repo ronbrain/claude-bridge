@@ -28,3 +28,8 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 dashmap = "6"
+# Bundled sqlite — no system libsqlite3 needed at runtime, single
+# static binary. Used by the optional persistence layer (enabled
+# when BRIDGE_DB_PATH is set in the server's env).
+rusqlite = { version = "0.31", features = ["bundled"] }
+parking_lot = "0.12"
