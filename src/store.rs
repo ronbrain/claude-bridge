@@ -406,6 +406,20 @@ impl Store {
     /// — those came from the X-Bridge-From fallback and don't
     /// correspond to real registry entities.
     ///
+    /// Per finding `9fe0e927` (paledo restart 19:22:58 hit this
+    /// boot path with an `SqliteFailure` that pentest traced to
+    /// FTS5 shadow-table inconsistency from a prior partial migration):
+    ///
+    /// - Wrap the whole op in `BEGIN IMMEDIATE` / `COMMIT` so a
+    ///   trigger-side failure rolls the whole UPDATE back instead
+    ///   of leaving the memory table half-migrated.
+    /// - Before the UPDATE runs, fire
+    ///   `INSERT INTO memory_fts(memory_fts) VALUES('rebuild')` to
+    ///   regenerate the FTS5 shadow content from the live memory
+    ///   table. This is a no-op when FTS is already coherent and a
+    ///   self-repair when it isn't — the underlying cause of the
+    ///   migration's `disk I/O error` on paledo.
+    ///
     /// `known` is the union of registry identities + memory admins
     /// at boot. Empty string and `NULL` are already treated as
     /// ownerless by the column type (TEXT NOT NULL DEFAULT '') so
@@ -416,36 +430,54 @@ impl Store {
         &self,
         known: &std::collections::HashSet<String>,
     ) -> SqliteResult<usize> {
-        // Build the IN-clause dynamically — rusqlite expects param
-        // count to match the SQL placeholders. For an empty known
-        // set the IN-clause collapses to "WHERE updated_by != ''",
-        // which is the correct effect: rewrite every non-empty
-        // owner string.
         let conn = self.conn.lock();
-        if known.is_empty() {
-            let n = conn.execute(
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+
+        // Defensive FTS rebuild. The trigger `memory_fts_update`
+        // attempts a DELETE of OLD.rowid from the FTS shadow table;
+        // if the shadow row is missing (partial prior migration,
+        // direct SQL edits, etc.), the DELETE fails with a generic
+        // `disk I/O error` masking the real cause. Rebuilding the
+        // index here re-syncs it to the content table before our
+        // UPDATE walks the rows. Cheap on a coherent DB.
+        if let Err(e) = conn.execute_batch(
+            "INSERT INTO memory_fts(memory_fts) VALUES('rebuild');",
+        ) {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(e);
+        }
+
+        let result: SqliteResult<usize> = if known.is_empty() {
+            conn.execute(
                 "UPDATE memory SET updated_by = '' WHERE updated_by != ''",
                 [],
-            )?;
-            return Ok(n);
+            )
+        } else {
+            // Build the IN-clause dynamically — rusqlite expects
+            // param count to match SQL placeholders.
+            let names: Vec<String> = known.iter().cloned().collect();
+            let placeholders: String = std::iter::repeat("?")
+                .take(names.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "UPDATE memory SET updated_by = '' \
+                 WHERE updated_by != '' AND updated_by NOT IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            stmt.execute(rusqlite::params_from_iter(names.iter()))
+        };
+
+        match result {
+            Ok(n) => {
+                conn.execute_batch("COMMIT;")?;
+                Ok(n)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
         }
-        // Two passes — first orphan anything that was the literal
-        // historical sentinel strings; then orphan anything whose
-        // owner isn't in the known set. Both can run as a single
-        // UPDATE with a NOT IN, but rusqlite's parameter binding
-        // for slice expansion isn't a one-liner here, so we walk.
-        let names: Vec<String> = known.iter().cloned().collect();
-        let placeholders: String = std::iter::repeat("?")
-            .take(names.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "UPDATE memory SET updated_by = '' \
-             WHERE updated_by != '' AND updated_by NOT IN ({placeholders})"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let n = stmt.execute(rusqlite::params_from_iter(names.iter()))?;
-        Ok(n)
     }
 
     pub fn memory_set(&self, m: &MemoryEntry) -> SqliteResult<()> {
@@ -1460,6 +1492,45 @@ mod tests {
         assert_eq!(state[1], ("beta".into(), "".into()));
         assert_eq!(state[2], ("delta".into(), "".into()));
         assert_eq!(state[3], ("gamma".into(), "".into()));
+    }
+
+    #[test]
+    fn orphan_migration_runs_under_transaction_with_fts_rebuild() {
+        // Re-runs of orphan_unmapped_memory_owners on the same DB
+        // must be idempotent — second call sees an already-clean
+        // table and orphans nothing. Confirms the TX commit-path
+        // is wired correctly (otherwise the BEGIN IMMEDIATE would
+        // leave a stale write lock and the second call would
+        // either deadlock or duplicate work).
+        let s = temp_store();
+        s.conn
+            .lock()
+            .execute(
+                "INSERT INTO memory (channel, key_, value_, updated_by, updated_at)
+                 VALUES ('c1', 'a', 'v', 'alice', 0),
+                        ('c1', 'b', 'v', 'unknown', 0),
+                        ('c1', 'c', 'v', 'anonymous', 0)",
+                [],
+            )
+            .unwrap();
+        let mut known = std::collections::HashSet::new();
+        known.insert("alice".to_string());
+        let n1 = s.orphan_unmapped_memory_owners(&known).unwrap();
+        assert_eq!(n1, 2, "first pass clears unknown + anonymous");
+        let n2 = s.orphan_unmapped_memory_owners(&known).unwrap();
+        assert_eq!(n2, 0, "second pass is idempotent");
+        // memory_fts is still queryable post-rebuild — confirms
+        // the trigger plumbing wasn't broken by the migration.
+        let q: i64 = s
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM memory_fts WHERE memory_fts MATCH ?",
+                ["v"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(q >= 1, "FTS index remains queryable post-orphan-migration");
     }
 
     #[test]

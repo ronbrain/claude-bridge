@@ -276,6 +276,17 @@ impl AuthState {
     pub fn is_memory_admin(&self, identity: &str) -> bool {
         self.memory_admins.iter().any(|a| a == identity)
     }
+
+    /// True when the server is running unauthenticated by explicit
+    /// operator choice (`BRIDGE_AUTH_PERMISSIVE=1`). Boot-time
+    /// migrations consult this to decide whether to refuse-to-start
+    /// on failure (enforce mode) or warn-and-continue (permissive).
+    /// Per finding `9fe0e927`: a migration that fails in enforce
+    /// mode would silently leave ownership unenforceable and is
+    /// itself a production-broken state.
+    pub fn is_permissive(&self) -> bool {
+        self.permissive
+    }
 }
 
 /// Decode a 64-hex-char string into the 32-byte hash. None on

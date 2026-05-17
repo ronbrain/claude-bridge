@@ -8,6 +8,23 @@
 
 use std::time::Duration;
 
+/// Errors `Config::from_env` returns when the startup invariants
+/// of `ops-rule-no-silent-fail-open-defaults` aren't met. `main()`
+/// surfaces these as a FATAL log + exit code 2 so an operator's
+/// missing env var doesn't silently degrade to a state-bearing
+/// failure mode (per data-loss incident on sv-s-bcloud + finding
+/// `c9d0bfd9`).
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigStartupError {
+    #[error(
+        "BRIDGE_DB_PATH empty and BRIDGE_DB_EPHEMERAL not set — refusing to start without \
+         persistent storage. Set BRIDGE_DB_PATH=/path/to/bridge.db to enable sqlite-backed \
+         persistence (recommended), OR set BRIDGE_DB_EPHEMERAL=1 to explicitly run in-memory-only \
+         (state lost on every restart — see finding c9d0bfd9)."
+    )]
+    DbPathEmptyNotEphemeral,
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// `0.0.0.0:<port>` to bind. From `PORT` (default 3001).
@@ -85,7 +102,7 @@ impl Config {
     /// a typo'd var name silently uses the default, which is the
     /// existing behaviour for `PORT` etc. and avoids gating boot on
     /// trivial env-name corrections.
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self, ConfigStartupError> {
         let default = Self::default();
         // Bind resolution order:
         //   1. `BRIDGE_BIND` (full host:port) wins — explicit
@@ -113,9 +130,32 @@ impl Config {
                 format!("127.0.0.1:{port}")
             }
         };
+        // Persistence resolution per ops-rule-no-silent-fail-open-
+        // defaults + finding c9d0bfd9. The previous code silently
+        // dropped to in-memory mode when BRIDGE_DB_PATH was unset,
+        // which cost an experienced operator multi-engagement state
+        // on sv-s-bcloud (2026-05-17). Now: refuse to start unless
+        // the operator either points at a file OR explicitly opts
+        // into ephemeral mode via BRIDGE_DB_EPHEMERAL=1. Same shape
+        // as the auth bundle's BRIDGE_AUTH_PERMISSIVE gate.
         let db_path = std::env::var("BRIDGE_DB_PATH")
             .ok()
             .filter(|s| !s.is_empty());
+        let ephemeral = std::env::var("BRIDGE_DB_EPHEMERAL")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if db_path.is_none() && !ephemeral {
+            return Err(ConfigStartupError::DbPathEmptyNotEphemeral);
+        }
+        if db_path.is_none() && ephemeral {
+            tracing::warn!(
+                "SEVERE: BRIDGE_DB_EPHEMERAL=1 — bridge is running with NO persistent storage. \
+                 Every message, finding, dispatch, memory key, audit row, and peer status will \
+                 be lost on the next restart. See finding c9d0bfd9. Set BRIDGE_DB_PATH=<file> \
+                 to enable sqlite-backed persistence."
+            );
+        }
         let allowed_origins = std::env::var("BRIDGE_ALLOWED_ORIGINS")
             .ok()
             .map(|s| {
@@ -126,7 +166,7 @@ impl Config {
                     .collect()
             })
             .unwrap_or_default();
-        Self {
+        Ok(Self {
             bind,
             db_path,
             allowed_origins,
@@ -142,13 +182,46 @@ impl Config {
                 "BRIDGE_MEMORY_HISTORY_KEEP",
                 default.memory_history_keep,
             ),
-        }
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_env_refuses_empty_db_path_without_ephemeral_opt_in() {
+        // Save + clear so we exercise the fail-closed gate.
+        let prev_path = std::env::var("BRIDGE_DB_PATH").ok();
+        let prev_eph = std::env::var("BRIDGE_DB_EPHEMERAL").ok();
+        std::env::remove_var("BRIDGE_DB_PATH");
+        std::env::remove_var("BRIDGE_DB_EPHEMERAL");
+        let r = Config::from_env();
+        assert!(
+            matches!(r, Err(ConfigStartupError::DbPathEmptyNotEphemeral)),
+            "empty BRIDGE_DB_PATH without BRIDGE_DB_EPHEMERAL must refuse to start"
+        );
+        // Opt-in path admits the empty path with a warn.
+        std::env::set_var("BRIDGE_DB_EPHEMERAL", "1");
+        let r = Config::from_env();
+        assert!(r.is_ok(), "BRIDGE_DB_EPHEMERAL=1 must admit empty path");
+        assert!(r.unwrap().db_path.is_none());
+        // Explicit path also admits (orthogonal to the opt-in flag).
+        std::env::set_var("BRIDGE_DB_PATH", "/tmp/bridge-test-config-only.db");
+        let r = Config::from_env();
+        assert!(r.is_ok());
+        assert_eq!(r.unwrap().db_path.as_deref(), Some("/tmp/bridge-test-config-only.db"));
+        // Restore env so we don't poison sibling tests.
+        std::env::remove_var("BRIDGE_DB_EPHEMERAL");
+        std::env::remove_var("BRIDGE_DB_PATH");
+        if let Some(v) = prev_path {
+            std::env::set_var("BRIDGE_DB_PATH", v);
+        }
+        if let Some(v) = prev_eph {
+            std::env::set_var("BRIDGE_DB_EPHEMERAL", v);
+        }
+    }
 
     #[test]
     fn defaults_are_sane() {

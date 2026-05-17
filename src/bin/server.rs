@@ -2022,7 +2022,16 @@ async fn complete_dispatch(
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let cfg = claude_bridge::Config::from_env();
+    let cfg = match claude_bridge::Config::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            // Same fail-closed gate as the auth bundle. Per ops-rule-
+            // no-silent-fail-open-defaults: missing persistence env
+            // must refuse to start, not silently degrade.
+            eprintln!("FATAL: {e}");
+            std::process::exit(2);
+        }
+    };
     tracing::info!(?cfg, "loaded runtime config");
 
     // Optional persistence. `db_path = Some(_)` enables write-through
@@ -2122,7 +2131,36 @@ async fn main() {
                 orphaned = n,
                 "memory-ownership migration: rewrote {n} rows to ownerless (claimable by first authed writer)"
             ),
-            Err(e) => tracing::warn!(error = %e, "memory-ownership migration failed; existing owners unchanged"),
+            Err(e) => {
+                // Per finding 9fe0e927: the migration failure on
+                // paledo was masked as WARN-only — operator never
+                // noticed the boot path left ownership in an
+                // inconsistent state. In enforce mode the bridge
+                // now refuses to start; in permissive mode it
+                // logs ERROR (not WARN) and continues so the
+                // operator has a way to come up and diagnose.
+                if !auth_state.is_permissive() {
+                    eprintln!(
+                        "FATAL: memory-ownership migration failed in enforce mode: {e}"
+                    );
+                    eprintln!(
+                        "       Likely FTS5 shadow-table inconsistency (finding 9fe0e927)."
+                    );
+                    eprintln!(
+                        "       Try: sqlite3 \"$BRIDGE_DB_PATH\" \"INSERT INTO memory_fts(memory_fts) VALUES('rebuild');\""
+                    );
+                    eprintln!(
+                        "       Then restart. If failure persists, set BRIDGE_AUTH_PERMISSIVE=1 to come up + investigate."
+                    );
+                    std::process::exit(2);
+                }
+                tracing::error!(
+                    error = %e,
+                    "memory-ownership migration FAILED. Permissive mode allows boot to continue, \
+                     but ownership of existing memory rows is unenforceable until the underlying \
+                     issue (see finding 9fe0e927) is resolved."
+                );
+            }
         }
     }
 
