@@ -16,7 +16,7 @@
 
 set -uo pipefail
 
-SERVER="${BRIDGE_SERVER:-http://172.16.101.166:3001}"
+SERVER="${BRIDGE_SERVER:-http://localhost:3001}"
 CHANNELS_RAW="${BRIDGE_CHANNEL:-general}"
 SELF="${BRIDGE_SELF:-$(hostname -s 2>/dev/null || hostname)}"
 LOG_FILE="${BRIDGE_LOG_FILE:-$HOME/.cache/bridge/messages.jsonl}"

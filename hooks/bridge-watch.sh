@@ -11,7 +11,7 @@
 
 set -uo pipefail
 
-SERVER="${BRIDGE_SERVER:-http://172.16.101.166:3001}"
+SERVER="${BRIDGE_SERVER:-http://localhost:3001}"
 CHANNELS_RAW="${BRIDGE_CHANNEL:-general}"
 # Per-session identity (host/short-session-id). Falls back to plain
 # hostname if SessionStart never ran. Other peers address us with

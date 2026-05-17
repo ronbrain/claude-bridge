@@ -221,7 +221,7 @@ triage from your editor — use the `bridge` binary. Same env-var
 contract as `bridge-mcp`:
 
 ```sh
-export BRIDGE_SERVER=http://172.16.101.166:3001
+export BRIDGE_SERVER=http://YOUR_BRIDGE_SERVER:3001
 export BRIDGE_CHANNEL=general
 export BRIDGE_SELF=$(hostname)
 ```
@@ -521,7 +521,7 @@ Verify the script end-to-end without spawning a session:
 ```sh
 ( BRIDGE_SELF=me ~/.claude/hooks/bridge-watch.sh; echo "EXIT=$?" ) &
 sleep 1
-curl -s -X POST http://172.16.101.166:3001/send/general \
+curl -s -X POST http://YOUR_BRIDGE_SERVER:3001/send/general \
   -H 'content-type: application/json' \
   -d '{"from":"other","content":"wake up"}'
 wait
@@ -607,7 +607,7 @@ End-to-end verify the daemon:
 journalctl --user -u bridge-daemon -f
 
 # In another (or from the peer instance):
-curl -s -X POST http://172.16.101.166:3001/send/general \
+curl -s -X POST http://YOUR_BRIDGE_SERVER:3001/send/general \
   -H 'content-type: application/json' \
   -d '{"from":"peer","content":"daemon test"}'
 

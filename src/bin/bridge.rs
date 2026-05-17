@@ -5,7 +5,7 @@
 //! single export-block in your shell rc covers both:
 //!
 //! ```sh
-//! export BRIDGE_SERVER=http://172.16.101.166:3001
+//! export BRIDGE_SERVER=http://localhost:3001
 //! export BRIDGE_CHANNEL=general
 //! export BRIDGE_SELF=$(hostname)
 //! ```
