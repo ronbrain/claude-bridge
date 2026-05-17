@@ -881,18 +881,36 @@ async fn main() {
                                                     .filter_map(|v| v.as_str().map(String::from))
                                                     .collect())
                                                 .unwrap_or_default();
+                                            let skills: Vec<String> = p["skills"]
+                                                .as_array()
+                                                .map(|a| a.iter()
+                                                    .filter_map(|v| v.as_str().map(String::from))
+                                                    .collect())
+                                                .unwrap_or_default();
+                                            let status = p["status"].as_str().unwrap_or("");
                                             let role_tag = if roles.is_empty() {
                                                 String::new()
                                             } else {
                                                 format!(" [roles: {}]", roles.join(","))
                                             };
-                                            format!(
+                                            let mut line = format!(
                                                 "• {} — idle {}s on #{}{}",
                                                 p["name"].as_str().unwrap_or("?"),
                                                 p["idle_secs"].as_u64().unwrap_or(0),
                                                 p["channel"].as_str().unwrap_or("?"),
                                                 role_tag,
-                                            )
+                                            );
+                                            if !skills.is_empty() {
+                                                line.push_str(&format!(
+                                                    "\n    skills: {}", skills.join(",")
+                                                ));
+                                            }
+                                            if !status.is_empty() {
+                                                line.push_str(&format!(
+                                                    "\n    status: {}", status
+                                                ));
+                                            }
+                                            line
                                         })
                                         .collect::<Vec<_>>()
                                         .join("\n");
