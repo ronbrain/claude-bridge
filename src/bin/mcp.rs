@@ -228,15 +228,11 @@ fn tools_list() -> Value {
 fn spawn_heartbeat(args: Arc<Args>, client: reqwest::Client) -> tokio::task::AbortHandle {
     let h = tokio::spawn(async move {
         let url = format!("{}/presence/{}", args.server, args.name);
-        // Parse roles once. Empty `--role ""` produces an empty Vec,
-        // which the server treats as "no roles declared".
-        let roles: Vec<String> = args
-            .role
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
         loop {
+            // Re-resolve roles every heartbeat so a user running
+            // `bridge role <name>` from inside the session takes
+            // effect within 20s — no MCP restart needed.
+            let roles = resolve_roles(&args.role);
             let _ = client
                 .post(&url)
                 .json(&json!({ "channel": args.channel, "roles": roles }))
@@ -247,6 +243,69 @@ fn spawn_heartbeat(args: Arc<Args>, client: reqwest::Client) -> tokio::task::Abo
         }
     });
     h.abort_handle()
+}
+
+/// Roles resolution precedence (highest first):
+///   1. `--role` flag explicitly set.
+///   2. `$BRIDGE_ROLE` env var.
+///   3. `~/.cache/bridge/roles/<session_id>`, where session_id is
+///      discovered by walking the PPID chain back to the Claude
+///      Code process (matches what bridge-identity.sh does for the
+///      identity string).
+fn resolve_roles(flag: &str) -> Vec<String> {
+    let split_csv = |s: &str| -> Vec<String> {
+        s.split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    };
+    if !flag.is_empty() {
+        return split_csv(flag);
+    }
+    if let Ok(env) = std::env::var("BRIDGE_ROLE") {
+        if !env.is_empty() {
+            return split_csv(&env);
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let cache_dir =
+        std::env::var("BRIDGE_CACHE_DIR").unwrap_or_else(|_| format!("{home}/.cache/bridge"));
+    if let Some(sid) = resolve_session_id(&cache_dir) {
+        let role_file = format!("{cache_dir}/roles/{sid}");
+        if let Ok(s) = std::fs::read_to_string(&role_file) {
+            return split_csv(&s);
+        }
+    }
+    Vec::new()
+}
+
+/// Walk up the PPID chain looking for `~/.cache/bridge/session-${pid}`
+/// (left by the SessionStart hook). Returns the session_id from the
+/// first hit. Matches the lookup the CLI subcommand `bridge role`
+/// and the shell helpers use, so all three agree on the same
+/// session_id for the running Claude Code instance.
+fn resolve_session_id(cache_dir: &str) -> Option<String> {
+    let mut pid = std::os::unix::process::parent_id();
+    for _ in 0..6 {
+        let path = format!("{cache_dir}/session-{pid}");
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            let s = s.trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after = stat.rsplit_once(')').map(|(_, rest)| rest)?.trim();
+        let parts: Vec<&str> = after.split_whitespace().collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        pid = parts[1].parse().ok()?;
+        if pid <= 1 {
+            return None;
+        }
+    }
+    None
 }
 
 #[tokio::main]

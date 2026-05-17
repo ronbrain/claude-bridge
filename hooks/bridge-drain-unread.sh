@@ -19,7 +19,7 @@ OFFSET_DIR="${BRIDGE_OFFSET_DIR:-$HOME/.cache/bridge/offsets}"
 # message with non-empty `.to` only surfaces when it includes either
 # our identity or one of our roles.
 SELF_NAME="$(~/.claude/hooks/bridge-identity.sh 2>/dev/null || hostname -s)"
-SELF_ROLES="${BRIDGE_ROLE:-}"
+SELF_ROLES="$(~/.claude/hooks/bridge-role.sh 2>/dev/null || echo)"
 
 # The hook receives a JSON payload on stdin including the session_id
 # Claude Code assigns to this instance. We key the offset on that so

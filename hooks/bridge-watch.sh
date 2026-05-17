@@ -19,7 +19,10 @@ CHANNELS_RAW="${BRIDGE_CHANNEL:-general}"
 SELF="$(~/.claude/hooks/bridge-identity.sh 2>/dev/null || echo sv-s-bcloud)"
 # Comma-separated roles this instance claims. Used to match messages
 # addressed `to: [<role>]` even when they don't name us literally.
-ROLES_RAW="${BRIDGE_ROLE:-}"
+# Resolved via the bridge-role helper so the role can be set per
+# session (via .bridge-role in cwd or `bridge role <name>`) without
+# requiring a static env var in settings.json.
+ROLES_RAW="$(~/.claude/hooks/bridge-role.sh 2>/dev/null || echo)"
 
 IFS=',' read -ra CHANNELS <<< "$CHANNELS_RAW"
 TRIMMED=()
