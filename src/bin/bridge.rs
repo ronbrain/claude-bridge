@@ -117,6 +117,27 @@ enum Cmd {
         /// New role for this session. Omit to read.
         name: Option<String>,
     },
+    /// Print peer-health snapshot for a peer. Wraps
+    /// `GET /peer/<name>/health` — composite presence + open
+    /// dispatches + open findings + active tasks. Useful for ops
+    /// triage without going through MCP.
+    Health {
+        /// Peer identity to inspect.
+        peer: String,
+    },
+    /// Pretty-print bridge-wide metrics. Wraps `GET /metrics`.
+    Metrics,
+    /// Print open dispatches (unacked) — short table. Reads
+    /// `dispatches_pending` via `GET /metrics` for the count and
+    /// composes the per-peer view from `GET /peer/<name>/health`
+    /// for each name in `--for`. Without `--for`, it prints the
+    /// pending count only (cheap).
+    Dispatches {
+        /// Inspect dispatches addressed to this peer; repeat for
+        /// multiple. Without it, only the global count is shown.
+        #[arg(long = "for")]
+        for_peers: Vec<String>,
+    },
 }
 
 struct Cfg {
@@ -415,6 +436,120 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 eprintln!("clear failed: {}", r.status());
                 std::process::exit(1);
+            }
+        }
+
+        Cmd::Health { peer } => {
+            let r = client
+                .get(format!("{}/peer/{}/health", c.server, peer))
+                .send()
+                .await?;
+            if !r.status().is_success() {
+                eprintln!("health failed: {}", r.status());
+                std::process::exit(1);
+            }
+            let v: Value = r.json().await?;
+            // Compact human-readable rendering — JSON-pretty is too
+            // verbose for a CLI tail-and-grep workflow.
+            let present = v["present"].as_bool().unwrap_or(false);
+            let idle = v["idle_secs"].as_u64();
+            let chan = v["channel"].as_str().unwrap_or("");
+            let status = v["status"].as_str().unwrap_or("");
+            let of = v["open_findings"].as_u64().unwrap_or(0);
+            let at = v["active_tasks"].as_u64().unwrap_or(0);
+            let pd = v["pending_dispatches"].as_array().map(|a| a.len()).unwrap_or(0);
+            println!("peer:    {peer}");
+            if !present {
+                println!("status:  (unknown / no heartbeat)");
+            } else {
+                println!("idle:    {}s on #{chan}", idle.unwrap_or(0));
+                println!("status:  {status}");
+            }
+            println!("open findings: {of}");
+            println!("active tasks:  {at}");
+            println!("pending dispatches: {pd}");
+            if let Some(arr) = v["pending_dispatches"].as_array() {
+                for d in arr {
+                    println!(
+                        "  - {} from {} #{} ({}s old)",
+                        d["message_id"].as_str().unwrap_or("?"),
+                        d["from"].as_str().unwrap_or("?"),
+                        d["channel"].as_str().unwrap_or("?"),
+                        d["age_secs"].as_u64().unwrap_or(0)
+                    );
+                }
+            }
+        }
+
+        Cmd::Metrics => {
+            let r = client
+                .get(format!("{}/metrics", c.server))
+                .send()
+                .await?;
+            if !r.status().is_success() {
+                eprintln!("metrics failed: {}", r.status());
+                std::process::exit(1);
+            }
+            let v: Value = r.json().await?;
+            // Right-aligned numeric column for terminal readability.
+            let row = |label: &str, val: &Value| {
+                let s = val.to_string();
+                println!("  {label:30}  {s}");
+            };
+            println!("bridge metrics:");
+            row("peers_active",          &v["peers_active"]);
+            row("channels",              &v["channels"]);
+            row("messages_total",        &v["messages_total"]);
+            row("findings_total",        &v["findings_total"]);
+            row("findings_open",         &v["findings_open"]);
+            row("tasks_total",           &v["tasks_total"]);
+            row("tasks_active",          &v["tasks_active"]);
+            row("artifacts",             &v["artifacts"]);
+            row("dispatches_pending",    &v["dispatches_pending"]);
+            if let Some(map) = v["sse_lag_drops"].as_object() {
+                if !map.is_empty() {
+                    println!("  sse_lag_drops_per_channel:");
+                    for (k, n) in map {
+                        println!("    {k:28}  {n}");
+                    }
+                }
+            }
+        }
+
+        Cmd::Dispatches { for_peers } => {
+            // Cheap path: just the bridge-wide count.
+            let v: Value = client
+                .get(format!("{}/metrics", c.server))
+                .send()
+                .await?
+                .json()
+                .await?;
+            println!(
+                "open dispatches (bridge-wide): {}",
+                v["dispatches_pending"].as_u64().unwrap_or(0)
+            );
+            // Expensive path: per-peer breakdown via health.
+            for peer in &for_peers {
+                let r = client
+                    .get(format!("{}/peer/{}/health", c.server, peer))
+                    .send()
+                    .await?;
+                if !r.status().is_success() {
+                    eprintln!("  {peer}: health failed ({})", r.status());
+                    continue;
+                }
+                let v: Value = r.json().await?;
+                let arr = v["pending_dispatches"].as_array().cloned().unwrap_or_default();
+                println!("  {peer}: {} pending", arr.len());
+                for d in arr {
+                    println!(
+                        "    - {} from {} #{} ({}s old)",
+                        d["message_id"].as_str().unwrap_or("?"),
+                        d["from"].as_str().unwrap_or("?"),
+                        d["channel"].as_str().unwrap_or("?"),
+                        d["age_secs"].as_u64().unwrap_or(0)
+                    );
+                }
             }
         }
     }

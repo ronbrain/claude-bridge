@@ -1,7 +1,52 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod automation;
+pub mod config;
+pub mod error;
 pub mod store;
+pub use config::Config;
+pub use error::{ApiError, ApiResult};
+
+/// Bound a `&str`-like input by byte length, returning a 400-shaped
+/// tuple-error compatible with axum handlers' current
+/// `Result<T, (StatusCode, String)>` signature. Lets handlers write
+/// `cap!(req.title, MAX_TITLE_LEN)` instead of the boilerplate
+/// `cap(&req.title, MAX_TITLE_LEN, "title")?` — the field name is
+/// the literal identifier so the error message stays accurate
+/// without an explicit string arg.
+///
+/// Used by every write handler in server.rs (12+ sites). Centralised
+/// to make changes to the error shape (Group D's later `ApiError`
+/// migration) a single edit.
+#[macro_export]
+macro_rules! cap {
+    ($value:expr, $max:expr) => {{
+        let v = &$value;
+        let max = $max;
+        if v.len() > max {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "{} too long ({}>{})",
+                    stringify!($value).trim_start_matches("req.").trim_start_matches("&"),
+                    v.len(),
+                    max
+                ),
+            ));
+        }
+    }};
+    ($value:expr, $max:expr, $field:expr) => {{
+        let v = &$value;
+        let max = $max;
+        if v.len() > max {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("{} too long ({}>{})", $field, v.len(), max),
+            ));
+        }
+    }};
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Message {
@@ -177,6 +222,177 @@ pub struct MemoryEntry {
     /// until the next overwrite.
     #[serde(default)]
     pub expires_at: u64,
+}
+
+// ─── Group A new types (Schema v2+) ────────────────────────────────
+//
+// These types back the post-v1 schema additions: structured peer
+// status history (audit-only; live presence stays string-typed in
+// server memory), dispatch tracking, memory version history, coverage
+// snapshots, decision log, finding lifecycle, channel mirrors, and
+// audit log. None of them participate in the hot-read path — they
+// exist to make analytics, postmortem, and resume-index generation
+// possible without grepping chat history.
+
+/// Structured form of a peer's status. Persisted only as transition
+/// history (`peer_status_history`); live presence stays `String` in
+/// `PeerState` to preserve the intentional ephemeral semantics in
+/// server.rs (see comment at AppState::peers).
+pub const PEER_STATES: &[&str] = &["working", "blocked", "standby", "engagement_closed"];
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerStatus {
+    /// One of PEER_STATES.
+    pub state: String,
+    /// Required when state is `blocked` or `standby`. Free text;
+    /// validated non-empty at write time, not by shape.
+    #[serde(default)]
+    pub reason: String,
+    /// Unix-seconds when this state was entered.
+    pub since: u64,
+    /// Required when state is `blocked` — identity of the peer (or
+    /// the artefact id) the caller is waiting on.
+    #[serde(default)]
+    pub blocked_by: String,
+}
+
+/// One row in `peer_status_history`. Append-only; written only when
+/// the live peer's status changes from the previous row's value
+/// (snapshot-on-transition, not on every heartbeat — protects the
+/// writer lock).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerStatusHistory {
+    pub id: String,
+    pub peer: String,
+    pub status: PeerStatus,
+    pub recorded_at: u64,
+}
+
+/// A message sent with a non-empty `to:` list becomes a dispatch
+/// row: a tracked unit of "X asked Y to do something". Ack and
+/// completion are separate columns so the lifecycle is queryable
+/// without rescanning chat.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Dispatch {
+    pub id: String,
+    pub message_id: String,
+    pub from: String,
+    /// Comma-joined recipients — serialized form so the table stays
+    /// scalar. Parsed back into `Vec<String>` at the API boundary.
+    pub to: String,
+    pub channel: String,
+    pub sent_at: u64,
+    /// Unix-seconds the recipient acknowledged. 0 = not yet acked.
+    #[serde(default)]
+    pub ack_at: u64,
+    /// ETA the recipient committed at ack time. 0 = none.
+    #[serde(default)]
+    pub ack_eta_secs: u64,
+    /// Unix-seconds the recipient marked done. 0 = open.
+    #[serde(default)]
+    pub completed_at: u64,
+    /// Free-form outcome note at completion.
+    #[serde(default)]
+    pub outcome: String,
+}
+
+/// One historical version of a memory key. Latest N=5 kept per
+/// (channel, key); older ones drop. Lets a peer `memory_diff` two
+/// versions without a separate database.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MemoryHistory {
+    pub channel: String,
+    pub key: String,
+    pub version: u64,
+    pub value: String,
+    pub set_by: String,
+    pub set_at: u64,
+}
+
+/// Coverage snapshot keyed by `(role, surface_type)`. Replaces the
+/// ad-hoc `<role>-coverage-<date>` memory keys with a queryable
+/// table.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Coverage {
+    pub role: String,
+    pub surface_type: String,
+    pub current: u64,
+    pub total: u64,
+    /// Optional JSON object — breakdown by sub-category, free-form.
+    #[serde(default)]
+    pub breakdown: String,
+    pub updated_by: String,
+    pub updated_at: u64,
+}
+
+/// A first-class decision record. Replaces ad-hoc `decision-*`
+/// memory keys; backed by FTS5 for text search.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Decision {
+    pub id: String,
+    pub decision_text: String,
+    pub reason: String,
+    /// JSON array of strings. Empty when no alternatives recorded.
+    #[serde(default)]
+    pub alternatives: String,
+    #[serde(default)]
+    pub scope: String,
+    pub decided_by: String,
+    #[serde(default)]
+    pub applies_to: String,
+    pub decided_at: u64,
+}
+
+/// One row in `finding_transitions` — the full lifecycle of a
+/// finding from `open` through any number of triage cycles to
+/// `fixed` or `wontfix`. Hooked from `create_finding` and
+/// `triage_finding`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FindingTransition {
+    pub finding_id: String,
+    pub from_status: String,
+    pub to_status: String,
+    pub transitioned_by: String,
+    pub at: u64,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// Cross-channel memory mirror declaration. When a write happens to
+/// `(source_channel, source_key)`, the server propagates to every
+/// registered mirror with `target_channel.target_key`. Depth-limited
+/// to 1 hop in the server to avoid cycles.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MirrorLink {
+    pub source_channel: String,
+    pub source_key: String,
+    pub target_channel: String,
+    pub target_key: String,
+    pub created_at: u64,
+}
+
+/// One row in `audit_log`. Append-only; one entry per write op.
+/// `before_hash` / `after_hash` are sha256-truncated to 16 bytes
+/// so the log does not itself store full payloads, but can be
+/// joined back to source tables at a known point for forensics.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub id: String,
+    pub at: u64,
+    pub actor: String,
+    pub op: String,
+    pub target_type: String,
+    pub target_id: String,
+    /// 16 hex chars (8 bytes) of sha256 over the prior row, "" if
+    /// the row didn't exist before this op.
+    #[serde(default)]
+    pub before_hash: String,
+    /// 16 hex chars of sha256 over the row after the op.
+    #[serde(default)]
+    pub after_hash: String,
+    /// "ok" or a short error tag — full error strings stay in
+    /// tracing logs to avoid mirroring sensitive content here.
+    pub result: String,
 }
 
 pub fn now_secs() -> u64 {

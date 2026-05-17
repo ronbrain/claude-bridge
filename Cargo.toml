@@ -41,3 +41,13 @@ dashmap = "6"
 # when BRIDGE_DB_PATH is set in the server's env).
 rusqlite = { version = "0.31", features = ["bundled"] }
 parking_lot = "0.12"
+thiserror = "1"
+# Audit-log content hashing. We only need a fixed-output one-way
+# digest; sha2 is the small/standard choice and pulls in no extra
+# transitive load. Truncated to 16 hex chars at the call site —
+# 64-bit collision-resistance is enough for forensic joins at
+# bridge scale (~thousands of events/year).
+sha2 = "0.10"
+# trait fn async in a `dyn Scanner` requires async_trait until the
+# stable RPITIT path lands for dyn-compatible traits.
+async-trait = "0.1"

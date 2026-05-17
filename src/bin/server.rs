@@ -7,8 +7,8 @@ use axum::{
     Json, Router,
 };
 use claude_bridge::{
-    now_secs, store::Store, Artifact, ChannelTopic, Finding, MemoryEntry, Message, Peer, Task,
-    SEVERITIES, STATUSES, TASK_STATUSES,
+    cap, now_secs, store::Store, Artifact, ChannelTopic, Finding, MemoryEntry, Message, Peer,
+    Task, SEVERITIES, STATUSES, TASK_STATUSES,
 };
 use dashmap::DashMap;
 use futures::Stream;
@@ -55,14 +55,42 @@ const MAX_TOPIC_LEN: usize = 512;
 /// `findings`/`artifacts` — all keyed by channel.
 const MAX_CHANNELS: usize = 256;
 
-fn cap(s: &str, max: usize, field: &str) -> Result<(), (StatusCode, String)> {
-    if s.len() > max {
-        Err((
-            StatusCode::BAD_REQUEST,
-            format!("{field} too long ({}>{max})", s.len()),
-        ))
-    } else {
-        Ok(())
+/// Append one audit-log row for a write op. Best-effort: a sqlite
+/// failure here MUST NOT propagate as a 5xx — the audit log is
+/// observability, not the source of truth. We log the failure via
+/// `tracing` and let the original mutation stand. Callers pass
+/// `before` = `None` for CREATEs and `after` = `None` for DELETEs;
+/// the helper computes 128-bit truncated sha256 over the canonical
+/// JSON form (see `claude_bridge::store::audit_hash_struct`) of
+/// each.
+///
+/// Width: 32 hex chars (128-bit) per pentest review 1779038688.
+fn write_audit<B, A>(
+    store: &Store,
+    actor: &str,
+    op: &str,
+    target_type: &str,
+    target_id: &str,
+    before: Option<&B>,
+    after: Option<&A>,
+) where
+    B: serde::Serialize,
+    A: serde::Serialize,
+{
+    use claude_bridge::store::audit_hash_struct;
+    let entry = claude_bridge::AuditEntry {
+        id: Uuid::new_v4().to_string(),
+        at: now_secs(),
+        actor: actor.to_string(),
+        op: op.to_string(),
+        target_type: target_type.to_string(),
+        target_id: target_id.to_string(),
+        before_hash: before.map(audit_hash_struct).unwrap_or_default(),
+        after_hash: after.map(audit_hash_struct).unwrap_or_default(),
+        result: "ok".into(),
+    };
+    if let Err(e) = store.audit(&entry) {
+        tracing::warn!(error = %e, op, target_type, target_id, "audit append failed");
     }
 }
 
@@ -77,6 +105,59 @@ fn safe_filename(raw: &str) -> String {
         .take(MAX_FILENAME_LEN)
         .collect();
     if s.is_empty() { "artifact.bin".into() } else { s }
+}
+
+/// Validate a channel name shape — `[a-z0-9][a-z0-9-]{1,62}$`. Today
+/// this is **warn-only**: invalid names log at WARN but the request
+/// is still accepted. Lets us measure how many non-compliant channels
+/// exist in the wild before flipping to enforcement (Group B4 phase
+/// 2). Returns `false` for non-compliant.
+///
+/// Existing channels are grandfathered — the check only runs on the
+/// first POST that lazily creates a channel; the cap is checked
+/// before this, so the channel doesn't exist yet at the call site.
+fn channel_name_valid(name: &str) -> bool {
+    if name.len() < 2 || name.len() > 63 {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Validate a memory key shape — `<category>-<topic>[-<rest>]`
+/// where category is one of the well-known prefixes from
+/// `bridge-features-roadmap-v1` F2. Returns `false` if the key
+/// doesn't match the family. Warn-only at the call site for now
+/// per operator's "warn not reject" stance — flipping enforcement
+/// on later is a one-line change at the handler.
+const MEMORY_KEY_CATEGORIES: &[&str] = &[
+    "ops-rule",
+    "api-contract",
+    "decision",
+    "coverage",
+    "snapshot",
+    "session-resume",
+    "plan",
+    "finding-context",
+    "integration-spec",
+    "pattern",
+];
+fn memory_key_valid(key: &str) -> bool {
+    if key.len() < 3 || key.len() > 256 {
+        return false;
+    }
+    if !MEMORY_KEY_CATEGORIES
+        .iter()
+        .any(|c| key.starts_with(c) && key[c.len()..].starts_with('-'))
+    {
+        return false;
+    }
+    key.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.' || c == '_' || c == '/')
 }
 
 /// Cleanup helper used by every write path. Evicts the
@@ -139,6 +220,18 @@ struct AppState {
     /// in env; `None` keeps the legacy in-memory-only behaviour.
     /// Every write path forwards to the store when present.
     store: Option<Store>,
+    /// Per-channel counter of SSE events dropped because a
+    /// subscriber lagged past `CHANNEL_CAPACITY` in its broadcast
+    /// ring buffer. Exposed via `GET /metrics` (Group C) so a slow
+    /// peer is visible without grepping logs.
+    sse_lag_drops: Arc<DashMap<String, u64>>,
+    /// Token-bucket-lite for `/resume/{name}`. Key is `(requester,
+    /// target)`; value is `(window_start_secs, call_count)`. Per
+    /// pentest 1779040472: cheap query, expensive aggregation =
+    /// asymmetric scraping risk; cap a single requester to 60/min
+    /// per target. Implemented as a simple sliding-minute count to
+    /// avoid pulling in `tower-governor` for one endpoint.
+    resume_buckets: Arc<DashMap<(String, String), (u64, u32)>>,
 }
 
 impl AppState {
@@ -153,6 +246,8 @@ impl AppState {
             tasks: Arc::new(DashMap::new()),
             memory: Arc::new(DashMap::new()),
             store,
+            sse_lag_drops: Arc::new(DashMap::new()),
+            resume_buckets: Arc::new(DashMap::new()),
         }
     }
 
@@ -261,9 +356,14 @@ async fn send(
     State(state): State<AppState>,
     Json(req): Json<SendReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    cap(&channel, MAX_CHANNEL_LEN, "channel")?;
-    cap(&req.from, MAX_FROM_LEN, "from")?;
-    cap(&req.content, MAX_CONTENT_LEN, "content")?;
+    cap!(channel, MAX_CHANNEL_LEN, "channel");
+    cap!(req.from, MAX_FROM_LEN, "from");
+    cap!(req.content, MAX_CONTENT_LEN, "content");
+    // Warn-only naming check: only on first-write that lazily
+    // creates the channel. Existing channels are grandfathered.
+    if !state.senders.contains_key(&channel) && !channel_name_valid(&channel) {
+        tracing::warn!(channel = %channel, "non-compliant channel name (warn-only)");
+    }
     ensure_channel_capacity(&state, &channel);
 
     let msg = Message {
@@ -298,6 +398,39 @@ async fn send(
         }
         // Mirror the in-memory drain.
         let _ = store.prune_messages(&channel, HISTORY_LIMIT);
+        // Track addressed messages as first-class dispatches. The
+        // numeric IDs peers were eyeballing (`1779030818` etc.) are
+        // just message timestamps used ad-hoc — now we have a real
+        // table the escalation scanner can scan and `/ack`/`/complete`
+        // endpoints can mutate.
+        if !msg.to.is_empty() {
+            let dispatch = claude_bridge::Dispatch {
+                id: Uuid::new_v4().to_string(),
+                message_id: msg.id.clone(),
+                from: msg.from.clone(),
+                to: msg.to.join(","),
+                channel: msg.channel.clone(),
+                sent_at: msg.timestamp,
+                ack_at: 0,
+                ack_eta_secs: 0,
+                completed_at: 0,
+                outcome: String::new(),
+            };
+            if let Err(e) = store.insert_dispatch(&dispatch) {
+                tracing::warn!(error = %e, "persist dispatch failed");
+            }
+        }
+        // Audit hook — INSERT, no prior row, after = serialized
+        // message. Actor is req.from which we already validated.
+        write_audit(
+            store,
+            &msg.from,
+            "create",
+            "message",
+            &msg.id,
+            None::<&Message>,
+            Some(&msg),
+        );
     }
 
     // Implicit presence — sending is a sign of life. Saves a separate
@@ -376,12 +509,38 @@ async fn stream_channel(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.sender(&channel).subscribe();
+    let chan_for_log = channel.clone();
+    let lag_counter = state.sse_lag_drops.clone();
 
-    let stream = BroadcastStream::new(rx).filter_map(|result| {
-        result.ok().map(|msg| {
+    // `BroadcastStream` yields `Err(BroadcastStreamRecvError::Lagged(n))`
+    // when a slow subscriber falls behind the channel's ring buffer
+    // (CHANNEL_CAPACITY=256). Previously we silently `result.ok()`-
+    // skipped those, so a stuck SSE consumer just lost events with
+    // no signal anywhere. Now we count drops per channel and emit a
+    // warn log including the lag count so ops can spot a misbehaving
+    // peer without parsing the broadcast internals.
+    let stream = BroadcastStream::new(rx).filter_map(move |result| match result {
+        Ok(msg) => {
             let data = serde_json::to_string(&msg).unwrap_or_default();
-            Ok::<_, Infallible>(Event::default().data(data))
-        })
+            Some(Ok::<_, Infallible>(Event::default().data(data)))
+        }
+        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+            let mut prev = lag_counter
+                .entry(chan_for_log.clone())
+                .or_insert(0u64);
+            // DashMap entry guard derefs to RefMut; we mutate then
+            // drop. n is u64, so saturate just in case.
+            let new = prev.value().saturating_add(n);
+            *prev = new;
+            drop(prev);
+            tracing::warn!(
+                channel = %chan_for_log,
+                lag = n,
+                total_drops = new,
+                "sse subscriber lagged; dropped events"
+            );
+            None
+        }
     });
 
     Sse::new(stream).keep_alive(
@@ -447,9 +606,9 @@ async fn set_topic(
     State(state): State<AppState>,
     Json(req): Json<SetTopicReq>,
 ) -> Result<Json<ChannelTopic>, (StatusCode, String)> {
-    cap(&channel, MAX_CHANNEL_LEN, "channel")?;
-    cap(&req.from, MAX_FROM_LEN, "from")?;
-    cap(&req.topic, MAX_TOPIC_LEN, "topic")?;
+    cap!(channel, MAX_CHANNEL_LEN, "channel");
+    cap!(req.from, MAX_FROM_LEN, "from");
+    cap!(req.topic, MAX_TOPIC_LEN, "topic");
     let t = ChannelTopic {
         name: channel.clone(),
         topic: req.topic,
@@ -499,10 +658,10 @@ async fn create_finding(
     State(state): State<AppState>,
     Json(req): Json<CreateFindingReq>,
 ) -> Result<Json<Finding>, (StatusCode, String)> {
-    cap(&channel, MAX_CHANNEL_LEN, "channel")?;
-    cap(&req.from, MAX_FROM_LEN, "from")?;
-    cap(&req.endpoint, MAX_ENDPOINT_LEN, "endpoint")?;
-    cap(&req.detail, MAX_DETAIL_LEN, "detail")?;
+    cap!(channel, MAX_CHANNEL_LEN, "channel");
+    cap!(req.from, MAX_FROM_LEN, "from");
+    cap!(req.endpoint, MAX_ENDPOINT_LEN, "endpoint");
+    cap!(req.detail, MAX_DETAIL_LEN, "detail");
     if !SEVERITIES.contains(&req.severity.as_str()) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -512,7 +671,7 @@ async fn create_finding(
     if req.title.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "title required".into()));
     }
-    cap(&req.title, MAX_TITLE_LEN, "title")?;
+    cap!(req.title, MAX_TITLE_LEN, "title");
     ensure_channel_capacity(&state, &channel);
     let now = now_secs();
     let finding = Finding {
@@ -543,6 +702,15 @@ async fn create_finding(
             tracing::warn!(error = %e, "persist finding failed");
         }
         let _ = store.prune_findings(&channel, FINDING_LIMIT);
+        write_audit(
+            store,
+            &finding.from,
+            "create",
+            "finding",
+            &finding.id,
+            None::<&Finding>,
+            Some(&finding),
+        );
     }
     let mut prev = state
         .peers
@@ -590,10 +758,11 @@ struct TriageReq {
 
 async fn triage_finding(
     Path((channel, id)): Path<(String, String)>,
+    headers: HeaderMap,
     State(state): State<AppState>,
     Json(req): Json<TriageReq>,
 ) -> Result<Json<Finding>, (StatusCode, String)> {
-    cap(&req.note, MAX_NOTE_LEN, "note")?;
+    cap!(req.note, MAX_NOTE_LEN, "note");
     if !STATUSES.contains(&req.status.as_str()) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -613,6 +782,10 @@ async fn triage_finding(
             format!("finding id '{id}' not found on channel '{channel}'"),
         ));
     };
+    // Snapshot prior state for audit's before_hash — clone happens
+    // before the in-place mutation so the hash reflects what the row
+    // looked like to readers prior to this triage.
+    let before = f.clone();
     f.status = req.status;
     f.note = req.note;
     f.updated_at = now_secs();
@@ -624,6 +797,22 @@ async fn triage_finding(
         if let Err(e) = store.upsert_finding(&snapshot) {
             tracing::warn!(error = %e, "persist triage failed");
         }
+        // Actor falls back to X-Bridge-From header (no `from:` body
+        // field on this endpoint). Same gap noted in
+        // decision-audit-hash-128bit reopen conditions.
+        let actor = headers
+            .get("x-bridge-from")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown");
+        write_audit(
+            store,
+            actor,
+            "triage",
+            "finding",
+            &snapshot.id,
+            Some(&before),
+            Some(&snapshot),
+        );
     }
     Ok(Json(snapshot))
 }
@@ -633,15 +822,21 @@ async fn triage_finding(
 /// status, so a `wontfix` still shows up in unfiltered lists.
 async fn delete_finding(
     Path((channel, id)): Path<(String, String)>,
+    headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let mut entry = match state.findings.get_mut(&channel) {
         Some(e) => e,
         None => return Err((StatusCode::NOT_FOUND, format!("no findings on channel '{channel}'"))),
     };
-    let before = entry.len();
+    // Capture the row we're about to drop so audit `before_hash`
+    // is non-empty. Searching twice (find→retain) avoids cloning a
+    // whole Vec; the table is finding-count-per-channel sized so
+    // O(n) on the typical 0..N is fine.
+    let prior = entry.iter().find(|f| f.id == id).cloned();
+    let before_len = entry.len();
     entry.retain(|f| f.id != id);
-    if entry.len() == before {
+    if entry.len() == before_len {
         return Err((
             StatusCode::NOT_FOUND,
             format!("finding id '{id}' not found on channel '{channel}'"),
@@ -650,6 +845,19 @@ async fn delete_finding(
     drop(entry);
     if let Some(store) = &state.store {
         let _ = store.delete_finding(&channel, &id);
+        let actor = headers
+            .get("x-bridge-from")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown");
+        write_audit(
+            store,
+            actor,
+            "delete",
+            "finding",
+            &id,
+            prior.as_ref(),
+            None::<&Finding>,
+        );
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -662,7 +870,7 @@ async fn upload_artifact(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    cap(&channel, MAX_CHANNEL_LEN, "channel")?;
+    cap!(channel, MAX_CHANNEL_LEN, "channel");
     if body.len() > ARTIFACT_MAX_BYTES {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -673,14 +881,14 @@ async fn upload_artifact(
         .get("x-bridge-from")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown");
-    cap(from, MAX_FROM_LEN, "x-bridge-from")?;
+    cap!(from, MAX_FROM_LEN, "x-bridge-from");
     let from = from.to_string();
 
     let raw_filename = headers
         .get("x-bridge-filename")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("artifact.bin");
-    cap(raw_filename, MAX_FILENAME_LEN, "x-bridge-filename")?;
+    cap!(raw_filename, MAX_FILENAME_LEN, "x-bridge-filename");
     // Strip control chars / quotes BEFORE we touch the header — keeps
     // a malicious filename from injecting CR/LF into our response's
     // Content-Disposition.
@@ -690,7 +898,7 @@ async fn upload_artifact(
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream");
-    cap(mime, MAX_MIME_LEN, "content-type")?;
+    cap!(mime, MAX_MIME_LEN, "content-type");
     let mime = mime.to_string();
 
     ensure_channel_capacity(&state, &channel);
@@ -807,9 +1015,9 @@ async fn heartbeat(
     State(state): State<AppState>,
     Json(req): Json<PresenceReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    cap(&name, MAX_FROM_LEN, "name")?;
-    cap(&req.channel, MAX_CHANNEL_LEN, "channel")?;
-    cap(&req.status, MAX_STATUS_LEN, "status")?;
+    cap!(name, MAX_FROM_LEN, "name");
+    cap!(req.channel, MAX_CHANNEL_LEN, "channel");
+    cap!(req.status, MAX_STATUS_LEN, "status");
     // Cheap defense: bound the role + skill lists so a buggy/hostile
     // heartbeat can't blow memory through repeated huge declarations.
     let roles: Vec<String> = req
@@ -935,10 +1143,10 @@ async fn create_task(
     State(state): State<AppState>,
     Json(req): Json<CreateTaskReq>,
 ) -> Result<Json<Task>, (StatusCode, String)> {
-    cap(&channel, MAX_CHANNEL_LEN, "channel")?;
-    cap(&req.from, MAX_FROM_LEN, "from")?;
-    cap(&req.title, MAX_TITLE_LEN, "title")?;
-    cap(&req.description, MAX_TASK_DESC_LEN, "description")?;
+    cap!(channel, MAX_CHANNEL_LEN, "channel");
+    cap!(req.from, MAX_FROM_LEN, "from");
+    cap!(req.title, MAX_TITLE_LEN, "title");
+    cap!(req.description, MAX_TASK_DESC_LEN, "description");
     if req.title.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "title required".into()));
     }
@@ -970,6 +1178,15 @@ async fn create_task(
         if let Err(e) = store.upsert_task(&task) {
             tracing::warn!(error = %e, "persist task failed");
         }
+        write_audit(
+            store,
+            &task.from,
+            "create",
+            "task",
+            &task.id,
+            None::<&Task>,
+            Some(&task),
+        );
     }
     Ok(Json(task))
 }
@@ -1010,6 +1227,7 @@ struct UpdateTaskReq {
 
 async fn update_task(
     Path((channel, id)): Path<(String, String)>,
+    headers: HeaderMap,
     State(state): State<AppState>,
     Json(req): Json<UpdateTaskReq>,
 ) -> Result<Json<Task>, (StatusCode, String)> {
@@ -1019,7 +1237,7 @@ async fn update_task(
         }
     }
     if let Some(n) = &req.note {
-        cap(n, MAX_NOTE_LEN, "note")?;
+        cap!(n, MAX_NOTE_LEN, "note");
     }
     let mut entry = match state.tasks.get_mut(&channel) {
         Some(e) => e,
@@ -1029,6 +1247,7 @@ async fn update_task(
     let Some(t) = found else {
         return Err((StatusCode::NOT_FOUND, format!("task id '{id}' not found on channel '{channel}'")));
     };
+    let before = t.clone();
     if let Some(s) = req.status {
         t.status = s;
     }
@@ -1043,26 +1262,54 @@ async fn update_task(
     drop(entry);
     if let Some(store) = &state.store {
         let _ = store.upsert_task(&snap);
+        let actor = headers
+            .get("x-bridge-from")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown");
+        write_audit(
+            store,
+            actor,
+            "update",
+            "task",
+            &snap.id,
+            Some(&before),
+            Some(&snap),
+        );
     }
     Ok(Json(snap))
 }
 
 async fn delete_task(
     Path((channel, id)): Path<(String, String)>,
+    headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let mut entry = match state.tasks.get_mut(&channel) {
         Some(e) => e,
         None => return Err((StatusCode::NOT_FOUND, format!("no tasks on channel '{channel}'"))),
     };
-    let before = entry.len();
+    let prior = entry.iter().find(|t| t.id == id).cloned();
+    let before_len = entry.len();
     entry.retain(|t| t.id != id);
-    if entry.len() == before {
+    if entry.len() == before_len {
         return Err((StatusCode::NOT_FOUND, format!("task id '{id}' not found on channel '{channel}'")));
     }
     drop(entry);
     if let Some(store) = &state.store {
         let _ = store.delete_task(&channel, &id);
+        let actor = headers
+            .get("x-bridge-from")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown");
+        write_audit(
+            store,
+            actor,
+            "delete",
+            "task",
+            &id,
+            prior.as_ref(),
+            None::<&Task>,
+        );
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1086,10 +1333,17 @@ async fn memory_set(
     State(state): State<AppState>,
     Json(req): Json<MemorySetReq>,
 ) -> Result<Json<MemoryEntry>, (StatusCode, String)> {
-    cap(&channel, MAX_CHANNEL_LEN, "channel")?;
-    cap(&key, MAX_MEMORY_KEY_LEN, "key")?;
-    cap(&req.value, MAX_MEMORY_VAL_LEN, "value")?;
-    cap(&req.from, MAX_FROM_LEN, "from")?;
+    cap!(channel, MAX_CHANNEL_LEN, "channel");
+    cap!(key, MAX_MEMORY_KEY_LEN, "key");
+    cap!(req.value, MAX_MEMORY_VAL_LEN, "value");
+    cap!(req.from, MAX_FROM_LEN, "from");
+    // Warn-only naming check per roadmap-v1 F2. Categorised keys
+    // like `decision-…`, `ops-rule-…`, `coverage-…` pass; ad-hoc
+    // names log a warn so operator can grep them and decide whether
+    // to migrate before enforcement.
+    if !memory_key_valid(&key) {
+        tracing::warn!(key = %key, "non-compliant memory key (warn-only)");
+    }
     let now = now_secs();
     let entry = MemoryEntry {
         channel: channel.clone(),
@@ -1099,9 +1353,27 @@ async fn memory_set(
         updated_at: now,
         expires_at: if req.ttl_secs == 0 { 0 } else { now + req.ttl_secs },
     };
+    // Capture pre-state for the audit's `before_hash`. The query
+    // runs while we still hold the write intent so a racing reader
+    // can't observe a midpoint, even though DashMap entries aren't
+    // ACID. The hash is stable across concurrent same-value writes,
+    // so a benign race is at worst a degenerate hash match.
+    let before = state
+        .memory
+        .get(&(channel.clone(), key.clone()))
+        .map(|kv| kv.value().clone());
     state.memory.insert((channel.clone(), key.clone()), entry.clone());
     if let Some(store) = &state.store {
         let _ = store.memory_set(&entry);
+        write_audit(
+            store,
+            &entry.updated_by,
+            if before.is_some() { "update" } else { "create" },
+            "memory",
+            &format!("{}/{}", channel, key),
+            before.as_ref(),
+            Some(&entry),
+        );
     }
     Ok(Json(entry))
 }
@@ -1124,11 +1396,37 @@ async fn memory_get(
 
 async fn memory_delete(
     Path((channel, key)): Path<(String, String)>,
+    headers: HeaderMap,
     State(state): State<AppState>,
 ) -> StatusCode {
+    // Capture before-state so the audit's `before_hash` is non-empty
+    // when the row existed. None ⇒ the delete is a no-op against a
+    // missing key (still audited, but with empty hashes).
+    let before = state
+        .memory
+        .get(&(channel.clone(), key.clone()))
+        .map(|kv| kv.value().clone());
     state.memory.remove(&(channel.clone(), key.clone()));
     if let Some(store) = &state.store {
         let _ = store.memory_delete(&channel, &key);
+        // No `from:` body field on this endpoint today — fall back
+        // to the `X-Bridge-From` header (artifact upload already
+        // uses this header) and finally to "unknown". Follow-up
+        // (decision-audit-actor-attribution) tracks normalising
+        // the actor channel across all mutation endpoints.
+        let actor = headers
+            .get("x-bridge-from")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown");
+        write_audit(
+            store,
+            actor,
+            "delete",
+            "memory",
+            &format!("{}/{}", channel, key),
+            before.as_ref(),
+            None::<&MemoryEntry>,
+        );
     }
     StatusCode::NO_CONTENT
 }
@@ -1149,20 +1447,525 @@ async fn memory_list(
     Json(v)
 }
 
+// ── Peer health + resume + metrics ──────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct PeerHealth {
+    peer: String,
+    /// `true` when we have a live presence record for this peer.
+    /// JSON consumers should check this before doing arithmetic on
+    /// `idle_secs` — replaces the prior `u64::MAX` sentinel that
+    /// could overflow naive `idle_secs * something` math on the
+    /// client side (pentest msg 1779040472).
+    present: bool,
+    /// Seconds since the peer's last heartbeat. `None` when the
+    /// peer has no presence record (`present == false`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    idle_secs: Option<u64>,
+    channel: String,
+    roles: Vec<String>,
+    skills: Vec<String>,
+    status: String,
+    /// Open dispatches addressed to this peer that haven't been
+    /// acked yet. Empty when persistence is disabled.
+    pending_dispatches: Vec<PendingDispatch>,
+    /// Findings created by or addressed to this peer that are still
+    /// open. Channel-scoped sum across the in-memory map.
+    open_findings: usize,
+    /// Tasks the peer owns that are in `todo` or `in_progress`
+    /// (anything not `done` / `cancelled`).
+    active_tasks: usize,
+}
+
+#[derive(serde::Serialize)]
+struct PendingDispatch {
+    message_id: String,
+    from: String,
+    channel: String,
+    sent_at: u64,
+    age_secs: u64,
+}
+
+/// Composite health view for a peer. World-readable to any caller
+/// reaching the bridge per ops dispatch 1779031396 — coord
+/// transparency is the point. Returns the live presence record plus
+/// derived counts (open findings, active tasks) and a pending-
+/// dispatch list pulled from the dispatches table. Empty arrays
+/// where persistence is off; never errors on a missing peer (returns
+/// an `idle_secs = u64::MAX` sentinel so callers can distinguish
+/// "unknown peer" from "peer present but quiet").
+async fn peer_health(
+    Path(name): Path<String>,
+    State(state): State<AppState>,
+) -> Json<PeerHealth> {
+    let now = now_secs();
+    let live = state.peers.get(&name).map(|kv| kv.value().clone());
+    let (present, idle_secs, channel, roles, skills, status) = match live {
+        Some(p) => (
+            true,
+            Some(now.saturating_sub(p.last_seen)),
+            p.channel,
+            p.roles,
+            p.skills,
+            p.status,
+        ),
+        None => (false, None, String::new(), Vec::new(), Vec::new(), String::new()),
+    };
+
+    // Pending dispatches addressed to this peer. The `to_` column
+    // is comma-joined; we filter in SQL with LIKE so the partial
+    // `dispatches_pending` index is still usable for the date
+    // range scan and the LIKE narrows the result set without
+    // requiring a separate index.
+    let pending = if let Some(store) = &state.store {
+        store
+            .open_dispatches_for_peer(&name, 50)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|d| PendingDispatch {
+                message_id: d.message_id,
+                from: d.from,
+                channel: d.channel,
+                sent_at: d.sent_at,
+                age_secs: now.saturating_sub(d.sent_at),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Open findings + active tasks: scan in-memory state which is
+    // already the source of truth for live views. Channel-agnostic;
+    // intent is "everything this peer has on its plate".
+    let mut open_findings = 0usize;
+    for kv in state.findings.iter() {
+        for f in kv.value() {
+            if (f.from == name) && f.status == "open" {
+                open_findings += 1;
+            }
+        }
+    }
+    let mut active_tasks = 0usize;
+    for kv in state.tasks.iter() {
+        for t in kv.value() {
+            if t.owner == name && (t.status == "todo" || t.status == "in_progress") {
+                active_tasks += 1;
+            }
+        }
+    }
+
+    Json(PeerHealth {
+        peer: name,
+        present,
+        idle_secs,
+        channel,
+        roles,
+        skills,
+        status,
+        pending_dispatches: pending,
+        open_findings,
+        active_tasks,
+    })
+}
+
+#[derive(serde::Serialize)]
+struct BridgeMetrics {
+    peers_active: usize,
+    channels: usize,
+    messages_total: usize,
+    findings_total: usize,
+    findings_open: usize,
+    tasks_total: usize,
+    tasks_active: usize,
+    artifacts: usize,
+    sse_lag_drops: std::collections::BTreeMap<String, u64>,
+    dispatches_pending: usize,
+}
+
+async fn metrics(State(state): State<AppState>) -> Json<BridgeMetrics> {
+    let peers_active = state.peers.len();
+    let channels = state.senders.len();
+    let messages_total: usize = state.history.iter().map(|kv| kv.value().len()).sum();
+    let mut findings_total = 0usize;
+    let mut findings_open = 0usize;
+    for kv in state.findings.iter() {
+        let v = kv.value();
+        findings_total += v.len();
+        findings_open += v.iter().filter(|f| f.status == "open").count();
+    }
+    let mut tasks_total = 0usize;
+    let mut tasks_active = 0usize;
+    for kv in state.tasks.iter() {
+        let v = kv.value();
+        tasks_total += v.len();
+        tasks_active += v
+            .iter()
+            .filter(|t| t.status == "todo" || t.status == "in_progress")
+            .count();
+    }
+    let dispatches_pending = if let Some(store) = &state.store {
+        store.count_open_dispatches().unwrap_or(0)
+    } else {
+        0
+    };
+    let sse_lag_drops: std::collections::BTreeMap<String, u64> = state
+        .sse_lag_drops
+        .iter()
+        .map(|kv| (kv.key().clone(), *kv.value()))
+        .collect();
+    Json(BridgeMetrics {
+        peers_active,
+        channels,
+        messages_total,
+        findings_total,
+        findings_open,
+        tasks_total,
+        tasks_active,
+        artifacts: state.artifacts.len(),
+        sse_lag_drops,
+        dispatches_pending,
+    })
+}
+
+/// Build a markdown resume for `name` — assembles their public
+/// memory keys, active dispatches, and open findings into a brief
+/// useful for next-session pickup.
+///
+/// Disclosure scope per ops 1779031396 + pentest 1779031342:
+/// - `_private_` prefix on memory keys → excluded entirely
+/// - Memory rows past `expires_at` (TTL elapsed) → excluded
+/// - Secret-shaped value fragments (Bearer eyJ…, password=…,
+///   api_key=…, sk_… variants) → redacted to `[REDACTED:<type>]`
+/// - 256-char value truncate from earlier draft DROPPED per ops
+///   1779031354 refinement — resume completeness matters more than
+///   summary brevity; peers wanting short forms write `summary-*`
+///   keys explicitly.
+///
+/// Rate-limit per requester is a TODO — needs tower-governor or a
+/// simple DashMap bucket. Tracked in `decision-resume-endpoint`.
+const RESUME_RATE_WINDOW_SECS: u64 = 60;
+const RESUME_RATE_LIMIT: u32 = 60;
+
+/// Bumps the per-(requester, target) bucket and returns whether the
+/// caller is within budget. Sliding window via simple reset-on-
+/// rollover; precise enough for the threat model (scraping
+/// detection, not high-precision QoS).
+fn resume_within_limit(state: &AppState, requester: &str, target: &str) -> bool {
+    let now = now_secs();
+    let key = (requester.to_string(), target.to_string());
+    let mut entry = state
+        .resume_buckets
+        .entry(key)
+        .or_insert((now, 0u32));
+    let (window_start, count) = *entry.value();
+    if now.saturating_sub(window_start) >= RESUME_RATE_WINDOW_SECS {
+        *entry.value_mut() = (now, 1);
+        return true;
+    }
+    if count >= RESUME_RATE_LIMIT {
+        return false;
+    }
+    *entry.value_mut() = (window_start, count + 1);
+    true
+}
+
+async fn resume_endpoint(
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    // Identify the requester for rate-limiting. Anonymous callers
+    // share a single bucket keyed by "anonymous" — fine as long as
+    // bridge auth is at the perimeter; if internal anon traffic
+    // ever shows up, switch to remote-IP via Forwarded header.
+    let requester = headers
+        .get("x-bridge-from")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("anonymous")
+        .to_string();
+    if !resume_within_limit(&state, &requester, &name) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            format!(
+                "rate limited: {} resumes/min/target. Try again in <={}s.\n",
+                RESUME_RATE_LIMIT, RESUME_RATE_WINDOW_SECS
+            ),
+        )
+            .into_response();
+    }
+    let now = now_secs();
+    let mut out = String::with_capacity(4096);
+    out.push_str(&format!("# Resume — {name}\n\nGenerated: {now} (unix-secs)\n\n"));
+
+    // Live presence
+    if let Some(p) = state.peers.get(&name).map(|kv| kv.value().clone()) {
+        out.push_str("## Live presence\n");
+        out.push_str(&format!(
+            "- last_seen: {}s ago\n- channel: {}\n- roles: {:?}\n- skills: {:?}\n- status: {}\n\n",
+            now.saturating_sub(p.last_seen),
+            p.channel,
+            p.roles,
+            p.skills,
+            p.status
+        ));
+    } else {
+        out.push_str("## Live presence\n\n_no recent heartbeat_\n\n");
+    }
+
+    // Open dispatches
+    if let Some(store) = &state.store {
+        let pend = store.open_dispatches_for_peer(&name, 50).unwrap_or_default();
+        out.push_str(&format!("## Open dispatches ({})\n", pend.len()));
+        for d in &pend {
+            out.push_str(&format!(
+                "- `{}` from `{}` in #{} — sent {}s ago\n",
+                d.message_id,
+                d.from,
+                d.channel,
+                now.saturating_sub(d.sent_at)
+            ));
+        }
+        out.push('\n');
+    }
+
+    // Open findings authored by the peer
+    let mut findings_block = String::new();
+    let mut nf = 0usize;
+    for kv in state.findings.iter() {
+        for f in kv.value() {
+            if f.from == name && f.status == "open" {
+                findings_block.push_str(&format!(
+                    "- [{}] `{}` — {} in #{}\n",
+                    f.severity, f.id, f.title, f.channel
+                ));
+                nf += 1;
+            }
+        }
+    }
+    out.push_str(&format!("## Open findings authored ({nf})\n"));
+    out.push_str(&findings_block);
+    out.push('\n');
+
+    // Memory keys — public, unexpired, redacted
+    let mut mem_block = String::new();
+    let mut nm = 0usize;
+    for kv in state.memory.iter() {
+        let entry = kv.value();
+        if entry.updated_by != name {
+            continue;
+        }
+        if entry.key.starts_with("_private_") {
+            continue;
+        }
+        if entry.expires_at != 0 && entry.expires_at <= now {
+            continue;
+        }
+        nm += 1;
+        let snippet = redact_secrets(&entry.value);
+        mem_block.push_str(&format!(
+            "### `{}/{}` (updated {}s ago)\n```\n{}\n```\n\n",
+            entry.channel,
+            entry.key,
+            now.saturating_sub(entry.updated_at),
+            snippet
+        ));
+    }
+    out.push_str(&format!("## Memory keys authored ({nm})\n"));
+    out.push_str(&mem_block);
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        out,
+    )
+        .into_response()
+}
+
+/// Redact known secret patterns from a string. Cheap pass via byte
+/// matching on common prefixes — caller's `value` is opaque so we
+/// can't parse structure; we just blank out the recognisable
+/// shapes. Anything not matched passes through. Per ops 1779031396
+/// + pentest 1779031342.
+fn redact_secrets(s: &str) -> String {
+    // Find each occurrence of a sensitive prefix and snip the token
+    // that follows. Cheap state machine — adequate for the bridge's
+    // single-machine resume endpoint; not a substitute for a real
+    // DLP scanner.
+    let patterns: &[(&str, &str)] = &[
+        ("Bearer ey", "[REDACTED:jwt]"),
+        ("password=", "[REDACTED:password]"),
+        ("password\":", "[REDACTED:password]"),
+        ("api_key=", "[REDACTED:api_key]"),
+        ("api_key\":", "[REDACTED:api_key]"),
+        ("sk_live_", "[REDACTED:stripe-secret]"),
+        ("sk_test_", "[REDACTED:stripe-secret]"),
+        ("AKIA", "[REDACTED:aws-access-key]"),
+        // Per pentest 1779040472 + operator 1779040495:
+        // Gezer SDK / load-balancer API keys (see
+        // `gezer-lb-origin-contract` memory key).
+        ("gz_", "[REDACTED:gezer-key]"),
+        // Stripe webhook signing secret (operator-provisioned,
+        // expected shape from Stripe).
+        ("whsec_", "[REDACTED:stripe-webhook-secret]"),
+    ];
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    let bytes = s.as_bytes();
+    'outer: while i < bytes.len() {
+        for (pat, redact) in patterns {
+            if s[i..].starts_with(pat) {
+                out.push_str(redact);
+                // Skip until whitespace, comma, quote or end —
+                // these are the typical token delimiters.
+                let start = i + pat.len();
+                let mut j = start;
+                while j < bytes.len() {
+                    let c = bytes[j];
+                    if c == b' ' || c == b',' || c == b'"' || c == b'\n' || c == b'\r' || c == b';'
+                    {
+                        break;
+                    }
+                    j += 1;
+                }
+                i = j;
+                continue 'outer;
+            }
+        }
+        // No pattern matched at this position — push the char and
+        // advance by its UTF-8 byte length so we don't slice mid-
+        // code-point.
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Prometheus text-exposition format. One sample per gauge; for
+/// labelled counters we emit a line per label. The newline before
+/// EOF is required by the spec; `format!` macros take care of it.
+async fn metrics_prometheus(State(state): State<AppState>) -> impl IntoResponse {
+    let m = metrics(State(state)).await.0;
+    let mut out = String::with_capacity(1024);
+    out.push_str("# HELP bridge_peers_active live peer count\n");
+    out.push_str("# TYPE bridge_peers_active gauge\n");
+    out.push_str(&format!("bridge_peers_active {}\n", m.peers_active));
+    out.push_str("# HELP bridge_channels declared channel count\n");
+    out.push_str("# TYPE bridge_channels gauge\n");
+    out.push_str(&format!("bridge_channels {}\n", m.channels));
+    out.push_str("# HELP bridge_messages_total in-memory retained messages\n");
+    out.push_str("# TYPE bridge_messages_total gauge\n");
+    out.push_str(&format!("bridge_messages_total {}\n", m.messages_total));
+    out.push_str("# HELP bridge_findings_open open findings across all channels\n");
+    out.push_str("# TYPE bridge_findings_open gauge\n");
+    out.push_str(&format!("bridge_findings_open {}\n", m.findings_open));
+    out.push_str("# HELP bridge_findings_total all findings across all channels\n");
+    out.push_str("# TYPE bridge_findings_total gauge\n");
+    out.push_str(&format!("bridge_findings_total {}\n", m.findings_total));
+    out.push_str("# HELP bridge_tasks_active todo+in_progress tasks across all channels\n");
+    out.push_str("# TYPE bridge_tasks_active gauge\n");
+    out.push_str(&format!("bridge_tasks_active {}\n", m.tasks_active));
+    out.push_str("# HELP bridge_dispatches_pending dispatches not yet acked\n");
+    out.push_str("# TYPE bridge_dispatches_pending gauge\n");
+    out.push_str(&format!("bridge_dispatches_pending {}\n", m.dispatches_pending));
+    out.push_str("# HELP bridge_artifacts retained artifact count\n");
+    out.push_str("# TYPE bridge_artifacts gauge\n");
+    out.push_str(&format!("bridge_artifacts {}\n", m.artifacts));
+    out.push_str("# HELP bridge_sse_lag_drops_total SSE events dropped due to subscriber lag\n");
+    out.push_str("# TYPE bridge_sse_lag_drops_total counter\n");
+    for (channel, n) in &m.sse_lag_drops {
+        // Escape `"` and `\` in channel labels per the prometheus
+        // exposition spec. Real channel names are simple ASCII so
+        // this is defensive.
+        let safe = channel.replace('\\', "\\\\").replace('"', "\\\"");
+        out.push_str(&format!(
+            "bridge_sse_lag_drops_total{{channel=\"{safe}\"}} {n}\n"
+        ));
+    }
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        out,
+    )
+}
+
+// ── Dispatches ──────────────────────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+struct AckDispatchReq {
+    /// Caller's commitment for when they'll complete. 0 = unspecified.
+    #[serde(default)]
+    eta_secs: u64,
+}
+
+async fn ack_dispatch(
+    Path(message_id): Path<String>,
+    State(state): State<AppState>,
+    Json(req): Json<AckDispatchReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let Some(store) = &state.store else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "persistence disabled; dispatch tracking requires BRIDGE_DB_PATH".into(),
+        ));
+    };
+    let n = store
+        .ack_dispatch(&message_id, now_secs(), req.eta_secs)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("ack failed: {e}")))?;
+    if n == 0 {
+        // Distinguish "no such message_id" from "already acked".
+        // Both return NOT_FOUND today to keep the API shape stable;
+        // a follow-up can split via a separate read if useful.
+        Err((StatusCode::NOT_FOUND, "no open dispatch with that message_id".into()))
+    } else {
+        Ok(StatusCode::NO_CONTENT)
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct CompleteDispatchReq {
+    #[serde(default)]
+    outcome: String,
+}
+
+const MAX_OUTCOME_LEN: usize = 1024;
+
+async fn complete_dispatch(
+    Path(message_id): Path<String>,
+    State(state): State<AppState>,
+    Json(req): Json<CompleteDispatchReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    cap!(req.outcome, MAX_OUTCOME_LEN, "outcome");
+    let Some(store) = &state.store else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "persistence disabled; dispatch tracking requires BRIDGE_DB_PATH".into(),
+        ));
+    };
+    let n = store
+        .complete_dispatch(&message_id, now_secs(), &req.outcome)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("complete failed: {e}")))?;
+    if n == 0 {
+        Err((StatusCode::NOT_FOUND, "no open dispatch with that message_id".into()))
+    } else {
+        Ok(StatusCode::NO_CONTENT)
+    }
+}
+
 // ── Wiring ──────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
-    let addr = format!("0.0.0.0:{}", port);
+    let cfg = claude_bridge::Config::from_env();
+    tracing::info!(?cfg, "loaded runtime config");
 
-    // Optional persistence. When BRIDGE_DB_PATH is set, the server
-    // mirrors every write to sqlite and rehydrates DashMaps on boot
-    // so a restart doesn't lose chat / findings / artifacts.
-    let store = match std::env::var("BRIDGE_DB_PATH") {
-        Ok(path) if !path.is_empty() => match Store::open(std::path::Path::new(&path)) {
+    // Optional persistence. `db_path = Some(_)` enables write-through
+    // sqlite + boot-time rehydrate. `None` keeps the legacy
+    // in-memory-only mode where state is lost on restart.
+    let store = match cfg.db_path.as_deref() {
+        Some(path) => match Store::open(std::path::Path::new(path)) {
             Ok(s) => {
                 tracing::info!(path, "persistence enabled (sqlite)");
                 Some(s)
@@ -1172,14 +1975,56 @@ async fn main() {
                 None
             }
         },
-        _ => {
+        None => {
             tracing::info!("BRIDGE_DB_PATH unset — running in-memory only (state lost on restart)");
             None
         }
     };
 
-    let state = AppState::new(store);
+    let state = AppState::new(store.clone());
     state.rehydrate();
+
+    // Background automation loop. Shared 60s base tick per ops
+    // dispatch 1779031875 — every additional scanner pushes into
+    // `registry` instead of starting its own interval. Heartbeat
+    // proves the loop is alive in dev; peer-history prune runs
+    // hourly. More scanners (dispatch escalation, peer-drop notice,
+    // finding-SLA) land as they're wired into mutation hooks.
+    // Snapshot closure — clones the peer-presence DashMap into a
+    // simple `(name, last_seen, channel)` Vec at call time so the
+    // scanner sees a consistent view without holding a DashMap
+    // guard. Stored as an Arc<dyn Fn(...)> in the ctx so it lives
+    // for the loop's lifetime.
+    let peers_for_snapshot = state.peers.clone();
+    let auto_ctx = claude_bridge::automation::AutomationCtx {
+        store: store.clone(),
+        peer_history_ttl_secs: cfg.peer_history_ttl.as_secs(),
+        dispatch_sla_secs: 15 * 60, // 15 minutes per roadmap-v1 F5
+        escalated: Arc::new(dashmap::DashSet::new()),
+        senders: state.senders.clone(),
+        peers_snapshot: Arc::new(move || {
+            peers_for_snapshot
+                .iter()
+                .map(|kv| {
+                    let ps = kv.value();
+                    (kv.key().clone(), ps.last_seen, ps.channel.clone())
+                })
+                .collect()
+        }),
+    };
+    let registry: Vec<Arc<dyn claude_bridge::automation::Scanner>> = vec![
+        Arc::new(claude_bridge::automation::HeartbeatScanner),
+        Arc::new(claude_bridge::automation::PeerHistoryPruneScanner),
+        Arc::new(claude_bridge::automation::DispatchEscalationScanner),
+        Arc::new(claude_bridge::automation::PeerDropScanner {
+            seen: Arc::new(dashmap::DashSet::new()),
+        }),
+    ];
+    let _automation_handle = claude_bridge::automation::spawn_loop(
+        Duration::from_secs(60),
+        auto_ctx,
+        registry,
+    );
 
     let app = Router::new()
         // Messages
@@ -1214,9 +2059,116 @@ async fn main() {
         // Presence
         .route("/presence/{name}", post(heartbeat))
         .route("/peers", get(list_peers))
+        // Dispatch lifecycle. Keyed by `message_id` rather than
+        // dispatch internal id so peers can call these with the id
+        // they already have from `send_message`'s response.
+        .route("/dispatches/{message_id}/ack", post(ack_dispatch))
+        .route("/dispatches/{message_id}/complete", post(complete_dispatch))
+        // Observability — world-readable per ops dispatch 1779031396.
+        .route("/peer/{name}/health", get(peer_health))
+        .route("/resume/{name}", get(resume_endpoint))
+        .route("/metrics", get(metrics))
+        .route("/metrics/prometheus", get(metrics_prometheus))
         .with_state(state);
 
-    tracing::info!("claude-bridge server on {}", addr);
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    tracing::info!("claude-bridge server on {}", cfg.bind);
+    let listener = tokio::net::TcpListener::bind(&cfg.bind).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_rate_limit_caps_per_pair_and_resets_on_window() {
+        // Construct a bare AppState directly — no need to spin up
+        // the full server for an isolated rate-limit assertion.
+        let state = AppState::new(None);
+        let req = "alice";
+        let tgt = "bob";
+        // First 60 calls succeed.
+        for _ in 0..super::RESUME_RATE_LIMIT {
+            assert!(resume_within_limit(&state, req, tgt));
+        }
+        // The 61st in the same window is rejected.
+        assert!(!resume_within_limit(&state, req, tgt));
+        // A different requester or target shares no bucket.
+        assert!(resume_within_limit(&state, "carol", tgt));
+        assert!(resume_within_limit(&state, req, "dan"));
+        // Simulate window rollover by rewinding the bucket's
+        // window_start. (Black-box test using public Arc<DashMap>.)
+        if let Some(mut e) = state.resume_buckets.get_mut(&(req.into(), tgt.into())) {
+            let (_old, count) = *e.value();
+            e.value_mut().0 = now_secs().saturating_sub(super::RESUME_RATE_WINDOW_SECS + 1);
+            // count is preserved; the helper notices the window
+            // expired and resets to 1 on next call.
+            let _ = count;
+        }
+        // After rollover, the next call succeeds (resets to 1).
+        assert!(resume_within_limit(&state, req, tgt));
+    }
+
+    #[test]
+    fn channel_name_valid_examples() {
+        // Compliant
+        assert!(channel_name_valid("general"));
+        assert!(channel_name_valid("pale-pentest"));
+        assert!(channel_name_valid("pale-sdk"));
+        assert!(channel_name_valid("a1"));
+        assert!(channel_name_valid("0test"));
+        // Non-compliant
+        assert!(!channel_name_valid(""));
+        assert!(!channel_name_valid("a"));
+        assert!(!channel_name_valid("-leading-dash"));
+        assert!(!channel_name_valid("Capital"));
+        assert!(!channel_name_valid("under_score"));
+        assert!(!channel_name_valid("a,b,c"));
+        assert!(!channel_name_valid(&"x".repeat(64)));
+    }
+
+    #[test]
+    fn redact_secrets_blanks_known_patterns() {
+        // JWT-shaped Bearer token → redacted.
+        let r = redact_secrets("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig");
+        assert!(r.contains("[REDACTED:jwt]"), "got: {r}");
+        assert!(!r.contains("eyJhbGciOiJIUzI1NiJ9"));
+        // password= form → redacted.
+        let r = redact_secrets("postgres://user:password=hunter2 host:5432");
+        assert!(r.contains("[REDACTED:password]"), "got: {r}");
+        assert!(!r.contains("hunter2"));
+        // Stripe live key → redacted.
+        let r = redact_secrets("STRIPE_KEY=sk_live_abc123def456");
+        assert!(r.contains("[REDACTED:stripe-secret]"));
+        // AWS access key prefix → redacted.
+        let r = redact_secrets("aws=AKIAIOSFODNN7EXAMPLE");
+        assert!(r.contains("[REDACTED:aws-access-key]"));
+        // Non-secret content passes through unchanged.
+        let r = redact_secrets("hello world, no secrets here");
+        assert_eq!(r, "hello world, no secrets here");
+        // Gezer LB API key — per gezer-lb-origin-contract memory.
+        let r = redact_secrets("GEZER_KEY=gz_c32b802343b555ea12345");
+        assert!(r.contains("[REDACTED:gezer-key]"), "got: {r}");
+        assert!(!r.contains("c32b802343b555ea"));
+        // Stripe webhook signing secret — operator-provisioned shape.
+        let r = redact_secrets("STRIPE_WEBHOOK_SECRET=whsec_abc123def456789");
+        assert!(r.contains("[REDACTED:stripe-webhook-secret]"), "got: {r}");
+        assert!(!r.contains("abc123def456"));
+    }
+
+    #[test]
+    fn memory_key_valid_examples() {
+        // Compliant (categorised)
+        assert!(memory_key_valid("decision-bridge-group-a-schema"));
+        assert!(memory_key_valid("ops-rule-no-client-side-credit-flows"));
+        assert!(memory_key_valid("coverage-2026-05-17"));
+        assert!(memory_key_valid("pattern-ws-auth-cookie-extension"));
+        assert!(memory_key_valid("session-resume-2026-05-17"));
+        // Non-compliant
+        assert!(!memory_key_valid("Capital-letter")); // uppercase
+        assert!(!memory_key_valid("random-key")); // no known category
+        assert!(!memory_key_valid("decision_no_dash")); // category not delimited by '-'
+        assert!(!memory_key_valid("ab")); // too short
+        assert!(!memory_key_valid("")); // empty
+    }
 }

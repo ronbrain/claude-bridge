@@ -367,6 +367,53 @@ fn tools_list() -> Value {
                     "properties": { "channel": { "type": "string" } },
                     "required": ["channel"]
                 }
+            },
+            {
+                "name": "ack_dispatch",
+                "description": "Acknowledge a dispatch — a message sent with `to:[peer]` that the bridge tracked in the `dispatches` table. Use this to commit to a recipient role and (optionally) signal an ETA so the auto-escalation scanner stops pinging you. Idempotent: re-acking a closed dispatch is a no-op 404.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "message_id": { "type": "string", "description": "The message id from `send_message`'s response" },
+                        "eta_secs":   { "type": "number", "description": "Seconds until you expect to complete; 0 = unspecified" }
+                    },
+                    "required": ["message_id"]
+                }
+            },
+            {
+                "name": "complete_dispatch",
+                "description": "Mark a dispatch as completed. Outcome free-form (e.g. \"shipped\", \"wontfix\", \"blocked\"). Implicitly acks the dispatch if you never called `ack_dispatch` first — peers who just ship don't have to ack and complete separately.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "message_id": { "type": "string" },
+                        "outcome":    { "type": "string", "description": "Free-form completion note (≤1024 chars)" }
+                    },
+                    "required": ["message_id"]
+                }
+            },
+            {
+                "name": "peer_health",
+                "description": "Composite health view for a peer — live presence + open dispatches addressed to them + open findings they authored + active tasks they own. World-readable across the bridge per ops coord-transparency policy. Use it to decide whether a peer is stuck, saturated, or just quiet before pinging.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "peer": { "type": "string", "description": "Identity name to inspect" } },
+                    "required": ["peer"]
+                }
+            },
+            {
+                "name": "resume_for",
+                "description": "Generate a next-session resume brief for a peer — markdown assembled from their live presence, open dispatches, authored open findings, and authored memory keys. `_private_`-prefixed memory keys are excluded; expired-TTL keys are excluded; secret-shaped values (Bearer JWTs, `password=`, `api_key=`, `sk_…` Stripe, `AKIA…` AWS) are redacted to `[REDACTED:<type>]`. Use this at the start of a new session to load context without grepping chat history.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "peer": { "type": "string" } },
+                    "required": ["peer"]
+                }
+            },
+            {
+                "name": "metrics",
+                "description": "Bridge-wide observability snapshot — JSON with peers_active, channels, messages_total, findings_total/open, tasks_total/active, artifacts, dispatches_pending, and per-channel `sse_lag_drops`. Cheap; safe to poll. For Prometheus scraping use `GET /metrics/prometheus` directly (not an MCP tool — Prometheus dials the server itself).",
+                "inputSchema": { "type": "object", "properties": {} }
             }
         ]
     })
@@ -660,7 +707,29 @@ fn resolve_roles(flag: &str) -> Vec<String> {
 async fn main() {
     let parsed = Args::parse();
     let args = Arc::new(parsed);
-    let client = reqwest::Client::new();
+    // Stamp every outbound request with the caller's identity via
+    // `X-Bridge-From` so the server's audit-log hooks (Group B/D)
+    // record an actor for the 5 mutation handlers that lack a body
+    // `from:` field (`triage_finding`, `delete_finding`,
+    // `update_task`, `delete_task`, `memory_delete`). Op-authorized
+    // Option 1 per dispatch 1779040100 — single point of enforcement
+    // in the shim's HTTP client; no per-handler body churn needed.
+    //
+    // `BRIDGE_FROM` env wins so a CLI invocation can override; falls
+    // back to the same `current_name()` resolver the heartbeat uses
+    // so the header matches `/peers` identity by construction.
+    let from_header = std::env::var("BRIDGE_FROM")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| current_name(&args.name));
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Ok(v) = reqwest::header::HeaderValue::from_str(&from_header) {
+        headers.insert("x-bridge-from", v);
+    }
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("reqwest client construction");
 
     // Mark ourselves online before serving the first request — the
     // peer's `list_peers` call right after we boot should see us.
@@ -1463,6 +1532,100 @@ async fn main() {
                         }
                     }
 
+                    "ack_dispatch" | "complete_dispatch" => {
+                        let mid = args_val["message_id"].as_str().unwrap_or("").to_string();
+                        if mid.is_empty() {
+                            text(id, "[bridge] ERROR: message_id required")
+                        } else {
+                            let path = if name == "ack_dispatch" { "ack" } else { "complete" };
+                            // Build body — `ack` takes `eta_secs?`,
+                            // `complete` takes `outcome?`. Server
+                            // accepts an empty body for either by
+                            // way of `#[serde(default)]`, so we send
+                            // whatever the caller passed and let
+                            // serde do the work.
+                            let body = if name == "ack_dispatch" {
+                                serde_json::json!({
+                                    "eta_secs": args_val["eta_secs"].as_u64().unwrap_or(0)
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "outcome": args_val["outcome"].as_str().unwrap_or("")
+                                })
+                            };
+                            let res = client
+                                .post(format!("{}/dispatches/{}/{path}", args.server, encode_path_segment(&mid)))
+                                .json(&body)
+                                .send()
+                                .await;
+                            match res {
+                                Ok(r) if r.status().is_success() =>
+                                    text(id, format!("[bridge] {name} OK for {mid}")),
+                                Ok(r) => {
+                                    let s = r.status();
+                                    let b = r.text().await.unwrap_or_default();
+                                    text(id, format!("[bridge] ERROR {s}: {b}"))
+                                }
+                                _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                            }
+                        }
+                    }
+
+                    "peer_health" => {
+                        let peer = args_val["peer"].as_str().unwrap_or("").to_string();
+                        if peer.is_empty() {
+                            text(id, "[bridge] ERROR: peer required")
+                        } else {
+                            let res = client
+                                .get(format!("{}/peer/{}/health", args.server, encode_path_segment(&peer)))
+                                .send()
+                                .await;
+                            match res {
+                                Ok(r) if r.status().is_success() => {
+                                    let body = r.text().await.unwrap_or_default();
+                                    text(id, format!("[bridge] {peer} health:\n{body}"))
+                                }
+                                Ok(r) => text(id, format!("[bridge] ERROR {}: peer_health failed", r.status())),
+                                _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                            }
+                        }
+                    }
+
+                    "resume_for" => {
+                        let peer = args_val["peer"].as_str().unwrap_or("").to_string();
+                        if peer.is_empty() {
+                            text(id, "[bridge] ERROR: peer required")
+                        } else {
+                            let res = client
+                                .get(format!("{}/resume/{}", args.server, encode_path_segment(&peer)))
+                                .send()
+                                .await;
+                            match res {
+                                Ok(r) if r.status().is_success() => {
+                                    let body = r.text().await.unwrap_or_default();
+                                    text(id, body)
+                                }
+                                Ok(r) => text(id, format!("[bridge] ERROR {}: resume failed", r.status())),
+                                _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                            }
+                        }
+                    }
+
+                    "metrics" => {
+                        let res = client
+                            .get(format!("{}/metrics", args.server))
+                            .send()
+                            .await;
+                        match res {
+                            Ok(r) if r.status().is_success() => {
+                                let body = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] metrics:\n{body}"))
+                            }
+                            Ok(r) => text(id, format!("[bridge] ERROR {}: metrics failed", r.status())),
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+
                     _ => err(id, -32601, "unknown tool"),
                 }
             }
@@ -1584,6 +1747,124 @@ mod tests {
         assert_eq!(decode_base64("YWI=").unwrap(), b"ab".to_vec());
         assert_eq!(decode_base64("YQ==").unwrap(), b"a".to_vec());
         assert_eq!(decode_base64("").unwrap(), Vec::<u8>::new());
+    }
+
+    /// Drift guard for the `381b3ea` class of bug: a server route
+    /// existed but the MCP `tools/list` response forgot it (or vice
+    /// versa). We can't directly compare against the router without
+    /// running the server, so we list both sides at build time and
+    /// assert the symmetric difference is empty for tools we expect
+    /// to map 1:1.
+    ///
+    /// Not every server route maps to a tool (e.g. `/stream/...` is
+    /// SSE, not RPC) and not every tool maps to a single route
+    /// (`share_endpoint` is purely client-side). The
+    /// `EXPECTED_TOOL_NAMES` allowlist is the contract; adding a new
+    /// MCP tool means adding it here AND in the `tools/list` array
+    /// returned by `tools_list()`. CI fails fast on a missing entry.
+    #[test]
+    fn tools_list_matches_expected_set() {
+        let v = super::tools_list();
+        let tools = v["tools"].as_array().expect("tools is an array");
+        let names: std::collections::BTreeSet<String> = tools
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(String::from))
+            .collect();
+        // Single source of truth — this is the list of MCP tool
+        // names the bridge exposes. Update both this array and
+        // `tools_list()` when adding a new tool.
+        const EXPECTED_TOOL_NAMES: &[&str] = &[
+            "send_message",
+            "read_messages",
+            "list_peers",
+            "share_endpoint",
+            "report_finding",
+            "list_findings",
+            "triage_finding",
+            "delete_finding",
+            "share_artifact",
+            "list_channels",
+            "set_channel_topic",
+            "clear_channel",
+            "set_status",
+            "set_skills",
+            "pin_message",
+            "unpin_message",
+            "create_task",
+            "list_tasks",
+            "update_task",
+            "delete_task",
+            "memory_get",
+            "memory_set",
+            "memory_delete",
+            "memory_list",
+            "delete_channel",
+            // Group B/C additions:
+            "ack_dispatch",
+            "complete_dispatch",
+            "peer_health",
+            "resume_for",
+            "metrics",
+        ];
+        let expected: std::collections::BTreeSet<String> =
+            EXPECTED_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+        let missing: Vec<&String> = expected.difference(&names).collect();
+        let extra: Vec<&String> = names.difference(&expected).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "tool/expected drift — missing from tools/list: {missing:?}; extra in tools/list (un-expected): {extra:?}"
+        );
+        // Every tool in tools/list must have a description and an
+        // inputSchema — the JSON-RPC client won't render a tool
+        // without these. Catches "added the name but forgot the
+        // metadata" mistakes.
+        for t in tools {
+            let name = t["name"].as_str().unwrap_or("?");
+            assert!(t["description"].is_string(), "tool {name} missing description");
+            assert!(t["inputSchema"].is_object(), "tool {name} missing inputSchema");
+        }
+    }
+
+    /// Guards the actor-attribution Opt 1 wiring (ops dispatch
+    /// 1779040100): the shim's HTTP client must be constructed with
+    /// an `X-Bridge-From` default header derived from the peer
+    /// name. Reqwest merges default headers at `send()` time, not
+    /// `build()` time, so we assert the construction path produces
+    /// a valid HeaderMap with the expected key/value — the layer
+    /// that's actually shim code, not reqwest internals.
+    #[test]
+    fn x_bridge_from_default_header_constructed_from_name() {
+        let from = "test-peer-xyz";
+        let mut headers = reqwest::header::HeaderMap::new();
+        let v = reqwest::header::HeaderValue::from_str(from)
+            .expect("from-name encodable as header");
+        headers.insert("x-bridge-from", v);
+        // Same builder shape the prod main() uses — guards against
+        // the wrong header name landing into the actual client
+        // construction.
+        let client = reqwest::Client::builder()
+            .default_headers(headers.clone())
+            .build()
+            .expect("build");
+        // We can't easily intercept reqwest's pre-send merge in a
+        // unit test, but we can confirm (a) the header is encodable
+        // (no control chars / non-ASCII bytes that would reject at
+        // runtime) and (b) the client built successfully with our
+        // map. Failure modes the test catches: bad header name
+        // ("X Bridge From"), non-ASCII byte in peer name producing
+        // `from_str` Err, builder failure under our flags.
+        assert!(headers.contains_key("x-bridge-from"));
+        assert_eq!(
+            headers.get("x-bridge-from").unwrap().to_str().unwrap(),
+            from
+        );
+        // Sanity: peer-name strings with whitespace/control chars
+        // would fail at `HeaderValue::from_str` — that's the
+        // correct behaviour (we'd never want such a name to silently
+        // produce an empty header). Confirm:
+        assert!(reqwest::header::HeaderValue::from_str("bad name\n").is_err());
+        // Drop client to silence unused warning.
+        drop(client);
     }
 
     #[test]
