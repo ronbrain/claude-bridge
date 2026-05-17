@@ -241,7 +241,11 @@ fn spawn_heartbeat(args: Arc<Args>, client: reqwest::Client) -> tokio::task::Abo
             // on `hostname` until the next MCP restart.
             let name = current_name(&args.name);
             let roles = resolve_roles(&args.role);
-            let url = format!("{}/presence/{}", args.server, name);
+            // URL-encode `/` (and `?`, `#`) in the name. Auto-derived
+            // identities like `paledo/0f4543` contain a slash that
+            // axum's `/presence/{name}` route would otherwise split
+            // into two path segments → 404 → silent heartbeat loss.
+            let url = format!("{}/presence/{}", args.server, encode_path_segment(&name));
             let _ = client
                 .post(&url)
                 .json(&json!({ "channel": args.channel, "roles": roles }))
@@ -252,6 +256,25 @@ fn spawn_heartbeat(args: Arc<Args>, client: reqwest::Client) -> tokio::task::Abo
         }
     });
     h.abort_handle()
+}
+
+/// Percent-encode the reserved characters that would otherwise break
+/// path matching when the name is interpolated into a URL. We don't
+/// pull in the `percent-encoding` crate for this — only a handful of
+/// chars matter for our `<host>/<short-sid>` identity format.
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'/' => out.push_str("%2F"),
+            b'?' => out.push_str("%3F"),
+            b'#' => out.push_str("%23"),
+            b'%' => out.push_str("%25"),
+            b' ' => out.push_str("%20"),
+            _ => out.push(b as char),
+        }
+    }
+    out
 }
 
 /// Resolve the name to use right now. Explicit `--name foo` wins;
