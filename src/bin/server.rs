@@ -82,6 +82,317 @@ fn effective_actor(
         .unwrap_or_else(|| "anonymous".into())
 }
 
+/// Fire any routing rules matching `trigger_type` against
+/// `payload`. Reads the enabled-rule set from sqlite, runs
+/// `routing::eval`, then dispatches each `MatchedAction` via the
+/// existing `publish_system` helper (so audit-log + dispatch
+/// tracking apply uniformly). Best-effort: a per-action failure
+/// logs at WARN and continues — routing actions are observability,
+/// not the source of truth for the underlying mutation that
+/// triggered them.
+///
+/// `depth` is the recursion budget passed in. The caller bumps it
+/// when emitting a synthesised action; the dispatcher refuses to
+/// fire actions when `depth >= max_depth` (Q3 cycle guard).
+/// Phase 2 doesn't yet trigger from synthetic events, so `depth`
+/// is always 0 today — but the parameter is here so the future
+/// AutoMessage-fires-AutoMessage path is bounded by construction.
+fn fire_routing_actions(
+    state: &AppState,
+    trigger_type: &str,
+    payload: &serde_json::Value,
+    max_depth: u8,
+    depth: u8,
+) {
+    if depth >= max_depth {
+        tracing::warn!(
+            trigger_type,
+            depth,
+            max_depth,
+            "routing engine cycle depth cap hit; refusing to dispatch more actions"
+        );
+        return;
+    }
+    let Some(store) = &state.store else { return };
+    let rules = match store.rules_for_trigger(trigger_type) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, trigger_type, "routing rule read failed");
+            return;
+        }
+    };
+    if rules.is_empty() {
+        return;
+    }
+    let matched = claude_bridge::routing::eval(&rules, trigger_type, payload);
+    let now = now_secs();
+    for action in matched {
+        match action.action_type.as_str() {
+            "auto_message" => {
+                dispatch_auto_message(state, &action, payload, now);
+            }
+            "auto_assign" => {
+                dispatch_auto_assign(state, &action, payload);
+            }
+            "auto_escalate" => {
+                dispatch_auto_escalate(state, &action, payload);
+            }
+            "auto_batch" => {
+                // Phase 2 ships a log-only stub; a real batch
+                // accumulator (group findings by `target_file` or
+                // similar, emit one batched dispatch per window)
+                // lands in F17.3. The action's payload is
+                // observable in tracing so operators can audit
+                // what would have batched.
+                tracing::info!(
+                    rule_id = %action.rule_id,
+                    rule_name = %action.rule_name,
+                    "auto_batch matched but deferred to F17.3 — payload logged for audit"
+                );
+            }
+            other => {
+                tracing::warn!(
+                    rule_id = %action.rule_id,
+                    action_type = other,
+                    "unknown action_type — skipping (this should have been rejected at insert)"
+                );
+            }
+        }
+    }
+}
+
+/// Render the rule's `action_params.template` against the trigger
+/// payload, publish a `bridge-auto` message to `action_params.channel`
+/// (falls back to `payload.channel`), with the Q4 rate-limit + 3-trip
+/// quarantine guard. On rate-limit trip, records the strike and (if
+/// over threshold) flips `enabled = 0` + pings ops.
+fn dispatch_auto_message(
+    state: &AppState,
+    action: &claude_bridge::routing::MatchedAction,
+    payload: &serde_json::Value,
+    now: u64,
+) {
+    let channel = action
+        .action_params
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("channel").and_then(|v| v.as_str()))
+        .unwrap_or("general")
+        .to_string();
+    let template = action
+        .action_params
+        .get("template")
+        .and_then(|v| v.as_str())
+        .unwrap_or("[bridge-auto] rule {{rule_name}} fired");
+    // Q4 rate-limit gate. If we're over cap → trip + maybe quarantine.
+    if !state.routing_rate.check_and_count(&action.rule_id, &channel, now) {
+        let quarantine = state.routing_rate.record_trip(&action.rule_id, now);
+        tracing::warn!(
+            rule_id = %action.rule_id,
+            channel = %channel,
+            "AutoMessage rate cap exceeded; dropping emit"
+        );
+        if quarantine {
+            if let Some(store) = &state.store {
+                if let Ok(_) = store.set_routing_rule_enabled(&action.rule_id, false) {
+                    tracing::warn!(
+                        rule_id = %action.rule_id,
+                        "rule auto-disabled — 3 trips in 5 min (Q4 quarantine)"
+                    );
+                    // Ping ops via a synthetic message in the same
+                    // channel; addressed to the `ops` role.
+                    publish_bridge_auto(
+                        state,
+                        &channel,
+                        &["ops".into()],
+                        format!(
+                            "[bridge-auto] routing rule `{}` (`{}`) auto-disabled — \
+                             3 rate-cap trips in 5 min. Re-enable with `routing_rule_toggle`.",
+                            action.rule_name, action.rule_id
+                        ),
+                    );
+                }
+            }
+        }
+        return;
+    }
+    // Build the placeholder context from the payload (Q5 whitelist
+    // already enforced at insert-validate time — we trust whatever
+    // keys the trigger emits + skip with WARN on unknowns).
+    let mut ctx: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    if let Some(obj) = payload.as_object() {
+        for (k, v) in obj {
+            let s = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            ctx.insert(k.as_str(), s);
+        }
+    }
+    // Convert HashMap<&str, String> → HashMap<&str, &str> for render_template.
+    let ctx_refs: std::collections::HashMap<&str, &str> =
+        ctx.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let content = claude_bridge::routing::render_template(template, &ctx_refs);
+    let to_field = action
+        .action_params
+        .get("to")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    publish_bridge_auto(state, &channel, &to_field, content);
+}
+
+/// `auto_assign`: resolve a target peer from
+/// `action_params.{assignee_role, assignee_skill}` via the live
+/// peers map, then post an addressed message into the trigger's
+/// channel (or `action_params.channel` if set). Per Q1 ops:
+/// message-only, never mutate a finding/task row.
+fn dispatch_auto_assign(
+    state: &AppState,
+    action: &claude_bridge::routing::MatchedAction,
+    payload: &serde_json::Value,
+) {
+    let target_role = action
+        .action_params
+        .get("assignee_role")
+        .and_then(|v| v.as_str());
+    let target_skill = action
+        .action_params
+        .get("assignee_skill")
+        .and_then(|v| v.as_str());
+    let mut candidates: Vec<String> = Vec::new();
+    for kv in state.peers.iter() {
+        let p = kv.value();
+        let role_ok = target_role
+            .map(|r| p.roles.iter().any(|pr| pr == r))
+            .unwrap_or(true);
+        let skill_ok = target_skill
+            .map(|s| p.skills.iter().any(|ps| ps == s))
+            .unwrap_or(true);
+        if role_ok && skill_ok {
+            candidates.push(kv.key().clone());
+        }
+    }
+    if candidates.is_empty() {
+        tracing::info!(
+            rule_id = %action.rule_id,
+            role = ?target_role,
+            skill = ?target_skill,
+            "auto_assign: no candidate peer matches role+skill; skipping"
+        );
+        return;
+    }
+    let channel = action
+        .action_params
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("channel").and_then(|v| v.as_str()))
+        .unwrap_or("general")
+        .to_string();
+    let target_kind = payload
+        .get("finding_id")
+        .or_else(|| payload.get("task_id"))
+        .or_else(|| payload.get("message_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("(unknown)");
+    let content = format!(
+        "[bridge-auto] assigning `{target_kind}` per rule `{}` — matches role={:?} skill={:?}",
+        action.rule_name, target_role, target_skill
+    );
+    publish_bridge_auto(state, &channel, &candidates, content);
+}
+
+/// `auto_escalate`: post a `bridge-auto` message to the trigger's
+/// channel, addressed to the `ops` role. Mirrors the
+/// DispatchEscalationScanner's auto-ping but for finding/task/peer
+/// triggers per the operator's rule.
+fn dispatch_auto_escalate(
+    state: &AppState,
+    action: &claude_bridge::routing::MatchedAction,
+    payload: &serde_json::Value,
+) {
+    let channel = action
+        .action_params
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("channel").and_then(|v| v.as_str()))
+        .unwrap_or("general")
+        .to_string();
+    let what = payload
+        .get("finding_id")
+        .or_else(|| payload.get("task_id"))
+        .or_else(|| payload.get("message_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("(unknown)");
+    let content = format!(
+        "[bridge-auto] escalating `{what}` per rule `{}`",
+        action.rule_name
+    );
+    publish_bridge_auto(state, &channel, &["ops".into()], content);
+}
+
+/// Publish a `bridge-auto`-authored message via the in-memory
+/// senders + sqlite write-through (same shape as `send` handler
+/// minus the body cap checks since content is server-generated).
+/// Also records a dispatch row when `to_field` is non-empty so
+/// the SLA escalation scanner can re-track it.
+fn publish_bridge_auto(state: &AppState, channel: &str, to_field: &[String], content: String) {
+    use claude_bridge::Message;
+    let msg = Message {
+        id: Uuid::new_v4().to_string(),
+        channel: channel.to_string(),
+        from: "bridge-auto".into(),
+        content,
+        timestamp: now_secs(),
+        to: to_field.to_vec(),
+        thread_id: String::new(),
+        pinned: false,
+    };
+    let id = msg.id.clone();
+    {
+        let mut h = state.history.entry(channel.to_string()).or_default();
+        h.push(msg.clone());
+        if h.len() > HISTORY_LIMIT {
+            let drain = h.len() - HISTORY_LIMIT;
+            h.drain(0..drain);
+        }
+    }
+    if let Some(store) = &state.store {
+        let _ = store.insert_message(&msg);
+        let _ = store.prune_messages(channel, HISTORY_LIMIT);
+        if !to_field.is_empty() {
+            let dispatch = claude_bridge::Dispatch {
+                id: Uuid::new_v4().to_string(),
+                message_id: id.clone(),
+                from: msg.from.clone(),
+                to: to_field.join(","),
+                channel: channel.to_string(),
+                sent_at: msg.timestamp,
+                ack_at: 0,
+                ack_eta_secs: 0,
+                completed_at: 0,
+                outcome: String::new(),
+            };
+            let _ = store.insert_dispatch(&dispatch);
+        }
+        // Audit hook — same write_audit path as user-authored sends.
+        write_audit(
+            store,
+            "bridge-auto",
+            "create",
+            "message",
+            &msg.id,
+            None::<&Message>,
+            Some(&msg),
+        );
+    }
+    let _ = state.sender(channel).send(msg);
+}
+
 /// Append one audit-log row for a write op. Best-effort: a sqlite
 /// failure here MUST NOT propagate as a 5xx — the audit log is
 /// observability, not the source of truth. We log the failure via
@@ -259,9 +570,26 @@ struct AppState {
     /// per target. Implemented as a simple sliding-minute count to
     /// avoid pulling in `tower-governor` for one endpoint.
     resume_buckets: Arc<DashMap<(String, String), (u64, u32)>>,
+    /// Routing-engine AutoMessage rate guard per (rule_id, channel).
+    /// See `routing::RateBucket` for the 10/min cap + 3-trips-in-
+    /// 5min quarantine signal (Q4 ops 1779048799). Cleared on
+    /// server restart by design — quarantine state itself is in
+    /// the routing_rules.enabled column on disk.
+    routing_rate: Arc<claude_bridge::routing::RateBucket>,
+    /// Per Q3 ops + 0f4543 Phase 1 note 1: max recursion depth for
+    /// the routing engine's chain-trigger guard. Set once at boot
+    /// from `BRIDGE_ROUTING_MAX_DEPTH` (1–3, FATAL outside the
+    /// range). Threaded into `fire_routing_actions` so future
+    /// AutoMessage-fires-AutoMessage paths can't loop.
+    routing_max_depth: u8,
 }
 
 impl AppState {
+    fn new_with_routing(store: Option<Store>, routing_max_depth: u8) -> Self {
+        let mut s = Self::new(store);
+        s.routing_max_depth = routing_max_depth;
+        s
+    }
     fn new(store: Option<Store>) -> Self {
         Self {
             senders: Arc::new(DashMap::new()),
@@ -275,6 +603,8 @@ impl AppState {
             store,
             sse_lag_drops: Arc::new(DashMap::new()),
             resume_buckets: Arc::new(DashMap::new()),
+            routing_rate: Arc::new(claude_bridge::routing::RateBucket::default()),
+            routing_max_depth: 1,
         }
     }
 
@@ -761,6 +1091,19 @@ async fn create_finding(
     prev.last_seen = now_secs();
     prev.channel = channel.clone();
     state.peers.insert(actor, prev);
+    // F17 Phase 2 emission — fire any routing rules that match
+    // the `finding_created` trigger. Synchronous so the action
+    // (e.g. auto_assign addressed message) shows up on the same
+    // SSE tick as the finding itself.
+    let payload = serde_json::json!({
+        "finding_id": finding.id,
+        "severity":   finding.severity,
+        "title":      finding.title,
+        "endpoint":   finding.endpoint,
+        "from":       finding.from,
+        "channel":    finding.channel,
+    });
+    fire_routing_actions(&state, "finding_created", &payload, state.routing_max_depth, 0);
     Ok(Json(finding))
 }
 
@@ -1227,6 +1570,20 @@ async fn create_task(
             None::<&Task>,
             Some(&task),
         );
+    }
+    // F17 Phase 2 emission — `task_unassigned` trigger fires only
+    // when `owner` is empty (the trigger semantics literally mean
+    // "this task needs someone to claim it"). Use the auto_assign
+    // action to push it to a peer matching a skill/role.
+    if task.owner.is_empty() {
+        let payload = serde_json::json!({
+            "task_id":     task.id,
+            "title":       task.title,
+            "description": task.description,
+            "from":        task.from,
+            "channel":     task.channel,
+        });
+        fire_routing_actions(&state, "task_unassigned", &payload, state.routing_max_depth, 0);
     }
     Ok(Json(task))
 }
@@ -2144,6 +2501,7 @@ async fn update_routing_rule(
     Path(id): Path<String>,
     headers: HeaderMap,
     ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
     State(state): State<AppState>,
     Json(req): Json<UpdateRoutingRuleReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
@@ -2151,6 +2509,30 @@ async fn update_routing_rule(
         StatusCode::SERVICE_UNAVAILABLE,
         "persistence disabled".into(),
     ))?;
+    // Ownership enforce per 0f4543 Phase 1 forward note 2 +
+    // 0919a7db pattern. Only the original creator (or memory-admin
+    // bypass list) can mutate a rule. Ownerless rows (empty
+    // `created_by`) are claimable by the next authenticated
+    // mutator — same first-write-wins semantics as memory.
+    let actor = effective_actor(&headers, ext.as_deref());
+    let prior = store
+        .get_routing_rule(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read failed: {e}")))?
+        .ok_or((StatusCode::NOT_FOUND, format!("routing rule '{id}' not found")))?;
+    let is_admin = auth_ext
+        .as_deref()
+        .map(|a| a.is_memory_admin(&actor))
+        .unwrap_or(false);
+    if !prior.created_by.is_empty() && prior.created_by != actor && !is_admin {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "routing rule '{id}' is owned by '{}'; '{actor}' cannot update. \
+                 Ask owner or request BRIDGE_MEMORY_ADMINS bypass.",
+                prior.created_by
+            ),
+        ));
+    }
     // Validate filter ahead of UPDATE (Q2 invariant — never let
     // a bad-syntax filter persist).
     if let Some(f) = &req.trigger_filter {
@@ -2224,12 +2606,34 @@ async fn delete_routing_rule(
     Path(id): Path<String>,
     headers: HeaderMap,
     ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
     State(state): State<AppState>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "persistence disabled".into(),
     ))?;
+    let actor = effective_actor(&headers, ext.as_deref());
+    // Same ownership enforce as update — only creator (or memory-
+    // admin) can delete a rule.
+    if let Some(prior) = store
+        .get_routing_rule(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read failed: {e}")))?
+    {
+        let is_admin = auth_ext
+            .as_deref()
+            .map(|a| a.is_memory_admin(&actor))
+            .unwrap_or(false);
+        if !prior.created_by.is_empty() && prior.created_by != actor && !is_admin {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!(
+                    "routing rule '{id}' is owned by '{}'; '{actor}' cannot delete.",
+                    prior.created_by
+                ),
+            ));
+        }
+    }
     let n = store
         .delete_routing_rule(&id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("delete failed: {e}")))?;
@@ -2383,6 +2787,20 @@ async fn main() {
     };
     tracing::info!(?cfg, "loaded runtime config");
 
+    // Routing engine max-depth gate (per 0f4543 Phase 1 review,
+    // forward note 1, msg 1779049950). Parse-and-validate at boot
+    // so a bad env value (BRIDGE_ROUTING_MAX_DEPTH=4) FATALs here
+    // instead of erroring at first eval — `ops-rule-no-silent-
+    // fail-open-defaults` applies to the cycle-depth gate too.
+    let routing_max_depth = match claude_bridge::routing::parse_max_depth_env() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("FATAL: {e}");
+            std::process::exit(2);
+        }
+    };
+    tracing::info!(routing_max_depth, "routing engine cycle depth cap");
+
     // Optional persistence. `db_path = Some(_)` enables write-through
     // sqlite + boot-time rehydrate. `None` keeps the legacy
     // in-memory-only mode where state is lost on restart.
@@ -2403,7 +2821,7 @@ async fn main() {
         }
     };
 
-    let state = AppState::new(store.clone());
+    let state = AppState::new_with_routing(store.clone(), routing_max_depth);
     state.rehydrate();
 
     // Background automation loop. Shared 60s base tick per ops
@@ -2497,6 +2915,18 @@ async fn main() {
             tracing::info!(
                 "finding-author migration skipped — permissive mode (no registry to define orphans against)"
             );
+        }
+        // F17 Phase 2: routing_rules ownership orphan migration
+        // (0f4543 forward note 2). Same enforce-mode gate.
+        if !auth_state.is_permissive() {
+            match store_ref.orphan_unmapped_rule_owners(&known) {
+                Ok(0) => tracing::info!("routing-rules-ownership migration: no rows needed orphaning"),
+                Ok(n) => tracing::info!(
+                    orphaned = n,
+                    "routing-rules-ownership migration: rewrote {n} rows to ownerless"
+                ),
+                Err(e) => tracing::warn!(error = %e, "routing-rules-ownership migration failed"),
+            }
         }
         match store_ref.orphan_unmapped_memory_owners(&known) {
             Ok(0) => tracing::info!("memory-ownership migration: no rows needed orphaning"),

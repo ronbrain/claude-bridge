@@ -688,6 +688,68 @@ impl Store {
         Ok(n)
     }
 
+    /// Read a single rule by id — used by the ownership-enforce
+    /// path on update/delete so we can compare `created_by` against
+    /// the authed identity without round-tripping the full list.
+    /// Returns Ok(None) on missing id (caller maps to 404).
+    pub fn get_routing_rule(&self, id: &str) -> SqliteResult<Option<crate::RoutingRule>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, trigger_type, trigger_filter, action_type,
+                    action_params, enabled, priority, created_by, created_at
+             FROM routing_rules WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(r) = rows.next()? {
+            Ok(Some(crate::RoutingRule {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                trigger_type: r.get(2)?,
+                trigger_filter: r.get(3)?,
+                action_type: r.get(4)?,
+                action_params: r.get(5)?,
+                enabled: r.get::<_, i64>(6)? != 0,
+                priority: r.get(7)?,
+                created_by: r.get(8)?,
+                created_at: r.get::<_, i64>(9)? as u64,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Mirror of `orphan_unmapped_memory_owners` for the
+    /// `routing_rules` table. Per 0f4543 Phase 1 review forward
+    /// note 2 (msg 1779049950): rules created during a permissive
+    /// window where the authoring identity isn't in the post-flip
+    /// registry+admins set get their `created_by` rewritten to
+    /// empty so they're treated as ownerless (first authenticated
+    /// re-claim wins). Enforce-mode-only at the caller; empty
+    /// `known` set is a defensive no-op.
+    ///
+    /// Returns rows-touched.
+    pub fn orphan_unmapped_rule_owners(
+        &self,
+        known: &std::collections::HashSet<String>,
+    ) -> SqliteResult<usize> {
+        let conn = self.conn.lock();
+        if known.is_empty() {
+            return Ok(0);
+        }
+        let names: Vec<String> = known.iter().cloned().collect();
+        let placeholders: String = std::iter::repeat("?")
+            .take(names.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "UPDATE routing_rules SET created_by = '' \
+             WHERE created_by != '' AND created_by NOT IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let n = stmt.execute(rusqlite::params_from_iter(names.iter()))?;
+        Ok(n)
+    }
+
     pub fn delete_routing_rule(&self, id: &str) -> SqliteResult<usize> {
         let n = self.conn.lock().execute(
             "DELETE FROM routing_rules WHERE id = ?1",
@@ -1951,6 +2013,77 @@ mod tests {
         // Two rows had non-empty owners and get rewritten; the
         // empty one was already ownerless.
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn orphan_unmapped_rule_owners_rewrites_strangers() {
+        // F17 Phase 2 — mirror of orphan_unmapped_memory_owners
+        // for routing_rules per 0f4543 Phase 1 forward note 2.
+        let s = temp_store();
+        for (id, by) in [
+            ("r1", "alice"),
+            ("r2", "saas-legacy"),
+            ("r3", "another-stranger"),
+            ("r4", ""),
+        ] {
+            s.conn
+                .lock()
+                .execute(
+                    "INSERT INTO routing_rules
+                     (id, name, trigger_type, trigger_filter, action_type,
+                      action_params, enabled, priority, created_by, created_at)
+                     VALUES (?1, ?1, 'finding_created', '{}', 'auto_message',
+                             '{}', 1, 50, ?2, 0)",
+                    rusqlite::params![id, by],
+                )
+                .unwrap();
+        }
+        let mut known = std::collections::HashSet::new();
+        known.insert("alice".to_string());
+        let n = s.orphan_unmapped_rule_owners(&known).unwrap();
+        // r2 + r3 renamed; r1 stays; r4 was already empty (untouched).
+        assert_eq!(n, 2);
+        let rows: Vec<(String, String)> = {
+            let conn = s.conn.lock();
+            let mut stmt = conn
+                .prepare("SELECT id, created_by FROM routing_rules ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(rows[0], ("r1".into(), "alice".into()));
+        assert_eq!(rows[1], ("r2".into(), "".into()));
+        assert_eq!(rows[2], ("r3".into(), "".into()));
+        assert_eq!(rows[3], ("r4".into(), "".into()));
+        // Empty known is a defensive no-op.
+        let empty = std::collections::HashSet::new();
+        let n2 = s.orphan_unmapped_rule_owners(&empty).unwrap();
+        assert_eq!(n2, 0);
+    }
+
+    #[test]
+    fn get_routing_rule_round_trips() {
+        let s = temp_store();
+        s.conn
+            .lock()
+            .execute(
+                "INSERT INTO routing_rules
+                 (id, name, trigger_type, trigger_filter, action_type,
+                  action_params, enabled, priority, created_by, created_at)
+                 VALUES ('r1', 'alpha', 'finding_created', '{\"severity\":\"high\"}',
+                         'auto_message', '{\"template\":\"hi\"}', 1, 80, 'alice', 0)",
+                [],
+            )
+            .unwrap();
+        let r = s.get_routing_rule("r1").unwrap().expect("present");
+        assert_eq!(r.name, "alpha");
+        assert_eq!(r.priority, 80);
+        assert_eq!(r.created_by, "alice");
+        assert!(r.enabled);
+        // Missing id → None.
+        assert!(s.get_routing_rule("does-not-exist").unwrap().is_none());
     }
 
     #[test]
