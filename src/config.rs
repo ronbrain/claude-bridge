@@ -23,6 +23,12 @@ pub enum ConfigStartupError {
          (state lost on every restart — see finding c9d0bfd9)."
     )]
     DbPathEmptyNotEphemeral,
+    #[error(
+        "BRIDGE_ROUTING_PEER_IDLE_SECS={0} out of range — must be 60..=3600 (per F17.4 / \
+         0f4543 review 1779053200). Refusing to start so the routing engine doesn't fire \
+         peer_idle triggers at a useless cadence."
+    )]
+    PeerIdleSecsOutOfRange(u64),
 }
 
 #[derive(Clone, Debug)]
@@ -57,11 +63,18 @@ pub struct Config {
     /// Maximum versions kept per memory key in `memory_history`.
     /// From `BRIDGE_MEMORY_HISTORY_KEEP` (default 5).
     pub memory_history_keep: usize,
+    /// Threshold the `PeerIdleScanner` uses to emit `peer_idle`
+    /// triggers — peers whose `last_seen` lag exceeds this fire
+    /// through the routing engine. From `BRIDGE_ROUTING_PEER_IDLE_SECS`
+    /// (default 300, range 60..=3600 per F17.4 / 0f4543 ask
+    /// 1779053200; out-of-range refuses to start).
+    pub routing_peer_idle_secs: u64,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
+            routing_peer_idle_secs: 300,
             // Default to loopback per pentest finding `dc633d7c`
             // (msg 1779042729). Operators wanting network exposure
             // must set `BRIDGE_BIND=0.0.0.0:<port>` explicitly,
@@ -182,6 +195,24 @@ impl Config {
                 "BRIDGE_MEMORY_HISTORY_KEEP",
                 default.memory_history_keep,
             ),
+            routing_peer_idle_secs: {
+                // F17.4 — operator-tunable per 0f4543 ask
+                // 1779053200. Out-of-range refuses to start so a
+                // 0 or 99999 doesn't silently degrade to default.
+                let raw = std::env::var("BRIDGE_ROUTING_PEER_IDLE_SECS").ok();
+                match raw.as_deref() {
+                    None | Some("") => default.routing_peer_idle_secs,
+                    Some(s) => {
+                        let n: u64 = s
+                            .parse()
+                            .map_err(|_| ConfigStartupError::PeerIdleSecsOutOfRange(0))?;
+                        if !(60..=3600).contains(&n) {
+                            return Err(ConfigStartupError::PeerIdleSecsOutOfRange(n));
+                        }
+                        n
+                    }
+                }
+            },
         })
     }
 }
@@ -220,6 +251,48 @@ mod tests {
         }
         if let Some(v) = prev_eph {
             std::env::set_var("BRIDGE_DB_EPHEMERAL", v);
+        }
+    }
+
+    #[test]
+    fn peer_idle_secs_env_range_enforced() {
+        // F17.4 — out-of-range refuses, in-range admits, unset defaults to 300.
+        let prev_path = std::env::var("BRIDGE_DB_PATH").ok();
+        let prev_eph = std::env::var("BRIDGE_DB_EPHEMERAL").ok();
+        let prev_idle = std::env::var("BRIDGE_ROUTING_PEER_IDLE_SECS").ok();
+        // Keep DB path satisfied so the only thing we exercise is the new gate.
+        std::env::set_var("BRIDGE_DB_EPHEMERAL", "1");
+        std::env::remove_var("BRIDGE_DB_PATH");
+        for ok in ["60", "300", "1800", "3600"] {
+            std::env::set_var("BRIDGE_ROUTING_PEER_IDLE_SECS", ok);
+            let c = Config::from_env().expect("in-range admits");
+            assert_eq!(c.routing_peer_idle_secs, ok.parse::<u64>().unwrap());
+        }
+        for bad in ["0", "59", "3601", "99999"] {
+            std::env::set_var("BRIDGE_ROUTING_PEER_IDLE_SECS", bad);
+            assert!(matches!(
+                Config::from_env().unwrap_err(),
+                ConfigStartupError::PeerIdleSecsOutOfRange(_)
+            ));
+        }
+        std::env::set_var("BRIDGE_ROUTING_PEER_IDLE_SECS", "notanumber");
+        assert!(matches!(
+            Config::from_env().unwrap_err(),
+            ConfigStartupError::PeerIdleSecsOutOfRange(_)
+        ));
+        std::env::remove_var("BRIDGE_ROUTING_PEER_IDLE_SECS");
+        let c = Config::from_env().expect("default admits");
+        assert_eq!(c.routing_peer_idle_secs, 300);
+        // Restore.
+        std::env::remove_var("BRIDGE_DB_EPHEMERAL");
+        for (k, v) in [
+            ("BRIDGE_DB_PATH", prev_path),
+            ("BRIDGE_DB_EPHEMERAL", prev_eph),
+            ("BRIDGE_ROUTING_PEER_IDLE_SECS", prev_idle),
+        ] {
+            if let Some(val) = v {
+                std::env::set_var(k, val);
+            }
         }
     }
 

@@ -3023,7 +3023,10 @@ async fn main() {
         Arc::new(claude_bridge::automation::PeerDropScanner {
             seen: Arc::new(dashmap::DashSet::new()),
         }),
-        Arc::new(claude_bridge::automation::PeerIdleScanner::default()),
+        Arc::new(claude_bridge::automation::PeerIdleScanner {
+            seen: Arc::new(dashmap::DashSet::new()),
+            threshold_secs: cfg.routing_peer_idle_secs,
+        }),
         Arc::new(claude_bridge::automation::AutoBatchScanner {
             flush: auto_batch_flush,
         }),
