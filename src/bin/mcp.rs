@@ -217,6 +217,149 @@ fn tools_list() -> Value {
                 }
             },
             {
+                "name": "set_status",
+                "description": "Set this peer's short status line (\"working on b358d8ea, ETA 30min\", \"blocked on operator SSH\"). Surfaced in `list_peers` next to the role so other peers see at a glance what each instance is doing. Pass empty string to clear.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "status": { "type": "string", "description": "Status line (≤280 chars)" } },
+                    "required": ["status"]
+                }
+            },
+            {
+                "name": "set_skills",
+                "description": "Set this peer's skills — comma-separated capability tags (`svelte,csp,oauth`). Finer-grained than role; lets a task-router or human pick the right peer for a job. Pass empty string to clear.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "skills": { "type": "string", "description": "Comma-separated skill tags" } },
+                    "required": ["skills"]
+                }
+            },
+            {
+                "name": "pin_message",
+                "description": "Pin a message to the top of its channel — stays visible in `read_messages` regardless of age. Use for the current-state doc, the skills board, decision log. Unpin with `unpin_message`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id":      { "type": "string", "description": "Message id (uuid)" },
+                        "channel": { "type": "string" }
+                    },
+                    "required": ["id"]
+                }
+            },
+            {
+                "name": "unpin_message",
+                "description": "Reverse of `pin_message`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id":      { "type": "string" },
+                        "channel": { "type": "string" }
+                    },
+                    "required": ["id"]
+                }
+            },
+            {
+                "name": "create_task",
+                "description": "Create a work-queue task (distinct from `report_finding`). Tasks describe action items assigned to a peer; findings describe bugs discovered. Use this when ops/coordination needs to track \"who is doing X by when\". Optional `owner` (identity or role) and dependency arrays.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "title":       { "type": "string" },
+                        "description": { "type": "string" },
+                        "owner":       { "type": "string", "description": "Identity name or role; empty = unassigned" },
+                        "blocks":      { "type": "array", "items": { "type": "string" } },
+                        "depends_on":  { "type": "array", "items": { "type": "string" } },
+                        "channel":     { "type": "string" }
+                    },
+                    "required": ["title"]
+                }
+            },
+            {
+                "name": "list_tasks",
+                "description": "List tasks in a channel, optionally filtered by `status` (todo|in_progress|blocked|done|cancelled) or `owner`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "status":  { "type": "string" },
+                        "owner":   { "type": "string" },
+                        "channel": { "type": "string" }
+                    }
+                }
+            },
+            {
+                "name": "update_task",
+                "description": "Update a task. Any of status / owner / note can be changed in one call. Status valid values: todo|in_progress|blocked|done|cancelled.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id":      { "type": "string" },
+                        "status":  { "type": "string" },
+                        "owner":   { "type": "string" },
+                        "note":    { "type": "string" },
+                        "channel": { "type": "string" }
+                    },
+                    "required": ["id"]
+                }
+            },
+            {
+                "name": "delete_task",
+                "description": "Hard-delete a task. Use for duplicates or task created in error. To close a task, prefer `update_task` with status=done.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id":      { "type": "string" },
+                        "channel": { "type": "string" }
+                    },
+                    "required": ["id"]
+                }
+            },
+            {
+                "name": "memory_get",
+                "description": "Read a value from the shared memory KV store. Channel-scoped — two channels can use the same key independently. Returns the entry or 'not found'.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "key":     { "type": "string" },
+                        "channel": { "type": "string" }
+                    },
+                    "required": ["key"]
+                }
+            },
+            {
+                "name": "memory_set",
+                "description": "Write a value into shared memory. Persisted to sqlite when the server has BRIDGE_DB_PATH. Optional `ttl_secs` for auto-expiry. Use for project state, decision log, agreed-on snippets — anything multiple peers want to look up by name.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "key":      { "type": "string" },
+                        "value":    { "type": "string" },
+                        "ttl_secs": { "type": "number", "description": "Seconds until auto-expiry; 0 = never" },
+                        "channel":  { "type": "string" }
+                    },
+                    "required": ["key", "value"]
+                }
+            },
+            {
+                "name": "memory_delete",
+                "description": "Delete a memory key.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "key":     { "type": "string" },
+                        "channel": { "type": "string" }
+                    },
+                    "required": ["key"]
+                }
+            },
+            {
+                "name": "memory_list",
+                "description": "List every key in a channel's memory namespace with its value, updated_by, updated_at, and expires_at.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "channel": { "type": "string" } }
+                }
+            },
+            {
                 "name": "delete_channel",
                 "description": "Hard-delete a channel — wipes messages, findings, topic, and removes it from `list_channels`. Use to clean up ghost channels (typos like `general,pale-sdk`, abandoned channels, etc). Stronger than `clear_channel` which only wipes history.",
                 "inputSchema": {
@@ -255,9 +398,20 @@ fn spawn_heartbeat(args: Arc<Args>, client: reqwest::Client) -> tokio::task::Abo
             // axum's `/presence/{name}` route would otherwise split
             // into two path segments → 404 → silent heartbeat loss.
             let url = format!("{}/presence/{}", args.server, encode_path_segment(&name));
+            // Skills + status come from the same per-session
+            // registry pattern as roles, so users can write
+            // `set_skills` / `set_status` and the change propagates
+            // on the next heartbeat without an MCP restart.
+            let skills = resolve_skills();
+            let status = resolve_status();
             let _ = client
                 .post(&url)
-                .json(&json!({ "channel": args.channel, "roles": roles }))
+                .json(&json!({
+                    "channel": args.channel,
+                    "roles": roles,
+                    "skills": skills,
+                    "status": status,
+                }))
                 .timeout(Duration::from_secs(5))
                 .send()
                 .await;
@@ -410,6 +564,39 @@ fn looks_like_uuid(s: &str) -> bool {
         }
     }
     true
+}
+
+/// Read the per-session skills file written by `set_skills`. Same
+/// resolution pattern as roles (session_id → cache/bridge/skills/<sid>).
+fn resolve_skills() -> Vec<String> {
+    if let Some(sid) = current_session_id() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let cache_dir = std::env::var("BRIDGE_CACHE_DIR")
+            .unwrap_or_else(|_| format!("{home}/.cache/bridge"));
+        let path = format!("{cache_dir}/skills/{sid}");
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            return s
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+/// Read the per-session status file written by `set_status`.
+fn resolve_status() -> String {
+    if let Some(sid) = current_session_id() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let cache_dir = std::env::var("BRIDGE_CACHE_DIR")
+            .unwrap_or_else(|_| format!("{home}/.cache/bridge"));
+        let path = format!("{cache_dir}/status/{sid}");
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            return s.trim().to_string();
+        }
+    }
+    String::new()
 }
 
 /// Roles resolution precedence (highest first):
@@ -950,6 +1137,220 @@ async fn main() {
                                 let s = r.status();
                                 let body = r.text().await.unwrap_or_default();
                                 text(id, format!("[bridge] ERROR {s}: {body}"))
+                            }
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+
+                    "set_status" | "set_skills" => {
+                        // Local-only — writes to ~/.cache/bridge/{status,skills}/<sid>.
+                        // Heartbeat picks it up within 20s and re-publishes.
+                        let value = args_val["status"].as_str()
+                            .or_else(|| args_val["skills"].as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let sid = match current_session_id() {
+                            Some(s) => s,
+                            None => {
+                                text(id.clone(), "[bridge] ERROR: no session — install SessionStart hook");
+                                continue;
+                            }
+                        };
+                        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+                        let cache_dir = std::env::var("BRIDGE_CACHE_DIR")
+                            .unwrap_or_else(|_| format!("{home}/.cache/bridge"));
+                        let sub = if name == "set_status" { "status" } else { "skills" };
+                        let dir = format!("{cache_dir}/{sub}");
+                        let _ = std::fs::create_dir_all(&dir);
+                        let path = format!("{dir}/{sid}");
+                        if value.is_empty() {
+                            let _ = std::fs::remove_file(&path);
+                            text(id, format!("[bridge] {sub} cleared"))
+                        } else {
+                            match std::fs::write(&path, &value) {
+                                Ok(_) => text(id, format!("[bridge] {sub} set: {value}")),
+                                Err(e) => text(id, format!("[bridge] ERROR writing {sub}: {e}")),
+                            }
+                        }
+                    }
+
+                    "pin_message" | "unpin_message" => {
+                        let msg_id = args_val["id"].as_str().unwrap_or("").to_string();
+                        let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
+                        if msg_id.is_empty() {
+                            text(id, "[bridge] ERROR: id required")
+                        } else {
+                            let req = if name == "pin_message" {
+                                client.post(format!("{}/messages/{}/{}/pin", args.server, channel, msg_id))
+                            } else {
+                                client.delete(format!("{}/messages/{}/{}/pin", args.server, channel, msg_id))
+                            };
+                            match req.send().await {
+                                Ok(r) if r.status().is_success() =>
+                                    text(id, format!("[bridge] message '{msg_id}' {}pinned ✓",
+                                        if name == "pin_message" { "" } else { "un" })),
+                                Ok(r) => text(id, format!("[bridge] ERROR {}: {}",
+                                    r.status(), r.text().await.unwrap_or_default())),
+                                _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                            }
+                        }
+                    }
+
+                    "create_task" => {
+                        let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
+                        let body = json!({
+                            "from": current_name(&args.name),
+                            "title": args_val["title"].as_str().unwrap_or(""),
+                            "description": args_val["description"].as_str().unwrap_or(""),
+                            "owner": args_val["owner"].as_str().unwrap_or(""),
+                            "blocks": args_val["blocks"].as_array().cloned().unwrap_or_default(),
+                            "depends_on": args_val["depends_on"].as_array().cloned().unwrap_or_default(),
+                        });
+                        let res = client.post(format!("{}/tasks/{}", args.server, channel))
+                            .json(&body).send().await;
+                        match res {
+                            Ok(r) if r.status().is_success() => {
+                                let task: Value = r.json().await.unwrap_or_default();
+                                text(id, format!("[bridge] task created: id={} title={} owner={}",
+                                    task["id"].as_str().unwrap_or("?"),
+                                    task["title"].as_str().unwrap_or("?"),
+                                    task["owner"].as_str().unwrap_or("(unassigned)")))
+                            }
+                            Ok(r) => text(id, format!("[bridge] ERROR {}: {}",
+                                r.status(), r.text().await.unwrap_or_default())),
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+
+                    "list_tasks" => {
+                        let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
+                        let mut qs: Vec<(&str, String)> = Vec::new();
+                        if let Some(s) = args_val["status"].as_str() { qs.push(("status", s.into())); }
+                        if let Some(o) = args_val["owner"].as_str() { qs.push(("owner", o.into())); }
+                        let res = client.get(format!("{}/tasks/{}", args.server, channel))
+                            .query(&qs).send().await;
+                        match res {
+                            Ok(r) => {
+                                let tasks: Vec<Value> = r.json().await.unwrap_or_default();
+                                if tasks.is_empty() {
+                                    text(id, format!("[bridge] no tasks in '{channel}' (with filters)"))
+                                } else {
+                                    let formatted = tasks.iter().map(|t| {
+                                        format!("• [{}] {} — {} (owner: {})",
+                                            t["status"].as_str().unwrap_or("?"),
+                                            t["id"].as_str().unwrap_or("?"),
+                                            t["title"].as_str().unwrap_or("?"),
+                                            t["owner"].as_str().unwrap_or("(unassigned)"))
+                                    }).collect::<Vec<_>>().join("\n");
+                                    text(id, formatted)
+                                }
+                            }
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+
+                    "update_task" => {
+                        let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
+                        let task_id = args_val["id"].as_str().unwrap_or("").to_string();
+                        let mut body = serde_json::Map::new();
+                        if let Some(s) = args_val["status"].as_str() { body.insert("status".into(), json!(s)); }
+                        if let Some(o) = args_val["owner"].as_str() { body.insert("owner".into(), json!(o)); }
+                        if let Some(n) = args_val["note"].as_str() { body.insert("note".into(), json!(n)); }
+                        let res = client.patch(format!("{}/tasks/{}/{}", args.server, channel, task_id))
+                            .json(&Value::Object(body)).send().await;
+                        match res {
+                            Ok(r) if r.status().is_success() => {
+                                let t: Value = r.json().await.unwrap_or_default();
+                                text(id, format!("[bridge] task {} updated: status={} owner={}",
+                                    task_id,
+                                    t["status"].as_str().unwrap_or("?"),
+                                    t["owner"].as_str().unwrap_or("(unassigned)")))
+                            }
+                            Ok(r) => text(id, format!("[bridge] ERROR {}: {}",
+                                r.status(), r.text().await.unwrap_or_default())),
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+
+                    "delete_task" => {
+                        let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
+                        let task_id = args_val["id"].as_str().unwrap_or("").to_string();
+                        let res = client.delete(format!("{}/tasks/{}/{}", args.server, channel, task_id))
+                            .send().await;
+                        match res {
+                            Ok(r) if r.status().is_success() =>
+                                text(id, format!("[bridge] task {task_id} deleted")),
+                            Ok(r) => text(id, format!("[bridge] ERROR {}: {}",
+                                r.status(), r.text().await.unwrap_or_default())),
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+
+                    "memory_get" => {
+                        let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
+                        let key = args_val["key"].as_str().unwrap_or("").to_string();
+                        let res = client.get(format!("{}/memory/{}/{}", args.server, channel, key))
+                            .send().await;
+                        match res {
+                            Ok(r) if r.status().is_success() => {
+                                let entry: Value = r.json().await.unwrap_or_default();
+                                text(id, format!("[bridge] {channel}/{key}:\n{}",
+                                    entry["value"].as_str().unwrap_or("")))
+                            }
+                            Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND =>
+                                text(id, format!("[bridge] {channel}/{key} not set")),
+                            Ok(r) => text(id, format!("[bridge] ERROR {}", r.status())),
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+
+                    "memory_set" => {
+                        let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
+                        let key = args_val["key"].as_str().unwrap_or("").to_string();
+                        let value = args_val["value"].as_str().unwrap_or("").to_string();
+                        let ttl = args_val["ttl_secs"].as_u64().unwrap_or(0);
+                        let res = client.put(format!("{}/memory/{}/{}", args.server, channel, key))
+                            .json(&json!({ "from": current_name(&args.name), "value": value, "ttl_secs": ttl }))
+                            .send().await;
+                        match res {
+                            Ok(r) if r.status().is_success() =>
+                                text(id, format!("[bridge] {channel}/{key} set ({} bytes{})",
+                                    value.len(),
+                                    if ttl > 0 { format!(", TTL {ttl}s") } else { String::new() })),
+                            Ok(r) => text(id, format!("[bridge] ERROR {}: {}",
+                                r.status(), r.text().await.unwrap_or_default())),
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+
+                    "memory_delete" => {
+                        let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
+                        let key = args_val["key"].as_str().unwrap_or("").to_string();
+                        let _ = client.delete(format!("{}/memory/{}/{}", args.server, channel, key))
+                            .send().await;
+                        text(id, format!("[bridge] {channel}/{key} deleted"))
+                    }
+
+                    "memory_list" => {
+                        let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
+                        let res = client.get(format!("{}/memory/{}", args.server, channel))
+                            .send().await;
+                        match res {
+                            Ok(r) => {
+                                let entries: Vec<Value> = r.json().await.unwrap_or_default();
+                                if entries.is_empty() {
+                                    text(id, format!("[bridge] no memory keys in '{channel}'"))
+                                } else {
+                                    let formatted = entries.iter().map(|e| {
+                                        let v = e["value"].as_str().unwrap_or("");
+                                        let preview = if v.len() > 80 { format!("{}…", &v[..80]) } else { v.into() };
+                                        format!("• {} = {} (by {})",
+                                            e["key"].as_str().unwrap_or("?"),
+                                            preview,
+                                            e["updated_by"].as_str().unwrap_or("?"))
+                                    }).collect::<Vec<_>>().join("\n");
+                                    text(id, formatted)
+                                }
                             }
                             _ => text(id, "[bridge] ERROR: bridge server unreachable"),
                         }
