@@ -568,35 +568,60 @@ fn looks_like_uuid(s: &str) -> bool {
 
 /// Read the per-session skills file written by `set_skills`. Same
 /// resolution pattern as roles (session_id → cache/bridge/skills/<sid>).
+/// Read the per-session skills file written by `set_skills`. Falls
+/// back to `<cache>/skills/by-role/<role>` when the session-keyed
+/// file isn't there yet — that's the path after `claude --resume`
+/// or `/compact` mints a new session_id and the previous per-sid
+/// file is orphaned. Role is the stable anchor: it's declared in
+/// `.bridge-role` or `bridge role <name>` and survives session
+/// rotation.
 fn resolve_skills() -> Vec<String> {
+    let csv_to_vec = |s: &str| -> Vec<String> {
+        s.split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    };
+    let cache_dir = bridge_cache_dir();
     if let Some(sid) = current_session_id() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let cache_dir = std::env::var("BRIDGE_CACHE_DIR")
-            .unwrap_or_else(|_| format!("{home}/.cache/bridge"));
         let path = format!("{cache_dir}/skills/{sid}");
         if let Ok(s) = std::fs::read_to_string(&path) {
-            return s
-                .split(',')
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .collect();
+            return csv_to_vec(&s);
+        }
+    }
+    // By-role fallback. Use the first role as the key; multi-role
+    // peers fall back on their primary identity.
+    if let Some(role) = resolve_roles("").first() {
+        let path = format!("{cache_dir}/skills/by-role/{role}");
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            return csv_to_vec(&s);
         }
     }
     Vec::new()
 }
 
-/// Read the per-session status file written by `set_status`.
+/// Read the per-session status file written by `set_status`. Same
+/// fallback pattern as `resolve_skills`.
 fn resolve_status() -> String {
+    let cache_dir = bridge_cache_dir();
     if let Some(sid) = current_session_id() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let cache_dir = std::env::var("BRIDGE_CACHE_DIR")
-            .unwrap_or_else(|_| format!("{home}/.cache/bridge"));
         let path = format!("{cache_dir}/status/{sid}");
         if let Ok(s) = std::fs::read_to_string(&path) {
             return s.trim().to_string();
         }
     }
+    if let Some(role) = resolve_roles("").first() {
+        let path = format!("{cache_dir}/status/by-role/{role}");
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            return s.trim().to_string();
+        }
+    }
     String::new()
+}
+
+fn bridge_cache_dir() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    std::env::var("BRIDGE_CACHE_DIR").unwrap_or_else(|_| format!("{home}/.cache/bridge"))
 }
 
 /// Roles resolution precedence (highest first):
@@ -1161,8 +1186,13 @@ async fn main() {
                     }
 
                     "set_status" | "set_skills" => {
-                        // Local-only — writes to ~/.cache/bridge/{status,skills}/<sid>.
-                        // Heartbeat picks it up within 20s and re-publishes.
+                        // Local-only — writes to ~/.cache/bridge/{status,skills}/<sid>
+                        // AND (when this session has a role) to a stable
+                        // ~/.cache/bridge/{status,skills}/by-role/<role>
+                        // mirror. The role copy survives session_id
+                        // rotation from `claude --resume` and `/compact`
+                        // so the next heartbeat picks up the value again
+                        // without the user having to re-publish.
                         let value = args_val["status"].as_str()
                             .or_else(|| args_val["skills"].as_str())
                             .unwrap_or("")
@@ -1174,19 +1204,39 @@ async fn main() {
                                 continue;
                             }
                         };
-                        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-                        let cache_dir = std::env::var("BRIDGE_CACHE_DIR")
-                            .unwrap_or_else(|_| format!("{home}/.cache/bridge"));
+                        let cache_dir = bridge_cache_dir();
                         let sub = if name == "set_status" { "status" } else { "skills" };
                         let dir = format!("{cache_dir}/{sub}");
-                        let _ = std::fs::create_dir_all(&dir);
-                        let path = format!("{dir}/{sid}");
+                        let by_role_dir = format!("{dir}/by-role");
+                        let _ = std::fs::create_dir_all(&by_role_dir);
+                        let sid_path = format!("{dir}/{sid}");
+                        let role_path = resolve_roles("")
+                            .first()
+                            .map(|r| format!("{by_role_dir}/{r}"));
                         if value.is_empty() {
-                            let _ = std::fs::remove_file(&path);
+                            let _ = std::fs::remove_file(&sid_path);
+                            if let Some(p) = &role_path {
+                                let _ = std::fs::remove_file(p);
+                            }
                             text(id, format!("[bridge] {sub} cleared"))
                         } else {
-                            match std::fs::write(&path, &value) {
-                                Ok(_) => text(id, format!("[bridge] {sub} set: {value}")),
+                            let sid_write = std::fs::write(&sid_path, &value);
+                            // Mirror to by-role. Failure here is non-fatal
+                            // — sid write is the canonical source for
+                            // this session; by-role is the cross-session
+                            // fallback. We tag the response so the user
+                            // sees whether the mirror was written.
+                            let mirrored = role_path
+                                .as_ref()
+                                .map(|p| std::fs::write(p, &value).is_ok())
+                                .unwrap_or(false);
+                            let tag = if mirrored {
+                                " (mirrored to by-role/ — survives /compact)"
+                            } else {
+                                " (no role set; won't survive /compact — `bridge role <x>` to enable)"
+                            };
+                            match sid_write {
+                                Ok(_) => text(id, format!("[bridge] {sub} set: {value}{tag}")),
                                 Err(e) => text(id, format!("[bridge] ERROR writing {sub}: {e}")),
                             }
                         }
