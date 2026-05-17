@@ -20,15 +20,19 @@
 //!   log, memory ownership, /resume rate-limit) read it directly
 //!   without re-parsing the header.
 //!
-//! ## Permissive mode
+//! ## Permissive mode (fail-CLOSED default)
 //!
-//! If `BRIDGE_AUTH_TOKENS` is unset/empty AND `BRIDGE_AUTH_ENFORCE`
-//! is not `1`, the middleware logs SEVERE once at boot and passes
-//! every request through, injecting `AuthIdentity::Anonymous`.
-//! This keeps existing deployments working until the operator
-//! flips the enforce flag — hard-bricking is worse than the
-//! known-vuln window, and the warn is loud enough to catch in any
-//! sensible log review.
+//! Per pentest pre-review 1779043445 + ops accept 1779043473: if
+//! `BRIDGE_AUTH_TOKENS` is unset/empty AND `BRIDGE_AUTH_PERMISSIVE`
+//! is not `1`, [`AuthState::from_env`] returns
+//! [`AuthStartupError::EmptyRegistryNotPermissive`] and `main()`
+//! refuses to start with a FATAL log + exit code 2. Permissive
+//! mode is an **explicit operator opt-in**: setting
+//! `BRIDGE_AUTH_PERMISSIVE=1` lets the bridge run unauthenticated
+//! while logging SEVERE at boot and injecting `AuthIdentity::
+//! Anonymous` on every request. This matches the Pale backend's
+//! `ALLOWED_ORIGINS`-or-refuse-to-start pattern — silent fallback
+//! to unauthenticated is the failure mode we're avoiding.
 //!
 //! ## Why not JWT or mTLS
 //!
