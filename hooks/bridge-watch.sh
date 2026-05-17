@@ -24,6 +24,26 @@ SELF="$(~/.claude/hooks/bridge-identity.sh 2>/dev/null || echo sv-s-bcloud)"
 # requiring a static env var in settings.json.
 ROLES_RAW="$(~/.claude/hooks/bridge-role.sh 2>/dev/null || echo)"
 
+# Single-instance lock per session. Claude Code re-invokes this hook
+# on every Stop attempt; old invocations from previous turns can
+# linger and stay subscribed to the SSE stream. When a new message
+# arrives, every leaked subscriber catches it and fires its own
+# Stop-blocking-error — the model sees the same message N times.
+# Killing the previous instance (PID in pidfile) before starting
+# ensures exactly one watcher per session.
+SID_KEY="${CLAUDE_CODE_SESSION_ID:-$(hostname -s)}"
+PIDFILE="${BRIDGE_WATCH_PIDFILE:-/tmp/bridge-watch-${SID_KEY//\//_}.pid}"
+if [[ -f "$PIDFILE" ]]; then
+  old_pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+  if [[ -n "$old_pid" && "$old_pid" != "$$" ]] && kill -0 "$old_pid" 2>/dev/null; then
+    # Kill the old watcher's process group so its child watch_one
+    # subprocesses (each with its own SSE curl) die too.
+    pkill -TERM -P "$old_pid" 2>/dev/null || true
+    kill -TERM "$old_pid" 2>/dev/null || true
+  fi
+fi
+echo "$$" > "$PIDFILE"
+
 IFS=',' read -ra CHANNELS <<< "$CHANNELS_RAW"
 TRIMMED=()
 for c in "${CHANNELS[@]}"; do
