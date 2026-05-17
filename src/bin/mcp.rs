@@ -16,12 +16,15 @@ struct Args {
     #[arg(long, default_value = "general")]
     channel: String,
 
-    /// Name shown to the other instance. When multiple Claude Code
-    /// sessions on the same host share `--name`, they're
-    /// indistinguishable to peers — recommend appending a short
-    /// per-session id (`paledo/9c4e1d`) so addressed messages can
-    /// reach exactly one instance.
-    #[arg(long, default_value = "instance")]
+    /// Name shown to the other instance. When left at the default
+    /// (`auto`), the MCP derives a per-session identity of the form
+    /// `<host>/<short-session-id>` so two Claude Code sessions on
+    /// the same host appear as distinct peers. The lookup uses the
+    /// same session file the SessionStart hook writes (PPID chain),
+    /// so it works without any extra config — install the hook and
+    /// don't pass `--name` and you're done. Pass an explicit value
+    /// to override (e.g. for one-shot CLI testing).
+    #[arg(long, default_value = "auto")]
     name: String,
 
     /// Roles this instance claims (e.g. `pentest`, `integration`,
@@ -245,6 +248,31 @@ fn spawn_heartbeat(args: Arc<Args>, client: reqwest::Client) -> tokio::task::Abo
     h.abort_handle()
 }
 
+/// Build the auto-derived `<host>/<short-session-id>` name used when
+/// `--name` is left at the default. Mirrors what bridge-identity.sh
+/// does for the shell-side hooks so MCP, watcher, and drain all
+/// agree on the same identity for the same Claude Code session.
+fn derive_name() -> String {
+    let host = std::process::Command::new("hostname")
+        .arg("-s")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "instance".into());
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let cache_dir =
+        std::env::var("BRIDGE_CACHE_DIR").unwrap_or_else(|_| format!("{home}/.cache/bridge"));
+    if let Some(sid) = resolve_session_id(&cache_dir) {
+        let short: String = sid.chars().filter(|c| c.is_ascii_hexdigit()).take(6).collect();
+        if !short.is_empty() {
+            return format!("{host}/{short}");
+        }
+    }
+    host
+}
+
 /// Roles resolution precedence (highest first):
 ///   1. `--role` flag explicitly set.
 ///   2. `$BRIDGE_ROLE` env var.
@@ -310,7 +338,14 @@ fn resolve_session_id(cache_dir: &str) -> Option<String> {
 
 #[tokio::main]
 async fn main() {
-    let args = Arc::new(Args::parse());
+    let mut parsed = Args::parse();
+    // Auto-derive name when the user didn't override. Falls back to
+    // hostname when SessionStart hasn't run yet — better than
+    // collisions on a shared default.
+    if parsed.name == "auto" || parsed.name == "instance" {
+        parsed.name = derive_name();
+    }
+    let args = Arc::new(parsed);
     let client = reqwest::Client::new();
 
     // Mark ourselves online before serving the first request — the
