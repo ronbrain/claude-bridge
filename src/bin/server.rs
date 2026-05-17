@@ -6,7 +6,10 @@ use axum::{
     routing::{delete, get, patch, post},
     Json, Router,
 };
-use claude_bridge::{now_secs, store::Store, Artifact, ChannelTopic, Finding, Message, Peer, SEVERITIES, STATUSES};
+use claude_bridge::{
+    now_secs, store::Store, Artifact, ChannelTopic, Finding, MemoryEntry, Message, Peer, Task,
+    SEVERITIES, STATUSES, TASK_STATUSES,
+};
 use dashmap::DashMap;
 use futures::Stream;
 use serde::Deserialize;
@@ -103,21 +106,35 @@ fn ensure_channel_capacity(state: &AppState, channel: &str) {
     }
 }
 
+/// In-memory peer presence record. Fields mirror `Peer` minus the
+/// derived `idle_secs` which `list_peers` computes at read time.
+#[derive(Clone, Default)]
+struct PeerState {
+    last_seen: u64,
+    channel: String,
+    roles: Vec<String>,
+    skills: Vec<String>,
+    status: String,
+}
+
 #[derive(Clone)]
 struct AppState {
     senders: Arc<DashMap<String, broadcast::Sender<Message>>>,
     history: Arc<DashMap<String, Vec<Message>>>,
     findings: Arc<DashMap<String, Vec<Finding>>>,
     artifacts: Arc<DashMap<String, (Artifact, Vec<u8>)>>,
-    /// `name -> (last_seen_secs, channel, roles)`. Updated by
-    /// heartbeat POST /presence/{name}; read by GET /peers.
-    /// Intentionally NOT persisted — presence is a runtime concept;
-    /// a peer presumed online after a server restart would be
-    /// misleading.
-    peers: Arc<DashMap<String, (u64, String, Vec<String>)>>,
+    /// `name -> PeerState`. Updated by heartbeat POST /presence/{name};
+    /// read by GET /peers. Intentionally NOT persisted — presence is
+    /// a runtime concept; a peer presumed online after a server
+    /// restart would be misleading.
+    peers: Arc<DashMap<String, PeerState>>,
     /// Declared channel purposes, keyed by channel name. Returned by
     /// `GET /channels` so peers can discover routing before posting.
     topics: Arc<DashMap<String, ChannelTopic>>,
+    /// Work queue, separate from findings. Channel-scoped.
+    tasks: Arc<DashMap<String, Vec<Task>>>,
+    /// Shared KV memory, keyed by (channel, key).
+    memory: Arc<DashMap<(String, String), MemoryEntry>>,
     /// Optional sqlite store. `Some` when `BRIDGE_DB_PATH` is set
     /// in env; `None` keeps the legacy in-memory-only behaviour.
     /// Every write path forwards to the store when present.
@@ -133,6 +150,8 @@ impl AppState {
             artifacts: Arc::new(DashMap::new()),
             peers: Arc::new(DashMap::new()),
             topics: Arc::new(DashMap::new()),
+            tasks: Arc::new(DashMap::new()),
+            memory: Arc::new(DashMap::new()),
             store,
         }
     }
@@ -198,6 +217,26 @@ impl AppState {
             }
             Err(e) => tracing::warn!(error = %e, "rehydrate topics failed"),
         }
+        match store.load_tasks() {
+            Ok(ts) => {
+                let count = ts.len();
+                for t in ts {
+                    self.tasks.entry(t.channel.clone()).or_default().push(t);
+                }
+                tracing::info!(count, "rehydrated tasks from sqlite");
+            }
+            Err(e) => tracing::warn!(error = %e, "rehydrate tasks failed"),
+        }
+        match store.load_memory() {
+            Ok(ms) => {
+                let count = ms.len();
+                for m in ms {
+                    self.memory.insert((m.channel.clone(), m.key.clone()), m);
+                }
+                tracing::info!(count, "rehydrated memory from sqlite");
+            }
+            Err(e) => tracing::warn!(error = %e, "rehydrate memory failed"),
+        }
     }
 }
 
@@ -211,6 +250,10 @@ struct SendReq {
     /// Clients filter on receive; the server just stores + relays.
     #[serde(default)]
     to: Vec<String>,
+    /// Optional thread the message belongs to (free-form id). Lets
+    /// the client group a finding + its discussion + fix updates.
+    #[serde(default)]
+    thread_id: String,
 }
 
 async fn send(
@@ -230,6 +273,8 @@ async fn send(
         content: req.content,
         timestamp: now_secs(),
         to: req.to,
+        thread_id: req.thread_id,
+        pinned: false,
     };
 
     let id = msg.id.clone();
@@ -260,14 +305,17 @@ async fn send(
     // background heartbeat that the MCP client does).
     // Implicit presence on send. We don't know the sender's roles
     // here — preserve whatever was last advertised via heartbeat.
-    let existing_roles = state
+    // Implicit presence — preserve any roles/skills/status the peer
+    // already advertised via heartbeat; just refresh last_seen and
+    // channel.
+    let mut prev = state
         .peers
         .get(&req.from)
-        .map(|kv| kv.value().2.clone())
+        .map(|kv| kv.value().clone())
         .unwrap_or_default();
-    state
-        .peers
-        .insert(req.from.clone(), (now_secs(), channel.clone(), existing_roles));
+    prev.last_seen = now_secs();
+    prev.channel = channel.clone();
+    state.peers.insert(req.from.clone(), prev);
 
     let _ = state.sender(&channel).send(msg);
 
@@ -479,6 +527,8 @@ async fn create_finding(
         created_at: now,
         updated_at: now,
         note: String::new(),
+        blocks: Vec::new(),
+        depends_on: Vec::new(),
     };
     {
         let mut f = state.findings.entry(channel.clone()).or_default();
@@ -494,14 +544,14 @@ async fn create_finding(
         }
         let _ = store.prune_findings(&channel, FINDING_LIMIT);
     }
-    let existing_roles = state
+    let mut prev = state
         .peers
         .get(&req.from)
-        .map(|kv| kv.value().2.clone())
+        .map(|kv| kv.value().clone())
         .unwrap_or_default();
-    state
-        .peers
-        .insert(req.from, (now_secs(), channel.clone(), existing_roles));
+    prev.last_seen = now_secs();
+    prev.channel = channel.clone();
+    state.peers.insert(req.from, prev);
     Ok(Json(finding))
 }
 
@@ -738,7 +788,19 @@ struct PresenceReq {
     /// last-write-wins per peer name.
     #[serde(default)]
     roles: Vec<String>,
+    /// Finer-grained skill list, e.g. ["svelte","csp","oauth"].
+    /// Used by `find_peer_by_skill` to route task assignments
+    /// without humans having to memorise who does what.
+    #[serde(default)]
+    skills: Vec<String>,
+    /// Short status line ("working on b358d8ea, ETA 30min").
+    /// Surfaced in `list_peers` so other peers can see at a glance
+    /// what each instance is busy with.
+    #[serde(default)]
+    status: String,
 }
+
+const MAX_STATUS_LEN: usize = 280;
 
 async fn heartbeat(
     Path(name): Path<String>,
@@ -747,15 +809,31 @@ async fn heartbeat(
 ) -> Result<StatusCode, (StatusCode, String)> {
     cap(&name, MAX_FROM_LEN, "name")?;
     cap(&req.channel, MAX_CHANNEL_LEN, "channel")?;
-    // Cheap defense: bound the role list so a buggy/hostile heartbeat
-    // can't blow memory through repeated huge declarations.
+    cap(&req.status, MAX_STATUS_LEN, "status")?;
+    // Cheap defense: bound the role + skill lists so a buggy/hostile
+    // heartbeat can't blow memory through repeated huge declarations.
     let roles: Vec<String> = req
         .roles
         .into_iter()
         .filter(|r| !r.is_empty() && r.len() <= 64)
         .take(16)
         .collect();
-    state.peers.insert(name, (now_secs(), req.channel, roles));
+    let skills: Vec<String> = req
+        .skills
+        .into_iter()
+        .filter(|s| !s.is_empty() && s.len() <= 64)
+        .take(32)
+        .collect();
+    state.peers.insert(
+        name,
+        PeerState {
+            last_seen: now_secs(),
+            channel: req.channel,
+            roles,
+            skills,
+            status: req.status,
+        },
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -768,7 +846,7 @@ async fn list_peers(State(state): State<AppState>) -> Json<Vec<Peer>> {
     let expired: Vec<String> = state
         .peers
         .iter()
-        .filter(|kv| now.saturating_sub(kv.value().0) > PEER_TTL_SECS)
+        .filter(|kv| now.saturating_sub(kv.value().last_seen) > PEER_TTL_SECS)
         .map(|kv| kv.key().clone())
         .collect();
     for k in expired {
@@ -778,18 +856,297 @@ async fn list_peers(State(state): State<AppState>) -> Json<Vec<Peer>> {
         .peers
         .iter()
         .map(|kv| {
-            let (last_seen, channel, roles) = kv.value().clone();
+            let ps = kv.value().clone();
             Peer {
                 name: kv.key().clone(),
-                last_seen,
-                idle_secs: now.saturating_sub(last_seen),
-                channel,
-                roles,
+                last_seen: ps.last_seen,
+                idle_secs: now.saturating_sub(ps.last_seen),
+                channel: ps.channel,
+                roles: ps.roles,
+                skills: ps.skills,
+                status: ps.status,
             }
         })
         .collect();
     peers.sort_by_key(|p| p.idle_secs);
     Json(peers)
+}
+
+// ── Pin / unpin a message ────────────────────────────────────────────
+
+async fn pin_message(
+    Path((channel, id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    set_pinned_state(&state, &channel, &id, true).await
+}
+
+async fn unpin_message(
+    Path((channel, id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    set_pinned_state(&state, &channel, &id, false).await
+}
+
+async fn set_pinned_state(
+    state: &AppState,
+    channel: &str,
+    id: &str,
+    pinned: bool,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let mut entry = match state.history.get_mut(channel) {
+        Some(e) => e,
+        None => return Err((StatusCode::NOT_FOUND, format!("no messages on channel '{channel}'"))),
+    };
+    let found = entry.iter_mut().find(|m| m.id == id);
+    let Some(m) = found else {
+        return Err((StatusCode::NOT_FOUND, format!("message id '{id}' not found on channel '{channel}'")));
+    };
+    m.pinned = pinned;
+    drop(entry);
+    if let Some(store) = &state.store {
+        let _ = store.set_message_pinned(id, pinned);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Tasks ────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CreateTaskReq {
+    from: String,
+    title: String,
+    #[serde(default)]
+    description: String,
+    /// Identity name or role. Empty = unassigned.
+    #[serde(default)]
+    owner: String,
+    #[serde(default)]
+    blocks: Vec<String>,
+    #[serde(default)]
+    depends_on: Vec<String>,
+}
+
+const MAX_TASK_DESC_LEN: usize = 16 * 1024;
+const TASK_LIMIT_PER_CHANNEL: usize = 500;
+
+async fn create_task(
+    Path(channel): Path<String>,
+    State(state): State<AppState>,
+    Json(req): Json<CreateTaskReq>,
+) -> Result<Json<Task>, (StatusCode, String)> {
+    cap(&channel, MAX_CHANNEL_LEN, "channel")?;
+    cap(&req.from, MAX_FROM_LEN, "from")?;
+    cap(&req.title, MAX_TITLE_LEN, "title")?;
+    cap(&req.description, MAX_TASK_DESC_LEN, "description")?;
+    if req.title.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "title required".into()));
+    }
+    ensure_channel_capacity(&state, &channel);
+    let now = now_secs();
+    let task = Task {
+        id: Uuid::new_v4().to_string(),
+        channel: channel.clone(),
+        from: req.from,
+        title: req.title,
+        description: req.description,
+        owner: req.owner,
+        status: "todo".into(),
+        created_at: now,
+        updated_at: now,
+        note: String::new(),
+        blocks: req.blocks,
+        depends_on: req.depends_on,
+    };
+    {
+        let mut t = state.tasks.entry(channel.clone()).or_default();
+        t.push(task.clone());
+        if t.len() > TASK_LIMIT_PER_CHANNEL {
+            let drain = t.len() - TASK_LIMIT_PER_CHANNEL;
+            t.drain(0..drain);
+        }
+    }
+    if let Some(store) = &state.store {
+        if let Err(e) = store.upsert_task(&task) {
+            tracing::warn!(error = %e, "persist task failed");
+        }
+    }
+    Ok(Json(task))
+}
+
+#[derive(Deserialize, Default)]
+struct ListTasksQuery {
+    status: Option<String>,
+    owner: Option<String>,
+}
+
+async fn list_tasks(
+    Path(channel): Path<String>,
+    Query(q): Query<ListTasksQuery>,
+    State(state): State<AppState>,
+) -> Json<Vec<Task>> {
+    let all = state
+        .tasks
+        .get(&channel)
+        .map(|t| t.value().clone())
+        .unwrap_or_default();
+    let filtered: Vec<Task> = all
+        .into_iter()
+        .filter(|t| q.status.as_deref().map_or(true, |s| t.status == s))
+        .filter(|t| q.owner.as_deref().map_or(true, |o| t.owner == o))
+        .collect();
+    Json(filtered)
+}
+
+#[derive(Deserialize)]
+struct UpdateTaskReq {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+async fn update_task(
+    Path((channel, id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(req): Json<UpdateTaskReq>,
+) -> Result<Json<Task>, (StatusCode, String)> {
+    if let Some(s) = &req.status {
+        if !TASK_STATUSES.contains(&s.as_str()) {
+            return Err((StatusCode::BAD_REQUEST, format!("status must be one of {TASK_STATUSES:?}")));
+        }
+    }
+    if let Some(n) = &req.note {
+        cap(n, MAX_NOTE_LEN, "note")?;
+    }
+    let mut entry = match state.tasks.get_mut(&channel) {
+        Some(e) => e,
+        None => return Err((StatusCode::NOT_FOUND, format!("no tasks on channel '{channel}'"))),
+    };
+    let found = entry.iter_mut().find(|t| t.id == id);
+    let Some(t) = found else {
+        return Err((StatusCode::NOT_FOUND, format!("task id '{id}' not found on channel '{channel}'")));
+    };
+    if let Some(s) = req.status {
+        t.status = s;
+    }
+    if let Some(o) = req.owner {
+        t.owner = o;
+    }
+    if let Some(n) = req.note {
+        t.note = n;
+    }
+    t.updated_at = now_secs();
+    let snap = t.clone();
+    drop(entry);
+    if let Some(store) = &state.store {
+        let _ = store.upsert_task(&snap);
+    }
+    Ok(Json(snap))
+}
+
+async fn delete_task(
+    Path((channel, id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let mut entry = match state.tasks.get_mut(&channel) {
+        Some(e) => e,
+        None => return Err((StatusCode::NOT_FOUND, format!("no tasks on channel '{channel}'"))),
+    };
+    let before = entry.len();
+    entry.retain(|t| t.id != id);
+    if entry.len() == before {
+        return Err((StatusCode::NOT_FOUND, format!("task id '{id}' not found on channel '{channel}'")));
+    }
+    drop(entry);
+    if let Some(store) = &state.store {
+        let _ = store.delete_task(&channel, &id);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Shared memory (KV) ───────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct MemorySetReq {
+    from: String,
+    value: String,
+    /// Optional TTL in seconds from now. 0 = no expiry.
+    #[serde(default)]
+    ttl_secs: u64,
+}
+
+const MAX_MEMORY_KEY_LEN: usize = 256;
+const MAX_MEMORY_VAL_LEN: usize = 256 * 1024;
+
+async fn memory_set(
+    Path((channel, key)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(req): Json<MemorySetReq>,
+) -> Result<Json<MemoryEntry>, (StatusCode, String)> {
+    cap(&channel, MAX_CHANNEL_LEN, "channel")?;
+    cap(&key, MAX_MEMORY_KEY_LEN, "key")?;
+    cap(&req.value, MAX_MEMORY_VAL_LEN, "value")?;
+    cap(&req.from, MAX_FROM_LEN, "from")?;
+    let now = now_secs();
+    let entry = MemoryEntry {
+        channel: channel.clone(),
+        key: key.clone(),
+        value: req.value,
+        updated_by: req.from,
+        updated_at: now,
+        expires_at: if req.ttl_secs == 0 { 0 } else { now + req.ttl_secs },
+    };
+    state.memory.insert((channel.clone(), key.clone()), entry.clone());
+    if let Some(store) = &state.store {
+        let _ = store.memory_set(&entry);
+    }
+    Ok(Json(entry))
+}
+
+async fn memory_get(
+    Path((channel, key)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<MemoryEntry>, StatusCode> {
+    let entry = state
+        .memory
+        .get(&(channel, key))
+        .map(|kv| kv.value().clone())
+        .ok_or(StatusCode::NOT_FOUND)?;
+    // Lazy expiry — entries past `expires_at` look gone to readers.
+    if entry.expires_at != 0 && entry.expires_at < now_secs() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(entry))
+}
+
+async fn memory_delete(
+    Path((channel, key)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> StatusCode {
+    state.memory.remove(&(channel.clone(), key.clone()));
+    if let Some(store) = &state.store {
+        let _ = store.memory_delete(&channel, &key);
+    }
+    StatusCode::NO_CONTENT
+}
+
+async fn memory_list(
+    Path(channel): Path<String>,
+    State(state): State<AppState>,
+) -> Json<Vec<MemoryEntry>> {
+    let now = now_secs();
+    let mut v: Vec<MemoryEntry> = state
+        .memory
+        .iter()
+        .filter(|kv| kv.key().0 == channel)
+        .map(|kv| kv.value().clone())
+        .filter(|e| e.expires_at == 0 || e.expires_at >= now)
+        .collect();
+    v.sort_by(|a, b| a.key.cmp(&b.key));
+    Json(v)
 }
 
 // ── Wiring ──────────────────────────────────────────────────────────
@@ -845,6 +1202,15 @@ async fn main() {
         .route("/artifacts/{channel}", post(upload_artifact))
         .route("/artifacts/{channel}/list", get(list_artifacts))
         .route("/artifact/{id}", get(download_artifact))
+        // Pin / unpin messages
+        .route("/messages/{channel}/{id}/pin", post(pin_message).delete(unpin_message))
+        // Tasks (work queue, distinct from findings)
+        .route("/tasks/{channel}", post(create_task).get(list_tasks))
+        .route("/tasks/{channel}/{id}", patch(update_task).delete(delete_task))
+        // Shared memory KV
+        .route("/memory/{channel}", get(memory_list))
+        .route("/memory/{channel}/{key}",
+               get(memory_get).put(memory_set).delete(memory_delete))
         // Presence
         .route("/presence/{name}", post(heartbeat))
         .route("/peers", get(list_peers))

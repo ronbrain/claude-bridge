@@ -19,6 +19,17 @@ pub struct Message {
     /// SSE stream doesn't need per-subscriber routing logic.
     #[serde(default)]
     pub to: Vec<String>,
+    /// Optional thread grouping. Messages sharing the same
+    /// `thread_id` form a conversation (a finding + its discussion +
+    /// fix updates, for example). When empty, the message stands
+    /// alone in the channel feed.
+    #[serde(default)]
+    pub thread_id: String,
+    /// Pinned messages stay at the top of `read_messages` listings
+    /// regardless of timestamp. Use for the "current state" doc, the
+    /// skills board, or a long-lived link to a critical artifact.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// Severity ladder for structured findings. String-typed in the JSON
@@ -29,6 +40,10 @@ pub const SEVERITIES: &[&str] = &["critical", "high", "medium", "low", "info"];
 /// `triaged` means a human looked at it and acknowledged; `fixed` /
 /// `wontfix` are terminal.
 pub const STATUSES: &[&str] = &["open", "triaged", "fixed", "wontfix"];
+
+/// Lifecycle states for a task in the work queue. Distinct from
+/// findings: tasks are "do X", findings are "there's a bug Y".
+pub const TASK_STATUSES: &[&str] = &["todo", "in_progress", "blocked", "done", "cancelled"];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Finding {
@@ -48,6 +63,13 @@ pub struct Finding {
     /// Latest triage note from `triage_finding`. Empty on creation.
     #[serde(default)]
     pub note: String,
+    /// IDs of other findings/tasks this one blocks (this finishes
+    /// before those can start).
+    #[serde(default)]
+    pub blocks: Vec<String>,
+    /// IDs of other findings/tasks this one depends on.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -92,6 +114,69 @@ pub struct Peer {
     /// declared any.
     #[serde(default)]
     pub roles: Vec<String>,
+    /// Finer-grained capabilities than `roles`. Where `roles` says
+    /// "what this peer is" (`pentest`, `fixer`), `skills` says "what
+    /// this peer can do" (`svelte`, `csp`, `sqlx`, `rust-axum`). A
+    /// task router (`find_peer_by_skill`) can pick the best match
+    /// when assigning work without anyone needing to memorise who's
+    /// good at what.
+    #[serde(default)]
+    pub skills: Vec<String>,
+    /// Short human-readable status line — what the peer is currently
+    /// doing, ETA, blocked-on note. Cleared when the peer goes
+    /// silent (TTL = peer TTL).
+    #[serde(default)]
+    pub status: String,
+}
+
+/// A unit of work tracked separately from findings. Findings describe
+/// problems discovered; tasks describe action items assigned to a
+/// peer. Tasks have explicit owner + status so ops can answer "what
+/// is X working on" and "what's blocked on whom" without paging the
+/// whole chat history.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Task {
+    pub id: String,
+    pub channel: String,
+    /// Peer that created the task (usually ops or whoever discovered
+    /// the need). Not necessarily the owner.
+    pub from: String,
+    pub title: String,
+    pub description: String,
+    /// Identity name or role of the assignee. When a role is given,
+    /// the client can resolve it to the live peer(s) at read-time.
+    /// Empty = unassigned (in the queue, waiting for pickup).
+    #[serde(default)]
+    pub owner: String,
+    /// One of TASK_STATUSES. Default `todo`.
+    pub status: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    /// Latest free-form note added by `update_task` (typically an
+    /// ETA, a blocker description, or a fix link).
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub blocks: Vec<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
+
+/// A single key in the shared memory KV store. Channel-scoped so two
+/// projects on the same bridge don't trample each other's keys.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MemoryEntry {
+    pub channel: String,
+    pub key: String,
+    pub value: String,
+    pub updated_by: String,
+    pub updated_at: u64,
+    /// Optional unix-seconds expiry. The server lazy-expires on read
+    /// rather than running a sweep thread — entries with `expires_at`
+    /// past `now` look gone to `memory_get` but may persist on disk
+    /// until the next overwrite.
+    #[serde(default)]
+    pub expires_at: u64,
 }
 
 pub fn now_secs() -> u64 {

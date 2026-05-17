@@ -23,7 +23,7 @@ use rusqlite::{params, Connection, Result as SqliteResult};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::{Artifact, ChannelTopic, Finding, Message};
+use crate::{Artifact, ChannelTopic, Finding, MemoryEntry, Message, Task};
 
 #[derive(Clone)]
 pub struct Store {
@@ -51,9 +51,21 @@ impl Store {
     pub fn insert_message(&self, m: &Message) -> SqliteResult<()> {
         let to_json = serde_json::to_string(&m.to).unwrap_or_else(|_| "[]".into());
         self.conn.lock().execute(
-            "INSERT OR REPLACE INTO messages (id, channel, from_, content, timestamp, to_)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![m.id, m.channel, m.from, m.content, m.timestamp as i64, to_json],
+            "INSERT OR REPLACE INTO messages
+             (id, channel, from_, content, timestamp, to_, thread_id, pinned)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                m.id, m.channel, m.from, m.content, m.timestamp as i64,
+                to_json, m.thread_id, m.pinned as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_message_pinned(&self, id: &str, pinned: bool) -> SqliteResult<()> {
+        self.conn.lock().execute(
+            "UPDATE messages SET pinned = ?1 WHERE id = ?2",
+            params![pinned as i64, id],
         )?;
         Ok(())
     }
@@ -83,12 +95,16 @@ impl Store {
         let conn = self.conn.lock();
         // Use a window function to keep only the latest N per channel —
         // honours HISTORY_LIMIT even if the DB has more rows from a
-        // previous run with a higher cap.
+        // previous run with a higher cap. Pinned rows are kept on top
+        // of the per-channel window so a pinned doc never falls off
+        // the cap.
         let mut stmt = conn.prepare(
             "SELECT id, channel, from_, content, timestamp,
-                    COALESCE(to_, '[]') AS to_ FROM (
+                    COALESCE(to_, '[]') AS to_,
+                    COALESCE(thread_id, '') AS thread_id,
+                    COALESCE(pinned, 0) AS pinned FROM (
                 SELECT *, ROW_NUMBER() OVER (
-                    PARTITION BY channel ORDER BY timestamp DESC
+                    PARTITION BY channel ORDER BY pinned DESC, timestamp DESC
                 ) AS rn FROM messages
             ) WHERE rn <= ?1 ORDER BY channel, timestamp",
         )?;
@@ -102,6 +118,8 @@ impl Store {
                 content: r.get(3)?,
                 timestamp: r.get::<_, i64>(4)? as u64,
                 to,
+                thread_id: r.get(6).unwrap_or_default(),
+                pinned: r.get::<_, i64>(7).unwrap_or(0) != 0,
             })
         })?;
         rows.collect()
@@ -124,11 +142,13 @@ impl Store {
     // ── Findings ────────────────────────────────────────────────────
 
     pub fn upsert_finding(&self, f: &Finding) -> SqliteResult<()> {
+        let blocks = serde_json::to_string(&f.blocks).unwrap_or_else(|_| "[]".into());
+        let deps = serde_json::to_string(&f.depends_on).unwrap_or_else(|_| "[]".into());
         self.conn.lock().execute(
             "INSERT OR REPLACE INTO findings
              (id, channel, from_, severity, title, detail, endpoint,
-              status, created_at, updated_at, note)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              status, created_at, updated_at, note, blocks_, depends_on_)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 f.id,
                 f.channel,
@@ -141,6 +161,8 @@ impl Store {
                 f.created_at as i64,
                 f.updated_at as i64,
                 f.note,
+                blocks,
+                deps,
             ],
         )?;
         Ok(())
@@ -169,7 +191,9 @@ impl Store {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, channel, from_, severity, title, detail, endpoint,
-                    status, created_at, updated_at, note
+                    status, created_at, updated_at, note,
+                    COALESCE(blocks_, '[]') AS blocks_,
+                    COALESCE(depends_on_, '[]') AS depends_on_
              FROM (
                 SELECT *, ROW_NUMBER() OVER (
                     PARTITION BY channel ORDER BY created_at DESC
@@ -177,6 +201,8 @@ impl Store {
              ) WHERE rn <= ?1 ORDER BY channel, created_at",
         )?;
         let rows = stmt.query_map(params![per_channel_cap as i64], |r| {
+            let blocks_json: String = r.get(11).unwrap_or_else(|_| "[]".into());
+            let deps_json: String = r.get(12).unwrap_or_else(|_| "[]".into());
             Ok(Finding {
                 id: r.get(0)?,
                 channel: r.get(1)?,
@@ -189,6 +215,8 @@ impl Store {
                 created_at: r.get::<_, i64>(8)? as u64,
                 updated_at: r.get::<_, i64>(9)? as u64,
                 note: r.get(10)?,
+                blocks: serde_json::from_str(&blocks_json).unwrap_or_default(),
+                depends_on: serde_json::from_str(&deps_json).unwrap_or_default(),
             })
         })?;
         rows.collect()
@@ -217,6 +245,105 @@ impl Store {
                 topic: r.get(1)?,
                 updated_by: r.get(2)?,
                 updated_at: r.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        rows.collect()
+    }
+
+    // ── Tasks ───────────────────────────────────────────────────────
+
+    pub fn upsert_task(&self, t: &Task) -> SqliteResult<()> {
+        let blocks = serde_json::to_string(&t.blocks).unwrap_or_else(|_| "[]".into());
+        let deps = serde_json::to_string(&t.depends_on).unwrap_or_else(|_| "[]".into());
+        self.conn.lock().execute(
+            "INSERT OR REPLACE INTO tasks
+             (id, channel, from_, title, description, owner, status,
+              created_at, updated_at, note, blocks_, depends_on_)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                t.id, t.channel, t.from, t.title, t.description,
+                t.owner, t.status,
+                t.created_at as i64, t.updated_at as i64, t.note,
+                blocks, deps,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_task(&self, channel: &str, id: &str) -> SqliteResult<()> {
+        self.conn.lock().execute(
+            "DELETE FROM tasks WHERE channel = ?1 AND id = ?2",
+            params![channel, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_tasks(&self) -> SqliteResult<Vec<Task>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, channel, from_, title, description, owner, status,
+                    created_at, updated_at, note,
+                    COALESCE(blocks_, '[]'), COALESCE(depends_on_, '[]')
+             FROM tasks ORDER BY channel, created_at",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let blocks_json: String = r.get(10).unwrap_or_else(|_| "[]".into());
+            let deps_json: String = r.get(11).unwrap_or_else(|_| "[]".into());
+            Ok(Task {
+                id: r.get(0)?,
+                channel: r.get(1)?,
+                from: r.get(2)?,
+                title: r.get(3)?,
+                description: r.get(4)?,
+                owner: r.get(5)?,
+                status: r.get(6)?,
+                created_at: r.get::<_, i64>(7)? as u64,
+                updated_at: r.get::<_, i64>(8)? as u64,
+                note: r.get(9)?,
+                blocks: serde_json::from_str(&blocks_json).unwrap_or_default(),
+                depends_on: serde_json::from_str(&deps_json).unwrap_or_default(),
+            })
+        })?;
+        rows.collect()
+    }
+
+    // ── Shared memory (KV) ──────────────────────────────────────────
+
+    pub fn memory_set(&self, m: &MemoryEntry) -> SqliteResult<()> {
+        self.conn.lock().execute(
+            "INSERT OR REPLACE INTO memory
+             (channel, key_, value_, updated_by, updated_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                m.channel, m.key, m.value, m.updated_by,
+                m.updated_at as i64, m.expires_at as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn memory_delete(&self, channel: &str, key: &str) -> SqliteResult<()> {
+        self.conn.lock().execute(
+            "DELETE FROM memory WHERE channel = ?1 AND key_ = ?2",
+            params![channel, key],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_memory(&self) -> SqliteResult<Vec<MemoryEntry>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT channel, key_, value_, updated_by, updated_at, expires_at
+             FROM memory ORDER BY channel, key_",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(MemoryEntry {
+                channel: r.get(0)?,
+                key: r.get(1)?,
+                value: r.get(2)?,
+                updated_by: r.get(3)?,
+                updated_at: r.get::<_, i64>(4)? as u64,
+                expires_at: r.get::<_, i64>(5)? as u64,
             })
         })?;
         rows.collect()
@@ -285,6 +412,10 @@ fn init(conn: &Connection) -> SqliteResult<()> {
     // version, since adding nullable/defaulted columns is the only
     // migration we've needed so far.
     let _ = conn.execute("ALTER TABLE messages ADD COLUMN to_ TEXT NOT NULL DEFAULT '[]'", []);
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN thread_id TEXT NOT NULL DEFAULT ''", []);
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0", []);
+    let _ = conn.execute("ALTER TABLE findings ADD COLUMN blocks_ TEXT NOT NULL DEFAULT '[]'", []);
+    let _ = conn.execute("ALTER TABLE findings ADD COLUMN depends_on_ TEXT NOT NULL DEFAULT '[]'", []);
 
     // `from_` not `from` because `FROM` is a SQL keyword and quoting
     // it across drivers is annoying.
@@ -338,6 +469,36 @@ fn init(conn: &Connection) -> SqliteResult<()> {
             topic      TEXT NOT NULL DEFAULT '',
             updated_by TEXT NOT NULL DEFAULT '',
             updated_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS tasks (
+            id           TEXT PRIMARY KEY,
+            channel      TEXT NOT NULL,
+            from_        TEXT NOT NULL,
+            title        TEXT NOT NULL,
+            description  TEXT NOT NULL DEFAULT '',
+            owner        TEXT NOT NULL DEFAULT '',
+            status       TEXT NOT NULL DEFAULT 'todo',
+            created_at   INTEGER NOT NULL,
+            updated_at   INTEGER NOT NULL,
+            note         TEXT NOT NULL DEFAULT '',
+            blocks_      TEXT NOT NULL DEFAULT '[]',
+            depends_on_  TEXT NOT NULL DEFAULT '[]'
+        );
+        CREATE INDEX IF NOT EXISTS tasks_channel_owner
+            ON tasks (channel, owner, status);
+
+        -- Shared memory: channel-scoped KV store. Composite primary
+        -- key (channel, key) so two channels can use the same key
+        -- name independently. `expires_at = 0` means no expiry.
+        CREATE TABLE IF NOT EXISTS memory (
+            channel    TEXT NOT NULL,
+            key_       TEXT NOT NULL,
+            value_     TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (channel, key_)
         );
         "#,
     )
