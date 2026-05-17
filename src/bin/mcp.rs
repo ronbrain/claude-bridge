@@ -1826,7 +1826,7 @@ async fn resolve_recipients(
     };
     let mut out: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut push = |s: String, out: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
+    let push = |s: String, out: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
         if seen.insert(s.clone()) {
             out.push(s);
         }

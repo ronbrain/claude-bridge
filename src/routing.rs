@@ -308,6 +308,93 @@ fn markdown_escape(s: &str) -> String {
     out
 }
 
+/// Extract `{{name}}` ident tokens from a template string. Used
+/// at insert/update time to check action_params templates against
+/// the trigger_type's whitelist (0f4543 Phase 1 bonus). Mirrors
+/// `render_template`'s parser exactly — same `\w` ident rule,
+/// same bounded scan, same conservative literal-on-malformed
+/// fallback — so what passes here is exactly what would render.
+pub fn extract_template_placeholders(template: &str) -> Vec<String> {
+    let bytes = template.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'{' {
+            let scan_end = (i + 2 + 64).min(bytes.len());
+            let mut j = i + 2;
+            let mut ok = true;
+            while j + 1 < scan_end && !(bytes[j] == b'}' && bytes[j + 1] == b'}') {
+                if !(bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    ok = false;
+                    break;
+                }
+                j += 1;
+            }
+            if ok && j + 1 < scan_end && bytes[j] == b'}' && bytes[j + 1] == b'}' && j > i + 2 {
+                let name = std::str::from_utf8(&bytes[i + 2..j])
+                    .expect("ascii ident")
+                    .to_string();
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+                i = j + 2;
+                continue;
+            }
+        }
+        let ch = template[i..].chars().next().unwrap();
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Validate that every placeholder used in an `auto_message` /
+/// `auto_batch` action's `template` is in the whitelist for the
+/// rule's trigger_type. Per 0f4543 Phase 1 bonus: catches the
+/// "rule references `{{ops_secret}}` against a trigger that
+/// doesn't carry it" path at insert time, instead of warn-spam at
+/// every eval. Other action types (auto_assign, auto_escalate)
+/// don't accept templates so they're no-op.
+pub fn validate_template_placeholders(
+    trigger_type: &str,
+    action_type: &str,
+    action_params: &serde_json::Value,
+) -> Result<(), FilterError> {
+    let template = match action_type {
+        "auto_message" | "auto_batch" => action_params.get("template").and_then(|v| v.as_str()),
+        _ => None,
+    };
+    let Some(template) = template else { return Ok(()) };
+    let allowed = placeholders_for(trigger_type);
+    // Batch metadata placeholders (count, batch_key, rule_name) are
+    // legal on auto_batch templates only (they're rendered by the
+    // flush path, not the per-trigger emit path).
+    let batch_extras: &[&str] = if action_type == "auto_batch" {
+        &["count", "batch_key", "rule_name"]
+    } else {
+        &[]
+    };
+    let used = extract_template_placeholders(template);
+    for name in &used {
+        let in_whitelist = allowed.iter().any(|w| *w == name.as_str());
+        let in_batch_extras = batch_extras.iter().any(|w| *w == name.as_str());
+        if !in_whitelist && !in_batch_extras {
+            return Err(FilterError::UnknownOperator {
+                field: format!("template placeholder `{{{{{name}}}}}`"),
+                op: format!(
+                    "not in whitelist for trigger_type `{trigger_type}` — \
+                     allowed: {allowed:?}{}",
+                    if batch_extras.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" + batch extras {batch_extras:?}")
+                    }
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Whitelisted context fields per trigger_type (locked at ops
 /// 1779048867). Returning a `&'static [&str]` lets us validate
 /// rule action_params against the trigger-context vocabulary at
@@ -655,6 +742,41 @@ mod tests {
         // After the window rolls, the count resets.
         let later = now + QUARANTINE_TRIP_WINDOW.as_secs() + 200;
         assert!(!b.record_trip("r1", later));
+    }
+
+    // === placeholder extraction + whitelist validation ===
+
+    #[test]
+    fn extract_template_placeholders_dedups_and_skips_malformed() {
+        let names = extract_template_placeholders(
+            "ping {{peer}} ({{count}} open, batch {{count}}) {{a-b}} {{ }}",
+        );
+        // `{{count}}` appears twice but dedup keeps one.
+        // `{{a-b}}` has a non-ident char → skipped.
+        // `{{ }}` has whitespace → skipped.
+        assert_eq!(names, vec!["peer".to_string(), "count".to_string()]);
+    }
+
+    #[test]
+    fn validate_template_placeholders_rejects_off_whitelist_for_auto_message() {
+        // `finding_created` whitelist = finding_id, severity, title,
+        // endpoint, from, channel.
+        let good = json!({"template": "[{{severity}}] {{title}} in {{channel}}"});
+        validate_template_placeholders("finding_created", "auto_message", &good)
+            .expect("whitelist hit");
+        let bad = json!({"template": "secret = {{ops_secret}}"});
+        let err = validate_template_placeholders("finding_created", "auto_message", &bad).unwrap_err();
+        assert!(matches!(err, FilterError::UnknownOperator { .. }));
+        let msg = format!("{err}");
+        assert!(msg.contains("ops_secret"));
+        // auto_batch allows the extras count/batch_key/rule_name.
+        let batch_ok =
+            json!({"template": "[batch] {{count}} items for {{batch_key}} via {{rule_name}}"});
+        validate_template_placeholders("finding_created", "auto_batch", &batch_ok)
+            .expect("batch extras allowed");
+        // Non-template action types are no-op.
+        let no_template = json!({"assignee_role": "pentest"});
+        validate_template_placeholders("finding_created", "auto_assign", &no_template).unwrap();
     }
 
     // === max-depth env parser ===

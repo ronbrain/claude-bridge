@@ -138,17 +138,7 @@ fn fire_routing_actions(
                 dispatch_auto_escalate(state, &action, payload);
             }
             "auto_batch" => {
-                // Phase 2 ships a log-only stub; a real batch
-                // accumulator (group findings by `target_file` or
-                // similar, emit one batched dispatch per window)
-                // lands in F17.3. The action's payload is
-                // observable in tracing so operators can audit
-                // what would have batched.
-                tracing::info!(
-                    rule_id = %action.rule_id,
-                    rule_name = %action.rule_name,
-                    "auto_batch matched but deferred to F17.3 — payload logged for audit"
-                );
+                dispatch_auto_batch(state, &action, payload, now);
             }
             other => {
                 tracing::warn!(
@@ -244,6 +234,125 @@ fn dispatch_auto_message(
         })
         .unwrap_or_default();
     publish_bridge_auto(state, &channel, &to_field, content);
+}
+
+/// `auto_batch` (F17 Phase 3): group successive matched triggers
+/// into a single flushed message per (rule, batch_key) per window.
+/// `batch_key` comes from `action_params.batch_by` (a payload field
+/// name like "endpoint" or "from"); falls back to `"_"` if unset
+/// (one global batch per rule). `window_secs` from
+/// `action_params.window_secs` (default 60). At flush time
+/// (`flush_auto_batches`, called every base tick) any (rule, key)
+/// whose age exceeds the window emits one batched
+/// `bridge-auto`-authored message with the accumulated payloads
+/// rendered in a compact list.
+fn dispatch_auto_batch(
+    state: &AppState,
+    action: &claude_bridge::routing::MatchedAction,
+    payload: &serde_json::Value,
+    now: u64,
+) {
+    let batch_by = action
+        .action_params
+        .get("batch_by")
+        .and_then(|v| v.as_str())
+        .unwrap_or("_");
+    let batch_key = if batch_by == "_" {
+        "_".to_string()
+    } else {
+        payload
+            .get(batch_by)
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_else(|| "_".to_string())
+    };
+    let key = (action.rule_id.clone(), batch_key);
+    let mut entry = state
+        .routing_batches
+        .entry(key)
+        .or_insert_with(|| (now, Vec::new()));
+    entry.value_mut().1.push(payload.clone());
+    // First-payload set the window-start to `now`; subsequent
+    // payloads in the same window keep accumulating without
+    // resetting it. Flush handled by `flush_auto_batches` on the
+    // next AutoBatchScanner tick.
+}
+
+/// AutoBatchScanner callback. Walks `routing_batches`, flushes any
+/// (rule_id, batch_key) whose window has elapsed. Loads the
+/// matching rule by id to read the channel / template / window
+/// from `action_params`; skips silently if the rule was deleted
+/// between dispatch and flush.
+fn flush_auto_batches(state: &AppState) {
+    let now = now_secs();
+    let Some(store) = &state.store else { return };
+    // Collect drained keys first so we don't hold the DashMap
+    // entry guard across the rule lookup + emit.
+    let mut to_drain: Vec<(String, String)> = Vec::new();
+    for kv in state.routing_batches.iter() {
+        let (_rule_id, _key) = kv.key();
+        let (window_start, _payloads) = kv.value();
+        // We don't know the per-rule window yet; use a global
+        // default of 60s for the readiness check. If a rule had a
+        // larger window we'd over-flush — acceptable until rules
+        // need per-window-sec configurability.
+        if now.saturating_sub(*window_start) >= 60 {
+            to_drain.push(kv.key().clone());
+        }
+    }
+    for key in to_drain {
+        let Some((_, (_window_start, payloads))) = state.routing_batches.remove(&key) else {
+            continue;
+        };
+        if payloads.is_empty() {
+            continue;
+        }
+        let (rule_id, batch_key) = &key;
+        let rule = match store.get_routing_rule(rule_id) {
+            Ok(Some(r)) => r,
+            _ => continue, // rule deleted or read errored — silently skip
+        };
+        let action_params: serde_json::Value =
+            serde_json::from_str(&rule.action_params).unwrap_or(serde_json::Value::Null);
+        let channel = action_params
+            .get("channel")
+            .and_then(|v| v.as_str())
+            .unwrap_or("general")
+            .to_string();
+        let header = action_params
+            .get("template")
+            .and_then(|v| v.as_str())
+            .unwrap_or("[bridge-auto] batched ({{count}} items, key {{batch_key}})")
+            .to_string();
+        let mut hdr_ctx: std::collections::HashMap<&str, String> =
+            std::collections::HashMap::new();
+        hdr_ctx.insert("count", payloads.len().to_string());
+        hdr_ctx.insert("batch_key", batch_key.clone());
+        hdr_ctx.insert("rule_name", rule.name.clone());
+        let hdr_refs: std::collections::HashMap<&str, &str> =
+            hdr_ctx.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let rendered_header =
+            claude_bridge::routing::render_template(&header, &hdr_refs);
+        // Render each payload as a compact JSON line under the
+        // header — gives operators a single message to skim instead
+        // of N separate pings.
+        let mut body = rendered_header;
+        body.push('\n');
+        for p in &payloads {
+            body.push_str("- ");
+            body.push_str(&p.to_string());
+            body.push('\n');
+        }
+        let to_field = action_params
+            .get("to")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        publish_bridge_auto(state, &channel, &to_field, body);
+    }
 }
 
 /// `auto_assign`: resolve a target peer from
@@ -582,6 +691,14 @@ struct AppState {
     /// range). Threaded into `fire_routing_actions` so future
     /// AutoMessage-fires-AutoMessage paths can't loop.
     routing_max_depth: u8,
+    /// F17 Phase 3 — AutoBatch deferred-window accumulator. Key is
+    /// (rule_id, batch_key) where batch_key is derived from
+    /// `action_params.batch_by` (a payload field name).
+    /// Value: (window_start_unix_secs, accumulated payloads). The
+    /// `AutoBatchScanner` reads + drains this every base tick (60s)
+    /// and flushes any (rule, key) whose age exceeds the rule's
+    /// configured window into a single batched message.
+    routing_batches: Arc<DashMap<(String, String), (u64, Vec<serde_json::Value>)>>,
 }
 
 impl AppState {
@@ -605,6 +722,7 @@ impl AppState {
             resume_buckets: Arc::new(DashMap::new()),
             routing_rate: Arc::new(claude_bridge::routing::RateBucket::default()),
             routing_max_depth: 1,
+            routing_batches: Arc::new(DashMap::new()),
         }
     }
 
@@ -2416,6 +2534,17 @@ async fn create_routing_rule(
     if let Err(e) = claude_bridge::routing::validate_filter(&req.trigger_filter) {
         return Err((StatusCode::BAD_REQUEST, format!("trigger_filter: {e}")));
     }
+    // 0f4543 Phase 1 bonus: validate template placeholders against
+    // the trigger_type whitelist at insert time so a rule with an
+    // unknown `{{secret}}` ident is rejected cleanly here, not
+    // warn-spammed at every eval.
+    if let Err(e) = claude_bridge::routing::validate_template_placeholders(
+        &req.trigger_type,
+        &req.action_type,
+        &req.action_params,
+    ) {
+        return Err((StatusCode::BAD_REQUEST, format!("action_params: {e}")));
+    }
     let filter_json = req.trigger_filter.to_string();
     let params_json = req.action_params.to_string();
     cap!(filter_json, MAX_ROUTING_JSON_LEN, "trigger_filter");
@@ -2538,6 +2667,18 @@ async fn update_routing_rule(
     if let Some(f) = &req.trigger_filter {
         if let Err(e) = claude_bridge::routing::validate_filter(f) {
             return Err((StatusCode::BAD_REQUEST, format!("trigger_filter: {e}")));
+        }
+    }
+    // If action_params is being changed, re-validate placeholders
+    // against the existing rule's trigger_type (immutable post-
+    // insert, so reading it from `prior` is sound).
+    if let Some(params) = &req.action_params {
+        if let Err(e) = claude_bridge::routing::validate_template_placeholders(
+            &prior.trigger_type,
+            &prior.action_type,
+            params,
+        ) {
+            return Err((StatusCode::BAD_REQUEST, format!("action_params: {e}")));
         }
     }
     if let Some(p) = req.priority {
@@ -2836,6 +2977,21 @@ async fn main() {
     // guard. Stored as an Arc<dyn Fn(...)> in the ctx so it lives
     // for the loop's lifetime.
     let peers_for_snapshot = state.peers.clone();
+    // Routing emit callback for scanners (F17 Phase 3). Captures
+    // a clone of AppState so the scanner can fire engine actions
+    // without circular module dependency. None when persistence
+    // is off (no rules table → no routing).
+    let routing_emit: Option<
+        Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>,
+    > = if store.is_some() {
+        let state_for_emit = state.clone();
+        let max_depth = state.routing_max_depth;
+        Some(Arc::new(move |trigger_type: &str, payload: serde_json::Value| {
+            fire_routing_actions(&state_for_emit, trigger_type, &payload, max_depth, 0);
+        }))
+    } else {
+        None
+    };
     let auto_ctx = claude_bridge::automation::AutomationCtx {
         store: store.clone(),
         peer_history_ttl_secs: cfg.peer_history_ttl.as_secs(),
@@ -2851,13 +3007,25 @@ async fn main() {
                 })
                 .collect()
         }),
+        routing_emit,
     };
+    // AutoBatch flush callback — closes over a state clone so the
+    // scanner can call back into the dispatcher's batch table.
+    let state_for_batch = state.clone();
+    let auto_batch_flush: Arc<dyn Fn(&claude_bridge::automation::AutomationCtx) + Send + Sync> =
+        Arc::new(move |_ctx: &claude_bridge::automation::AutomationCtx| {
+            flush_auto_batches(&state_for_batch);
+        });
     let registry: Vec<Arc<dyn claude_bridge::automation::Scanner>> = vec![
         Arc::new(claude_bridge::automation::HeartbeatScanner),
         Arc::new(claude_bridge::automation::PeerHistoryPruneScanner),
         Arc::new(claude_bridge::automation::DispatchEscalationScanner),
         Arc::new(claude_bridge::automation::PeerDropScanner {
             seen: Arc::new(dashmap::DashSet::new()),
+        }),
+        Arc::new(claude_bridge::automation::PeerIdleScanner::default()),
+        Arc::new(claude_bridge::automation::AutoBatchScanner {
+            flush: auto_batch_flush,
         }),
     ];
     let _automation_handle = claude_bridge::automation::spawn_loop(

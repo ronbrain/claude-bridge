@@ -64,6 +64,14 @@ pub struct AutomationCtx {
     /// the right thread.
     pub peers_snapshot:
         Arc<dyn Fn() -> Vec<(String, u64, String)> + Send + Sync>,
+    /// Routing-engine emit callback (F17 Phase 3). Scanners fire
+    /// triggers through this — argument shape mirrors
+    /// `server::fire_routing_actions`: trigger_type + serde payload.
+    /// `None` when persistence is disabled (no rules table → no
+    /// routing) so the scanners are a no-op without an extra Option
+    /// check at every emit site.
+    pub routing_emit:
+        Option<Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>>,
 }
 
 /// One unit of background work. Implementations should be cheap on
@@ -209,7 +217,109 @@ impl Scanner for DispatchEscalationScanner {
                     ctx.dispatch_sla_secs / 60
                 ),
             );
+            // F17 Phase 3 — also emit `dispatch_stale` through the
+            // routing engine so operator-authored rules (e.g.
+            // auto_escalate to a specific role, auto_message with a
+            // templated body) can fire on the same event the SLA
+            // auto-ping above covers. Payload mirrors the
+            // `placeholders_for("dispatch_stale")` whitelist.
+            if let Some(emit) = &ctx.routing_emit {
+                let payload = serde_json::json!({
+                    "message_id": d.message_id,
+                    "from":       d.from,
+                    "to":         d.to,
+                    "channel":    d.channel,
+                    "age_secs":   age,
+                });
+                emit("dispatch_stale", payload);
+            }
         }
+    }
+}
+
+/// PeerIdleScanner (F17 Phase 3) — emits `peer_idle` triggers
+/// through the routing engine when a peer's last_seen lag crosses
+/// the configured threshold. Distinct from `PeerDropScanner` which
+/// fires a synthetic chat message at >120s; this scanner fires the
+/// routing engine path so operator rules can decide what to do
+/// (auto_escalate vs auto_message vs auto_assign a wake-task to
+/// somebody else).
+///
+/// Default threshold is 5 min (300s). Dedup via per-scanner
+/// `seen` set so a single idle episode only fires once; cleared
+/// when the peer reconnects (last_seen refreshes).
+pub struct PeerIdleScanner {
+    pub seen: Arc<DashSet<String>>,
+    pub threshold_secs: u64,
+}
+
+impl Default for PeerIdleScanner {
+    fn default() -> Self {
+        Self {
+            seen: Arc::new(DashSet::new()),
+            threshold_secs: 5 * 60,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Scanner for PeerIdleScanner {
+    fn name(&self) -> &'static str {
+        "peer_idle"
+    }
+    fn every(&self) -> u64 {
+        1
+    }
+    async fn tick(&self, ctx: &AutomationCtx) {
+        let Some(emit) = &ctx.routing_emit else { return };
+        let now = crate::now_secs();
+        let peers = (ctx.peers_snapshot)();
+        for (name, last_seen, channel) in &peers {
+            let lag = now.saturating_sub(*last_seen);
+            if lag < self.threshold_secs {
+                // Recovered: clear the dedup so a re-idle re-fires.
+                self.seen.remove(name);
+                continue;
+            }
+            if !self.seen.insert(name.clone()) {
+                continue;
+            }
+            let payload = serde_json::json!({
+                "peer":      name,
+                "idle_secs": lag,
+                "channel":   channel,
+            });
+            emit("peer_idle", payload);
+        }
+    }
+}
+
+/// AutoBatchScanner (F17 Phase 3) — flushes the deferred-window
+/// accumulator owned by the dispatcher. The accumulator collects
+/// triggered payloads keyed by (rule_id, batch_key) where
+/// `batch_key` is derived from `action_params.batch_by` (a field
+/// name in the payload). At each flush tick, accumulator entries
+/// older than `window_secs` get rendered into a single batched
+/// message and emitted via `publish_system` to the rule's channel.
+///
+/// Implementation: the scanner doesn't own the accumulator — it
+/// reads + drains via a callback that the dispatcher provides. This
+/// keeps the accumulator's identity-per-server-state (DashMap in
+/// `AppState`) and avoids splitting the state across modules.
+pub struct AutoBatchScanner {
+    pub flush: Arc<dyn Fn(&AutomationCtx) + Send + Sync>,
+}
+
+#[async_trait::async_trait]
+impl Scanner for AutoBatchScanner {
+    fn name(&self) -> &'static str {
+        "auto_batch_flush"
+    }
+    fn every(&self) -> u64 {
+        1 // every base tick (60s) — batch window resolution = 60s
+    }
+    async fn tick(&self, ctx: &AutomationCtx) {
+        (self.flush)(ctx);
     }
 }
 
