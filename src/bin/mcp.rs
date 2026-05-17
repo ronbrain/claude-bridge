@@ -726,6 +726,30 @@ async fn main() {
     if let Ok(v) = reqwest::header::HeaderValue::from_str(&from_header) {
         headers.insert("x-bridge-from", v);
     }
+    // Per finding `dc633d7c` bundle: server now requires
+    // `Authorization: Bearer <token>` on every mutation/SSE route
+    // when its registry is non-empty. We inject the bearer once at
+    // client-build so all subsequent `client.get/post(...)` calls
+    // carry it. Mark the header value as sensitive so reqwest's
+    // request-log redaction kicks in. Missing/empty token → no
+    // header injected — bridge runs in permissive mode locally OK.
+    if let Ok(token) = std::env::var("BRIDGE_AUTH_TOKEN") {
+        let trimmed = token.trim();
+        if !trimmed.is_empty() {
+            match reqwest::header::HeaderValue::from_str(&format!("Bearer {trimmed}")) {
+                Ok(mut hv) => {
+                    hv.set_sensitive(true);
+                    headers.insert(reqwest::header::AUTHORIZATION, hv);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[bridge-mcp] BRIDGE_AUTH_TOKEN unencodable as header value: {e}. \
+                         Skipping bearer injection — server will 401 if it enforces."
+                    );
+                }
+            }
+        }
+    }
     let client = reqwest::Client::builder()
         .default_headers(headers)
         .build()

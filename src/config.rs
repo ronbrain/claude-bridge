@@ -45,7 +45,13 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            bind: "0.0.0.0:3001".into(),
+            // Default to loopback per pentest finding `dc633d7c`
+            // (msg 1779042729). Operators wanting network exposure
+            // must set `BRIDGE_BIND=0.0.0.0:<port>` explicitly,
+            // which triggers a SEVERE warn at boot reminding them
+            // to pair it with `BRIDGE_AUTH_TOKENS`. Closes the
+            // "anyone reachable can hit /memory_set" surface.
+            bind: "127.0.0.1:3001".into(),
             db_path: None,
             allowed_origins: Vec::new(),
             history_limit: 100,
@@ -81,8 +87,32 @@ impl Config {
     /// trivial env-name corrections.
     pub fn from_env() -> Self {
         let default = Self::default();
-        let port = std::env::var("PORT").unwrap_or_else(|_| "3001".into());
-        let bind = format!("0.0.0.0:{port}");
+        // Bind resolution order:
+        //   1. `BRIDGE_BIND` (full host:port) wins — explicit
+        //      opt-in to whatever exposure the operator wants.
+        //   2. `PORT` composes with the safe loopback default.
+        //   3. Plain `Default::default()` (127.0.0.1:3001).
+        // A `BRIDGE_BIND` that starts with `0.` or `0:` warns at
+        // boot — this is the single most common foot-gun and worth
+        // the explicit pointer back to the auth findings.
+        let bind = match std::env::var("BRIDGE_BIND").ok().filter(|s| !s.is_empty()) {
+            Some(b) => {
+                if b.starts_with("0.0.0.0") || b.starts_with("0:") || b.starts_with("[::]") {
+                    tracing::warn!(
+                        bind = %b,
+                        "SEVERE: BRIDGE_BIND exposes the bridge to all interfaces — \
+                         ensure BRIDGE_AUTH_TOKENS is set (see finding dc633d7c). \
+                         Without an auth token map, every host that can reach this \
+                         port can hit every mutation endpoint."
+                    );
+                }
+                b
+            }
+            None => {
+                let port = std::env::var("PORT").unwrap_or_else(|_| "3001".into());
+                format!("127.0.0.1:{port}")
+            }
+        };
         let db_path = std::env::var("BRIDGE_DB_PATH")
             .ok()
             .filter(|s| !s.is_empty());
@@ -128,5 +158,9 @@ mod tests {
         assert!(c.db_path.is_none());
         // 30 days per ops dispatch — guard against accidental edits.
         assert_eq!(c.peer_history_ttl, Duration::from_secs(2_592_000));
+        // Per finding `dc633d7c`: default MUST be loopback, not
+        // 0.0.0.0. If this assert fails, someone is regressing the
+        // critical-finding fix. Re-read the finding before changing.
+        assert_eq!(c.bind, "127.0.0.1:3001");
     }
 }

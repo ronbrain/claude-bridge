@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod auth;
 pub mod automation;
 pub mod config;
 pub mod error;

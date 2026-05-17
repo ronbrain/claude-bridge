@@ -51,3 +51,13 @@ sha2 = "0.10"
 # trait fn async in a `dyn Scanner` requires async_trait until the
 # stable RPITIT path lands for dyn-compatible traits.
 async-trait = "0.1"
+# Constant-time bytes comparison for the auth-token registry. We
+# never compare hashes with `==` because a timing oracle would let
+# an attacker recover the live token byte-by-byte (per finding
+# `dc633d7c` family, same constant-time hygiene that fixed
+# `28a77268` on the pale backend).
+subtle = "2"
+# axum middleware uses tower service combinators; pulled in
+# explicitly so the middleware module's `from_fn` style is
+# stable across axum minor versions.
+tower = { version = "0.5", features = ["util"] }

@@ -55,6 +55,33 @@ const MAX_TOPIC_LEN: usize = 512;
 /// `findings`/`artifacts` — all keyed by channel.
 const MAX_CHANNELS: usize = 256;
 
+/// Resolve the request's effective actor for audit-log + rate-
+/// limit + ownership purposes. Order:
+///   1. authenticated identity from the middleware (post-Step 2);
+///   2. legacy `X-Bridge-From` header (permissive-mode bridges
+///      that haven't onboarded tokens yet);
+///   3. literal `"anonymous"`.
+/// Per finding `cc3c33d6`: option 2 is spoofable on its own — it
+/// stays only as a back-compat path while the registry is empty.
+/// Once the registry has any entries, the middleware refuses
+/// unauthenticated callers before this helper runs.
+fn effective_actor(
+    headers: &axum::http::HeaderMap,
+    ext: Option<&claude_bridge::auth::AuthIdentity>,
+) -> String {
+    if let Some(id) = ext {
+        if id.is_authenticated() {
+            return id.as_actor().to_string();
+        }
+    }
+    headers
+        .get("x-bridge-from")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "anonymous".into())
+}
+
 /// Append one audit-log row for a write op. Best-effort: a sqlite
 /// failure here MUST NOT propagate as a 5xx — the audit log is
 /// observability, not the source of truth. We log the failure via
@@ -759,6 +786,7 @@ struct TriageReq {
 async fn triage_finding(
     Path((channel, id)): Path<(String, String)>,
     headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
     State(state): State<AppState>,
     Json(req): Json<TriageReq>,
 ) -> Result<Json<Finding>, (StatusCode, String)> {
@@ -797,16 +825,13 @@ async fn triage_finding(
         if let Err(e) = store.upsert_finding(&snapshot) {
             tracing::warn!(error = %e, "persist triage failed");
         }
-        // Actor falls back to X-Bridge-From header (no `from:` body
-        // field on this endpoint). Same gap noted in
-        // decision-audit-hash-128bit reopen conditions.
-        let actor = headers
-            .get("x-bridge-from")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("unknown");
+        // Actor resolves via authed identity (post-finding
+        // `cc3c33d6` bundle) or falls back to header in permissive
+        // mode.
+        let actor = effective_actor(&headers, ext.as_deref());
         write_audit(
             store,
-            actor,
+            &actor,
             "triage",
             "finding",
             &snapshot.id,
@@ -823,6 +848,7 @@ async fn triage_finding(
 async fn delete_finding(
     Path((channel, id)): Path<(String, String)>,
     headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
     State(state): State<AppState>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let mut entry = match state.findings.get_mut(&channel) {
@@ -845,13 +871,10 @@ async fn delete_finding(
     drop(entry);
     if let Some(store) = &state.store {
         let _ = store.delete_finding(&channel, &id);
-        let actor = headers
-            .get("x-bridge-from")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("unknown");
+        let actor = effective_actor(&headers, ext.as_deref());
         write_audit(
             store,
-            actor,
+            &actor,
             "delete",
             "finding",
             &id,
@@ -1228,6 +1251,7 @@ struct UpdateTaskReq {
 async fn update_task(
     Path((channel, id)): Path<(String, String)>,
     headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
     State(state): State<AppState>,
     Json(req): Json<UpdateTaskReq>,
 ) -> Result<Json<Task>, (StatusCode, String)> {
@@ -1262,13 +1286,10 @@ async fn update_task(
     drop(entry);
     if let Some(store) = &state.store {
         let _ = store.upsert_task(&snap);
-        let actor = headers
-            .get("x-bridge-from")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("unknown");
+        let actor = effective_actor(&headers, ext.as_deref());
         write_audit(
             store,
-            actor,
+            &actor,
             "update",
             "task",
             &snap.id,
@@ -1282,6 +1303,7 @@ async fn update_task(
 async fn delete_task(
     Path((channel, id)): Path<(String, String)>,
     headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
     State(state): State<AppState>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let mut entry = match state.tasks.get_mut(&channel) {
@@ -1297,13 +1319,10 @@ async fn delete_task(
     drop(entry);
     if let Some(store) = &state.store {
         let _ = store.delete_task(&channel, &id);
-        let actor = headers
-            .get("x-bridge-from")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("unknown");
+        let actor = effective_actor(&headers, ext.as_deref());
         write_audit(
             store,
-            actor,
+            &actor,
             "delete",
             "task",
             &id,
@@ -1330,6 +1349,9 @@ const MAX_MEMORY_VAL_LEN: usize = 256 * 1024;
 
 async fn memory_set(
     Path((channel, key)): Path<(String, String)>,
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
     State(state): State<AppState>,
     Json(req): Json<MemorySetReq>,
 ) -> Result<Json<MemoryEntry>, (StatusCode, String)> {
@@ -1337,6 +1359,32 @@ async fn memory_set(
     cap!(key, MAX_MEMORY_KEY_LEN, "key");
     cap!(req.value, MAX_MEMORY_VAL_LEN, "value");
     cap!(req.from, MAX_FROM_LEN, "from");
+    // Memory ownership (finding `0919a7db`): if a row already
+    // exists, the writer's authenticated identity must match the
+    // original `updated_by`. Admin allowlist (BRIDGE_MEMORY_ADMINS)
+    // can bypass for ops cleanup. In permissive mode (no token
+    // registry → AuthIdentity::Anonymous), the X-Bridge-From
+    // header still has to match — back-compat path, not stronger
+    // than the original threat model but no worse either.
+    let actor = effective_actor(&headers, ext.as_deref());
+    if let Some(prior) = state.memory.get(&(channel.clone(), key.clone())) {
+        let owner = prior.value().updated_by.clone();
+        drop(prior);
+        let is_admin = auth_ext
+            .as_deref()
+            .map(|a| a.is_memory_admin(&actor))
+            .unwrap_or(false);
+        if !owner.is_empty() && owner != actor && !is_admin {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!(
+                    "memory key '{channel}/{key}' is owned by '{owner}'; \
+                     '{actor}' cannot overwrite. Ask owner to rotate or \
+                     request BRIDGE_MEMORY_ADMINS bypass."
+                ),
+            ));
+        }
+    }
     // Warn-only naming check per roadmap-v1 F2. Categorised keys
     // like `decision-…`, `ops-rule-…`, `coverage-…` pass; ad-hoc
     // names log a warn so operator can grep them and decide whether
@@ -1345,11 +1393,19 @@ async fn memory_set(
         tracing::warn!(key = %key, "non-compliant memory key (warn-only)");
     }
     let now = now_secs();
+    // `updated_by` must be the AUTHENTICATED identity, not the
+    // body field — `req.from` is spoofable per finding cc3c33d6.
+    // Falls back to body in permissive mode for back-compat.
+    let updated_by = if ext.as_deref().map(|i| i.is_authenticated()).unwrap_or(false) {
+        actor.clone()
+    } else {
+        req.from
+    };
     let entry = MemoryEntry {
         channel: channel.clone(),
         key: key.clone(),
         value: req.value,
-        updated_by: req.from,
+        updated_by,
         updated_at: now,
         expires_at: if req.ttl_secs == 0 { 0 } else { now + req.ttl_secs },
     };
@@ -1397,30 +1453,40 @@ async fn memory_get(
 async fn memory_delete(
     Path((channel, key)): Path<(String, String)>,
     headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
     State(state): State<AppState>,
-) -> StatusCode {
-    // Capture before-state so the audit's `before_hash` is non-empty
-    // when the row existed. None ⇒ the delete is a no-op against a
-    // missing key (still audited, but with empty hashes).
+) -> Result<StatusCode, (StatusCode, String)> {
+    let actor = effective_actor(&headers, ext.as_deref());
+    // Capture before-state for ownership check + audit before_hash.
     let before = state
         .memory
         .get(&(channel.clone(), key.clone()))
         .map(|kv| kv.value().clone());
+    // Memory ownership (finding `0919a7db`): same rule as
+    // memory_set — only the owner or a memory-admin can delete.
+    if let Some(ref prior) = before {
+        let is_admin = auth_ext
+            .as_deref()
+            .map(|a| a.is_memory_admin(&actor))
+            .unwrap_or(false);
+        if !prior.updated_by.is_empty() && prior.updated_by != actor && !is_admin {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!(
+                    "memory key '{channel}/{key}' is owned by '{}'; \
+                     '{actor}' cannot delete.",
+                    prior.updated_by
+                ),
+            ));
+        }
+    }
     state.memory.remove(&(channel.clone(), key.clone()));
     if let Some(store) = &state.store {
         let _ = store.memory_delete(&channel, &key);
-        // No `from:` body field on this endpoint today — fall back
-        // to the `X-Bridge-From` header (artifact upload already
-        // uses this header) and finally to "unknown". Follow-up
-        // (decision-audit-actor-attribution) tracks normalising
-        // the actor channel across all mutation endpoints.
-        let actor = headers
-            .get("x-bridge-from")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("unknown");
         write_audit(
             store,
-            actor,
+            &actor,
             "delete",
             "memory",
             &format!("{}/{}", channel, key),
@@ -1428,7 +1494,7 @@ async fn memory_delete(
             None::<&MemoryEntry>,
         );
     }
-    StatusCode::NO_CONTENT
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn memory_list(
@@ -1672,17 +1738,15 @@ fn resume_within_limit(state: &AppState, requester: &str, target: &str) -> bool 
 async fn resume_endpoint(
     Path(name): Path<String>,
     headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    // Identify the requester for rate-limiting. Anonymous callers
-    // share a single bucket keyed by "anonymous" — fine as long as
-    // bridge auth is at the perimeter; if internal anon traffic
-    // ever shows up, switch to remote-IP via Forwarded header.
-    let requester = headers
-        .get("x-bridge-from")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("anonymous")
-        .to_string();
+    // Per finding `cc3c33d6`: rate-limit key MUST be the authed
+    // identity (not the spoofable header), otherwise the limiter
+    // is trivially bypassed by varying the X-Bridge-From header
+    // string. `effective_actor` prefers the authed identity and
+    // falls back to the header only in permissive mode.
+    let requester = effective_actor(&headers, ext.as_deref());
     if !resume_within_limit(&state, &requester, &name) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -2026,7 +2090,19 @@ async fn main() {
         registry,
     );
 
-    let app = Router::new()
+    // Load the auth registry once at boot. Per finding `dc633d7c`
+    // bundle: the middleware sits in front of every route that
+    // mutates or streams (and the bind hotfix from Step 1 already
+    // moves the default attack surface off network interfaces).
+    // `/metrics/prometheus` stays exempt so existing Prometheus
+    // scrapers don't break — its payload is aggregate-only and a
+    // separate reverse proxy can ACL it.
+    let auth_state = claude_bridge::auth::AuthState::from_env();
+
+    // Split the router into "authed" (everything sensitive) and
+    // "public" (Prometheus scrape only) so the layer applies once
+    // and we don't fight axum's route-by-route layer order.
+    let authed = Router::new()
         // Messages
         .route("/send/{channel}", post(send))
         .route("/messages/{channel}", get(get_messages))
@@ -2064,12 +2140,32 @@ async fn main() {
         // they already have from `send_message`'s response.
         .route("/dispatches/{message_id}/ack", post(ack_dispatch))
         .route("/dispatches/{message_id}/complete", post(complete_dispatch))
-        // Observability — world-readable per ops dispatch 1779031396.
+        // Observability — authed per finding `cc3c33d6` (was world-
+        // readable; identity is now needed for per-(requester,
+        // target) rate-limit bucket on /resume).
         .route("/peer/{name}/health", get(peer_health))
         .route("/resume/{name}", get(resume_endpoint))
         .route("/metrics", get(metrics))
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state.clone(),
+            claude_bridge::auth::require_auth,
+        ))
+        .with_state(state.clone());
+
+    let public = Router::new()
+        // Prometheus scrape kept unauthed — typical Prom deployments
+        // don't speak bearer tokens; ops fronts this with a reverse
+        // proxy ACL. The payload is aggregate-only counts, no
+        // per-peer secrets.
         .route("/metrics/prometheus", get(metrics_prometheus))
-        .with_state(state);
+        .with_state(state.clone());
+
+    // Store the auth state in the app for handlers that need to
+    // consult the memory-admin allowlist or re-resolve identity.
+    let app = Router::new()
+        .merge(authed)
+        .merge(public)
+        .layer(axum::extract::Extension(auth_state));
 
     tracing::info!("claude-bridge server on {}", cfg.bind);
     let listener = tokio::net::TcpListener::bind(&cfg.bind).await.unwrap();
