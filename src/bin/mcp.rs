@@ -297,31 +297,37 @@ fn current_name(flag: &str) -> String {
     derive_name()
 }
 
-/// Build the auto-derived `<host>/<short-session-id>` name used when
-/// `--name` is left at the default. Mirrors what bridge-identity.sh
-/// does for the shell-side hooks so MCP, watcher, and drain all
-/// agree on the same identity for the same Claude Code session.
+/// Build the auto-derived identity used when `--name` is left at the
+/// default. Mirrors what bridge-identity.sh does for the shell-side
+/// hooks so MCP, watcher, and drain all agree on the same identity
+/// for the same Claude Code session.
+///
+/// Format: `<short-session-id>` (6 hex chars). We dropped the
+/// `<host>/...` prefix because the host name was duplicated across
+/// peer entries and added noise — the role tells you what each
+/// instance does, the short-sid distinguishes them, and that's
+/// enough for addressing. Hostname fallback only when there's no
+/// session at all (one-shot CLI from outside Claude Code).
 ///
 /// Resolution: env var first (set in bash but NOT in MCP children —
 /// Claude Code intentionally doesn't propagate it to mcpServer
 /// stdio launches), then the rendezvous file
 /// `~/.cache/bridge/session-<claude_pid>` written by SessionStart.
 fn derive_name() -> String {
-    let host = std::process::Command::new("hostname")
+    if let Some(sid) = current_session_id() {
+        let short: String = sid.chars().filter(|c| c.is_ascii_hexdigit()).take(6).collect();
+        if !short.is_empty() {
+            return short;
+        }
+    }
+    std::process::Command::new("hostname")
         .arg("-s")
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "instance".into());
-    if let Some(sid) = current_session_id() {
-        let short: String = sid.chars().filter(|c| c.is_ascii_hexdigit()).take(6).collect();
-        if !short.is_empty() {
-            return format!("{host}/{short}");
-        }
-    }
-    host
+        .unwrap_or_else(|| "instance".into())
 }
 
 /// Find this process's owning Claude Code session_id. Used by
