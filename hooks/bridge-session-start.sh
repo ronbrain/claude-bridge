@@ -1,19 +1,17 @@
 #!/usr/bin/env bash
-# SessionStart hook — auto-assigns a role for this session if the
-# project directory (cwd or any ancestor) contains a `.bridge-role`
-# file. The role is persisted under
-# ~/.cache/bridge/roles/<session_id> so it survives session
-# resumption: Claude Code re-opens the same session_id, the role
-# file is still there, the instance reclaims its role automatically.
-# The user can also set the role manually at any time via
-# `bridge role <name>` from inside the session.
+# SessionStart hook. Two responsibilities:
 #
-# Identity comes from $CLAUDE_CODE_SESSION_ID (set by Claude Code in
-# every child process), so there's no PPID dance — every bridge tool
-# in the session can find the role file the same way.
+# 1. Write `~/.cache/bridge/session-<claude_pid>` so MCP (which
+#    doesn't inherit $CLAUDE_CODE_SESSION_ID — Claude Code passes it
+#    to bash shells, not to mcpServer stdio children) can find the
+#    session_id by walking back to the same Claude Code PID.
 #
-# Always exits 0 — failing here would block session start and the
-# bridge is a nice-to-have, not a hard dependency.
+# 2. If `.bridge-role` exists in cwd (or any ancestor), persist it
+#    to `~/.cache/bridge/roles/<session_id>` so the instance
+#    auto-claims a role on session start. The user can override at
+#    any time with `bridge role <name>`.
+#
+# Always exits 0.
 
 set -uo pipefail
 
@@ -21,9 +19,6 @@ CACHE_DIR="${BRIDGE_CACHE_DIR:-$HOME/.cache/bridge}"
 mkdir -p "$CACHE_DIR/roles" 2>/dev/null || exit 0
 
 hook_input="$(cat 2>/dev/null || true)"
-# Prefer the env var — the hook input also carries session_id but
-# the env is the canonical Claude-Code-set value and works
-# identically for every other tool.
 sid="${CLAUDE_CODE_SESSION_ID:-}"
 [[ -z "$sid" ]] && sid="$(printf '%s' "$hook_input" | jq -r '.session_id // empty' 2>/dev/null)"
 [[ -z "$sid" ]] && exit 0
@@ -32,9 +27,16 @@ sid="${sid//../_}"
 
 cwd="$(printf '%s' "$hook_input" | jq -r '.cwd // empty' 2>/dev/null)"
 
-# Auto-role: walk up from cwd looking for `.bridge-role`. First hit
-# wins. Empty/whitespace-only file is treated as "no role" so a
-# stale empty file doesn't clobber a role set manually via the CLI.
+# Anchor: the Claude Code PID this hook is running under. Walk the
+# parent chain (we may have been launched through an intermediate
+# shell) until we find a process with comm=claude.
+claude_pid="$(~/.claude/hooks/bridge-claude-pid.sh 2>/dev/null)"
+if [[ -n "$claude_pid" ]]; then
+  printf '%s\n' "$sid" > "${CACHE_DIR}/session-${claude_pid}.tmp" \
+    && mv "${CACHE_DIR}/session-${claude_pid}.tmp" "${CACHE_DIR}/session-${claude_pid}"
+fi
+
+# Auto-role from `.bridge-role` in cwd (or any ancestor dir).
 role_file="${CACHE_DIR}/roles/${sid}"
 if [[ -n "$cwd" && -d "$cwd" ]]; then
   dir="$cwd"
@@ -51,8 +53,9 @@ if [[ -n "$cwd" && -d "$cwd" ]]; then
   done
 fi
 
-# GC: drop roles/* files older than 30 days. Each is tiny but in
-# long-lived shells they pile up across hundreds of sessions.
+# GC: drop stale rendezvous + role files older than 30 days.
+find "$CACHE_DIR" -maxdepth 1 -name 'session-*' -type f -mtime +30 \
+  -delete 2>/dev/null || true
 find "$CACHE_DIR/roles" -maxdepth 1 -type f -mtime +30 \
   -delete 2>/dev/null || true
 

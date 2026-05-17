@@ -125,6 +125,52 @@ struct Cfg {
     name: String,
 }
 
+/// Find the owning Claude Code session_id by walking parents up to
+/// the first `comm = claude` process and reading the rendezvous
+/// file SessionStart wrote at `~/.cache/bridge/session-<pid>`.
+/// Mirrors the bash helper bridge-claude-pid.sh — the CLI and the
+/// shell tools resolve to the same anchor PID, so they agree on
+/// which session they belong to.
+fn current_session_id_via_walk(cache_dir: &str) -> Option<String> {
+    let mut pid = std::os::unix::process::parent_id();
+    for _ in 0..10 {
+        if pid <= 1 {
+            return None;
+        }
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        if comm.trim() == "claude" {
+            let path = format!("{cache_dir}/session-{pid}");
+            if let Ok(s) = std::fs::read_to_string(&path) {
+                let s = s.trim();
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+            // Last resort: parse cmdline for `--resume <uuid>`.
+            let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).ok()?;
+            for tok in cmdline.split('\0') {
+                if tok.len() == 36
+                    && tok.chars().enumerate().all(|(i, c)| {
+                        let h = matches!(i, 8 | 13 | 18 | 23);
+                        if h { c == '-' } else { c.is_ascii_hexdigit() }
+                    })
+                {
+                    return Some(tok.to_string());
+                }
+            }
+            return None;
+        }
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after = stat.rsplit_once(')').map(|(_, rest)| rest)?.trim();
+        let parts: Vec<&str> = after.split_whitespace().collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        pid = parts[1].parse().ok()?;
+    }
+    None
+}
+
 fn cfg(cli: &Cli) -> Cfg {
     Cfg {
         server: cli
@@ -156,17 +202,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.cmd {
         Cmd::Role { name } => {
-            // No network — this is a local-only registry op. Reads
-            // $CLAUDE_CODE_SESSION_ID directly (Claude Code sets it
-            // in every child process's env), so no PPID walk is
-            // needed and `bridge role` works from any subshell
-            // launched inside a session.
+            // Local-only registry op. Tries the env var first (set
+            // in bash hook context) and falls back to the parent
+            // walk so it works from MCP-spawned subshells too.
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
             let cache_dir = std::env::var("BRIDGE_CACHE_DIR")
                 .unwrap_or_else(|_| format!("{home}/.cache/bridge"));
-            let sid = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
-            let Some(sid) = sid.filter(|s| !s.is_empty()) else {
-                eprintln!("error: CLAUDE_CODE_SESSION_ID not set — run this from inside a Claude Code session, or export the var manually.");
+            let sid = std::env::var("CLAUDE_CODE_SESSION_ID")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| current_session_id_via_walk(&cache_dir));
+            let Some(sid) = sid else {
+                eprintln!("error: could not determine session_id — install ~/.claude/hooks/bridge-session-start.sh as a SessionStart hook, or run this from inside a Claude Code session.");
                 std::process::exit(2);
             };
             let role_file = format!("{cache_dir}/roles/{sid}");

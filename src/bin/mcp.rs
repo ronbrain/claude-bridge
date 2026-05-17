@@ -252,8 +252,11 @@ fn spawn_heartbeat(args: Arc<Args>, client: reqwest::Client) -> tokio::task::Abo
 /// `--name` is left at the default. Mirrors what bridge-identity.sh
 /// does for the shell-side hooks so MCP, watcher, and drain all
 /// agree on the same identity for the same Claude Code session.
-/// Reads `$CLAUDE_CODE_SESSION_ID` — Claude Code propagates it to
-/// every child process, so no PPID dance is needed.
+///
+/// Resolution: env var first (set in bash but NOT in MCP children —
+/// Claude Code intentionally doesn't propagate it to mcpServer
+/// stdio launches), then the rendezvous file
+/// `~/.cache/bridge/session-<claude_pid>` written by SessionStart.
 fn derive_name() -> String {
     let host = std::process::Command::new("hostname")
         .arg("-s")
@@ -263,13 +266,95 @@ fn derive_name() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "instance".into());
-    if let Ok(sid) = std::env::var("CLAUDE_CODE_SESSION_ID") {
+    if let Some(sid) = current_session_id() {
         let short: String = sid.chars().filter(|c| c.is_ascii_hexdigit()).take(6).collect();
         if !short.is_empty() {
             return format!("{host}/{short}");
         }
     }
     host
+}
+
+/// Find this process's owning Claude Code session_id. Used by
+/// `derive_name()` and `resolve_roles()` — see those for context.
+///
+/// 1. `$CLAUDE_CODE_SESSION_ID` if present.
+/// 2. Walk the parent chain to find the first ancestor with
+///    `comm = "claude"`, read its cmdline for a UUID arg (works
+///    for `claude --resume <uuid>`), or fall back to reading
+///    `~/.cache/bridge/session-<claude_pid>` written by the
+///    SessionStart hook.
+fn current_session_id() -> Option<String> {
+    if let Ok(sid) = std::env::var("CLAUDE_CODE_SESSION_ID") {
+        if !sid.is_empty() {
+            return Some(sid);
+        }
+    }
+    let claude_pid = find_claude_ancestor_pid()?;
+    // Rendezvous file is the canonical source (SessionStart wrote
+    // the same session_id Claude Code reports to its hooks). Try it
+    // before the cmdline scrape so we don't depend on argv layout.
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let cache_dir =
+        std::env::var("BRIDGE_CACHE_DIR").unwrap_or_else(|_| format!("{home}/.cache/bridge"));
+    let path = format!("{cache_dir}/session-{claude_pid}");
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        let s = s.trim();
+        if !s.is_empty() {
+            return Some(s.to_string());
+        }
+    }
+    // Fallback: grep the claude process cmdline for a UUID. Covers
+    // `claude --resume <uuid>` when SessionStart hasn't run yet.
+    let cmdline = std::fs::read_to_string(format!("/proc/{claude_pid}/cmdline")).ok()?;
+    for tok in cmdline.split('\0') {
+        if looks_like_uuid(tok) {
+            return Some(tok.to_string());
+        }
+    }
+    None
+}
+
+/// Walk parent IDs until we find a process whose `comm` is `claude`.
+/// Returns its PID. Bounded to 10 hops so a runaway loop is impossible.
+fn find_claude_ancestor_pid() -> Option<u32> {
+    let mut pid = std::os::unix::process::parent_id();
+    for _ in 0..10 {
+        if pid <= 1 {
+            return None;
+        }
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        if comm.trim() == "claude" {
+            return Some(pid);
+        }
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after = stat.rsplit_once(')').map(|(_, rest)| rest)?.trim();
+        let parts: Vec<&str> = after.split_whitespace().collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        pid = parts[1].parse().ok()?;
+    }
+    None
+}
+
+/// Cheap UUID heuristic — 8-4-4-4-12 hex with hyphens.
+fn looks_like_uuid(s: &str) -> bool {
+    let s = s.as_bytes();
+    if s.len() != 36 {
+        return false;
+    }
+    for (i, &b) in s.iter().enumerate() {
+        let expect_hyphen = matches!(i, 8 | 13 | 18 | 23);
+        if expect_hyphen {
+            if b != b'-' {
+                return false;
+            }
+        } else if !b.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Roles resolution precedence (highest first):
@@ -292,7 +377,7 @@ fn resolve_roles(flag: &str) -> Vec<String> {
             return split_csv(&env);
         }
     }
-    if let Ok(sid) = std::env::var("CLAUDE_CODE_SESSION_ID") {
+    if let Some(sid) = current_session_id() {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
         let cache_dir = std::env::var("BRIDGE_CACHE_DIR")
             .unwrap_or_else(|_| format!("{home}/.cache/bridge"));
