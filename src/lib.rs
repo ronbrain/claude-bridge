@@ -5,6 +5,7 @@ pub mod auth;
 pub mod automation;
 pub mod config;
 pub mod error;
+pub mod routing;
 pub mod store;
 pub use config::Config;
 pub use error::{ApiError, ApiResult};
@@ -394,6 +395,60 @@ pub struct AuditEntry {
     /// "ok" or a short error tag — full error strings stay in
     /// tracing logs to avoid mirroring sensitive content here.
     pub result: String,
+}
+
+// ─── F17 — Smart routing rules (roadmap-v2) ────────────────────────
+
+/// Trigger types a routing rule may register against. String-typed
+/// in the wire format so a client in any language can author rules.
+/// `peer_idle` and `dispatch_stale` are emitted from the background
+/// scanner; `finding_created` and `task_unassigned` from the
+/// mutation handlers.
+pub const TRIGGER_TYPES: &[&str] = &[
+    "finding_created",
+    "task_unassigned",
+    "peer_idle",
+    "dispatch_stale",
+];
+
+/// Action types a matched rule may emit. All actions go through
+/// the existing `publish_system` helper so they carry an author of
+/// `bridge-auto` and land in the audit log uniformly.
+pub const ACTION_TYPES: &[&str] = &[
+    "auto_assign",
+    "auto_escalate",
+    "auto_batch",
+    "auto_message",
+];
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RoutingRule {
+    pub id: String,
+    pub name: String,
+    /// One of `TRIGGER_TYPES`.
+    pub trigger_type: String,
+    /// JSON filter object — `{field: literal}` (eq),
+    /// `{field: {contains: "x"}}` or `{field: {in: [...]}}`.
+    /// Top-level fields are implicit-AND'd. Validated at insert
+    /// time per ops Q2; unknown operators reject up-front rather
+    /// than fall through to a silent no-match.
+    pub trigger_filter: String,
+    /// One of `ACTION_TYPES`.
+    pub action_type: String,
+    /// JSON params object — keys depend on action_type (`channel`,
+    /// `template`, `assignee_role`, `assignee_skill`, ...).
+    pub action_params: String,
+    /// Toggleable without delete. `0` rows are skipped by the
+    /// scanner; `1` participates. Per Q4 the AutoMessage quarantine
+    /// path flips this back to `0` after 3 trips in 5 minutes.
+    pub enabled: bool,
+    /// 0–100. Highest first wins on the scanner walk (DESC). Ties
+    /// resolved by table insertion order.
+    pub priority: i64,
+    /// Identity of the peer that created the rule (`updated_by`
+    /// equivalent — uses the auth bundle's `effective_actor`).
+    pub created_by: String,
+    pub created_at: u64,
 }
 
 pub fn now_secs() -> u64 {

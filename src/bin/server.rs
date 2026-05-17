@@ -1996,6 +1996,312 @@ async fn metrics_prometheus(State(state): State<AppState>) -> impl IntoResponse 
     )
 }
 
+// ── Routing rules (F17) ─────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CreateRoutingRuleReq {
+    name: String,
+    trigger_type: String,
+    /// JSON object. Validated by `routing::validate_filter` before
+    /// landing in the DB — per Q2 ops decision, unknown ops reject
+    /// at insert time (no silent no-match fallback).
+    #[serde(default)]
+    trigger_filter: serde_json::Value,
+    action_type: String,
+    #[serde(default)]
+    action_params: serde_json::Value,
+    /// 0–100. Higher = scanner picks first.
+    #[serde(default = "default_routing_priority")]
+    priority: i64,
+}
+
+fn default_routing_priority() -> i64 {
+    50
+}
+
+const MAX_ROUTING_NAME_LEN: usize = 128;
+const MAX_ROUTING_JSON_LEN: usize = 8 * 1024;
+
+async fn create_routing_rule(
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    State(state): State<AppState>,
+    Json(req): Json<CreateRoutingRuleReq>,
+) -> Result<Json<claude_bridge::RoutingRule>, (StatusCode, String)> {
+    cap!(req.name, MAX_ROUTING_NAME_LEN, "name");
+    if !claude_bridge::TRIGGER_TYPES.contains(&req.trigger_type.as_str()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "trigger_type must be one of {:?}",
+                claude_bridge::TRIGGER_TYPES
+            ),
+        ));
+    }
+    if !claude_bridge::ACTION_TYPES.contains(&req.action_type.as_str()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "action_type must be one of {:?}",
+                claude_bridge::ACTION_TYPES
+            ),
+        ));
+    }
+    if !(0..=100).contains(&req.priority) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "priority must be in 0..=100".into(),
+        ));
+    }
+    // Q2: fail at insert on bad filter syntax. Pentest's
+    // ops-rule-no-silent-fail-open-defaults applied to the rule
+    // language itself.
+    if let Err(e) = claude_bridge::routing::validate_filter(&req.trigger_filter) {
+        return Err((StatusCode::BAD_REQUEST, format!("trigger_filter: {e}")));
+    }
+    let filter_json = req.trigger_filter.to_string();
+    let params_json = req.action_params.to_string();
+    cap!(filter_json, MAX_ROUTING_JSON_LEN, "trigger_filter");
+    cap!(params_json, MAX_ROUTING_JSON_LEN, "action_params");
+    let actor = effective_actor(&headers, ext.as_deref());
+    let rule = claude_bridge::RoutingRule {
+        id: Uuid::new_v4().to_string(),
+        name: req.name,
+        trigger_type: req.trigger_type,
+        trigger_filter: filter_json,
+        action_type: req.action_type,
+        action_params: params_json,
+        enabled: true,
+        priority: req.priority,
+        created_by: actor.clone(),
+        created_at: now_secs(),
+    };
+    if let Some(store) = &state.store {
+        if let Err(e) = store.insert_routing_rule(&rule) {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("persist routing rule failed: {e}"),
+            ));
+        }
+        write_audit(
+            store,
+            &actor,
+            "create",
+            "routing_rule",
+            &rule.id,
+            None::<&claude_bridge::RoutingRule>,
+            Some(&rule),
+        );
+    } else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "persistence disabled; routing rules require BRIDGE_DB_PATH".into(),
+        ));
+    }
+    Ok(Json(rule))
+}
+
+#[derive(Deserialize, Default)]
+struct ListRoutingRulesQuery {
+    trigger_type: Option<String>,
+    enabled: Option<bool>,
+}
+
+async fn list_routing_rules(
+    Query(q): Query<ListRoutingRulesQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<claude_bridge::RoutingRule>>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "persistence disabled; routing rules require BRIDGE_DB_PATH".into(),
+    ))?;
+    let rules = store
+        .list_routing_rules(q.trigger_type.as_deref(), q.enabled)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("list routing rules failed: {e}"),
+            )
+        })?;
+    Ok(Json(rules))
+}
+
+#[derive(Deserialize, Default)]
+struct UpdateRoutingRuleReq {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    trigger_filter: Option<serde_json::Value>,
+    #[serde(default)]
+    action_params: Option<serde_json::Value>,
+    #[serde(default)]
+    priority: Option<i64>,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+async fn update_routing_rule(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    State(state): State<AppState>,
+    Json(req): Json<UpdateRoutingRuleReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "persistence disabled".into(),
+    ))?;
+    // Validate filter ahead of UPDATE (Q2 invariant — never let
+    // a bad-syntax filter persist).
+    if let Some(f) = &req.trigger_filter {
+        if let Err(e) = claude_bridge::routing::validate_filter(f) {
+            return Err((StatusCode::BAD_REQUEST, format!("trigger_filter: {e}")));
+        }
+    }
+    if let Some(p) = req.priority {
+        if !(0..=100).contains(&p) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "priority must be in 0..=100".into(),
+            ));
+        }
+    }
+    if let Some(n) = &req.name {
+        cap!(n, MAX_ROUTING_NAME_LEN, "name");
+    }
+    let filter_str = req.trigger_filter.as_ref().map(|v| v.to_string());
+    let params_str = req.action_params.as_ref().map(|v| v.to_string());
+    if let Some(s) = &filter_str {
+        cap!(s, MAX_ROUTING_JSON_LEN, "trigger_filter");
+    }
+    if let Some(s) = &params_str {
+        cap!(s, MAX_ROUTING_JSON_LEN, "action_params");
+    }
+    let mut touched = 0usize;
+    if req.name.is_some() || filter_str.is_some() || params_str.is_some() || req.priority.is_some()
+    {
+        touched += store
+            .update_routing_rule(
+                &id,
+                req.name.as_deref(),
+                filter_str.as_deref(),
+                params_str.as_deref(),
+                req.priority,
+            )
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("update failed: {e}"),
+                )
+            })?;
+    }
+    if let Some(e) = req.enabled {
+        touched += store.set_routing_rule_enabled(&id, e).map_err(|e2| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("toggle failed: {e2}"),
+            )
+        })?;
+    }
+    let actor = effective_actor(&headers, ext.as_deref());
+    write_audit(
+        store,
+        &actor,
+        "update",
+        "routing_rule",
+        &id,
+        None::<&claude_bridge::RoutingRule>,
+        None::<&claude_bridge::RoutingRule>,
+    );
+    if touched == 0 {
+        Err((StatusCode::NOT_FOUND, format!("routing rule '{id}' not found or nothing to update")))
+    } else {
+        Ok(StatusCode::NO_CONTENT)
+    }
+}
+
+async fn delete_routing_rule(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "persistence disabled".into(),
+    ))?;
+    let n = store
+        .delete_routing_rule(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("delete failed: {e}")))?;
+    if n == 0 {
+        return Err((StatusCode::NOT_FOUND, format!("routing rule '{id}' not found")));
+    }
+    let actor = effective_actor(&headers, ext.as_deref());
+    write_audit(
+        store,
+        &actor,
+        "delete",
+        "routing_rule",
+        &id,
+        None::<&claude_bridge::RoutingRule>,
+        None::<&claude_bridge::RoutingRule>,
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct EvalRoutingReq {
+    trigger_type: String,
+    payload: serde_json::Value,
+}
+
+#[derive(serde::Serialize)]
+struct EvalRoutingResp {
+    matched: Vec<EvalMatch>,
+}
+
+#[derive(serde::Serialize)]
+struct EvalMatch {
+    rule_id: String,
+    rule_name: String,
+    action_type: String,
+    action_params: serde_json::Value,
+}
+
+/// Dry-run: given a synthetic trigger context, returns the rules
+/// that would fire. Doesn't actually emit actions. Useful for
+/// authoring rules + verifying their filter shape before enabling.
+async fn eval_routing(
+    State(state): State<AppState>,
+    Json(req): Json<EvalRoutingReq>,
+) -> Result<Json<EvalRoutingResp>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "persistence disabled".into(),
+    ))?;
+    if !claude_bridge::TRIGGER_TYPES.contains(&req.trigger_type.as_str()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("trigger_type must be one of {:?}", claude_bridge::TRIGGER_TYPES),
+        ));
+    }
+    let rules = store
+        .rules_for_trigger(&req.trigger_type)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read rules failed: {e}")))?;
+    let matched = claude_bridge::routing::eval(&rules, &req.trigger_type, &req.payload);
+    Ok(Json(EvalRoutingResp {
+        matched: matched
+            .into_iter()
+            .map(|m| EvalMatch {
+                rule_id: m.rule_id,
+                rule_name: m.rule_name,
+                action_type: m.action_type,
+                action_params: m.action_params,
+            })
+            .collect(),
+    }))
+}
+
 // ── Dispatches ──────────────────────────────────────────────────────
 
 #[derive(Deserialize, Default)]
@@ -2282,6 +2588,11 @@ async fn main() {
         // they already have from `send_message`'s response.
         .route("/dispatches/{message_id}/ack", post(ack_dispatch))
         .route("/dispatches/{message_id}/complete", post(complete_dispatch))
+        // F17 routing rules — author/list/update/delete + eval dry-run.
+        // Requires persistence (503 if BRIDGE_DB_PATH unset / ephemeral).
+        .route("/routing-rules", post(create_routing_rule).get(list_routing_rules))
+        .route("/routing-rules/{id}", patch(update_routing_rule).delete(delete_routing_rule))
+        .route("/routing-rules/eval", post(eval_routing))
         // Observability — authed per finding `cc3c33d6` (was world-
         // readable; identity is now needed for per-(requester,
         // target) rate-limit bucket on /resume).

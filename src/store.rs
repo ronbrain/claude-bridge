@@ -525,6 +525,177 @@ impl Store {
         Ok(n)
     }
 
+    // ── Routing rules (F17) ─────────────────────────────────────────
+
+    /// Insert a new routing rule. Filter + action_params should be
+    /// pre-validated by the handler (per Q2 ops decision —
+    /// fail-at-insert on bad filter syntax).
+    pub fn insert_routing_rule(&self, r: &crate::RoutingRule) -> SqliteResult<()> {
+        self.conn.lock().execute(
+            "INSERT INTO routing_rules
+             (id, name, trigger_type, trigger_filter, action_type,
+              action_params, enabled, priority, created_by, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                r.id,
+                r.name,
+                r.trigger_type,
+                r.trigger_filter,
+                r.action_type,
+                r.action_params,
+                r.enabled as i64,
+                r.priority,
+                r.created_by,
+                r.created_at as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// All enabled rules for a trigger_type, priority DESC. Hot
+    /// path on the scanner side — the partial index
+    /// `routing_rules_enabled_prio` covers this exact query.
+    pub fn rules_for_trigger(
+        &self,
+        trigger_type: &str,
+    ) -> SqliteResult<Vec<crate::RoutingRule>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, trigger_type, trigger_filter, action_type,
+                    action_params, enabled, priority, created_by, created_at
+             FROM routing_rules
+             WHERE enabled = 1 AND trigger_type = ?1
+             ORDER BY priority DESC",
+        )?;
+        let rows = stmt.query_map(params![trigger_type], |r| {
+            Ok(crate::RoutingRule {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                trigger_type: r.get(2)?,
+                trigger_filter: r.get(3)?,
+                action_type: r.get(4)?,
+                action_params: r.get(5)?,
+                enabled: r.get::<_, i64>(6)? != 0,
+                priority: r.get(7)?,
+                created_by: r.get(8)?,
+                created_at: r.get::<_, i64>(9)? as u64,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// List all rules (any trigger, any enabled state) with optional
+    /// filters. Powers `GET /routing-rules`.
+    pub fn list_routing_rules(
+        &self,
+        trigger_filter: Option<&str>,
+        enabled_filter: Option<bool>,
+    ) -> SqliteResult<Vec<crate::RoutingRule>> {
+        let conn = self.conn.lock();
+        // Compose SQL + params dynamically; the optional filters
+        // make a prepared-statement approach awkward without
+        // a query builder.
+        let mut sql = String::from(
+            "SELECT id, name, trigger_type, trigger_filter, action_type,
+                    action_params, enabled, priority, created_by, created_at
+             FROM routing_rules WHERE 1=1",
+        );
+        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(t) = trigger_filter {
+            sql.push_str(" AND trigger_type = ?");
+            bound.push(Box::new(t.to_string()));
+        }
+        if let Some(e) = enabled_filter {
+            sql.push_str(" AND enabled = ?");
+            bound.push(Box::new(e as i64));
+        }
+        sql.push_str(" ORDER BY priority DESC, created_at ASC");
+        let mut stmt = conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(refs.as_slice(), |r| {
+            Ok(crate::RoutingRule {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                trigger_type: r.get(2)?,
+                trigger_filter: r.get(3)?,
+                action_type: r.get(4)?,
+                action_params: r.get(5)?,
+                enabled: r.get::<_, i64>(6)? != 0,
+                priority: r.get(7)?,
+                created_by: r.get(8)?,
+                created_at: r.get::<_, i64>(9)? as u64,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Toggle `enabled` for a rule. Used by both the operator
+    /// PATCH endpoint and the quarantine path (3-trips-in-5-min).
+    /// Returns rows-touched for 404 semantics at the handler.
+    pub fn set_routing_rule_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> SqliteResult<usize> {
+        let n = self.conn.lock().execute(
+            "UPDATE routing_rules SET enabled = ?1 WHERE id = ?2",
+            params![enabled as i64, id],
+        )?;
+        Ok(n)
+    }
+
+    /// Update any combination of (name, trigger_filter,
+    /// action_params, priority) on an existing rule. Other
+    /// columns (trigger_type, action_type, created_*) are
+    /// immutable post-insert — to change those, delete + recreate.
+    pub fn update_routing_rule(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        trigger_filter: Option<&str>,
+        action_params: Option<&str>,
+        priority: Option<i64>,
+    ) -> SqliteResult<usize> {
+        // Build the SET clause incrementally so untouched columns
+        // keep their values.
+        let mut sets = Vec::new();
+        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(v) = name {
+            sets.push("name = ?");
+            bound.push(Box::new(v.to_string()));
+        }
+        if let Some(v) = trigger_filter {
+            sets.push("trigger_filter = ?");
+            bound.push(Box::new(v.to_string()));
+        }
+        if let Some(v) = action_params {
+            sets.push("action_params = ?");
+            bound.push(Box::new(v.to_string()));
+        }
+        if let Some(v) = priority {
+            sets.push("priority = ?");
+            bound.push(Box::new(v));
+        }
+        if sets.is_empty() {
+            return Ok(0);
+        }
+        let sql = format!("UPDATE routing_rules SET {} WHERE id = ?", sets.join(", "));
+        bound.push(Box::new(id.to_string()));
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|b| b.as_ref()).collect();
+        let n = stmt.execute(refs.as_slice())?;
+        Ok(n)
+    }
+
+    pub fn delete_routing_rule(&self, id: &str) -> SqliteResult<usize> {
+        let n = self.conn.lock().execute(
+            "DELETE FROM routing_rules WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(n)
+    }
+
     pub fn memory_set(&self, m: &MemoryEntry) -> SqliteResult<()> {
         self.conn.lock().execute(
             "INSERT OR REPLACE INTO memory
@@ -1256,6 +1427,36 @@ const MIGRATIONS: &[Migration] = &[
                 ON messages (thread_id, timestamp) WHERE thread_id != '';
             CREATE INDEX IF NOT EXISTS findings_status_sev
                 ON findings (channel, status, severity);
+        "#,
+    },
+    Migration {
+        version: 11,
+        name: "v11_routing_rules",
+        // F17 — Smart routing rules. Schema per
+        // `bridge-features-roadmap-v2` F17 plus `created_by` so
+        // ownership matches the pattern established by finding
+        // `0919a7db` (memory_set ownership). Action params + filter
+        // are JSON blobs validated at insert time per Q2 op decision
+        // (`fail at insert on unknown filter syntax`).
+        //
+        // Index orders by (enabled, priority DESC, trigger_type) so
+        // the eval engine's hot path can stream-walk matching rules
+        // without a sort.
+        up: r#"
+            CREATE TABLE IF NOT EXISTS routing_rules (
+                id             TEXT PRIMARY KEY,
+                name           TEXT NOT NULL,
+                trigger_type   TEXT NOT NULL,
+                trigger_filter TEXT NOT NULL DEFAULT '{}',
+                action_type    TEXT NOT NULL,
+                action_params  TEXT NOT NULL DEFAULT '{}',
+                enabled        INTEGER NOT NULL DEFAULT 1,
+                priority       INTEGER NOT NULL DEFAULT 50,
+                created_by     TEXT NOT NULL DEFAULT '',
+                created_at     INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS routing_rules_enabled_prio
+                ON routing_rules (enabled, priority DESC, trigger_type);
         "#,
     },
 ];

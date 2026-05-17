@@ -414,6 +414,57 @@ fn tools_list() -> Value {
                 "name": "metrics",
                 "description": "Bridge-wide observability snapshot — JSON with peers_active, channels, messages_total, findings_total/open, tasks_total/active, artifacts, dispatches_pending, and per-channel `sse_lag_drops`. Cheap; safe to poll. For Prometheus scraping use `GET /metrics/prometheus` directly (not an MCP tool — Prometheus dials the server itself).",
                 "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "routing_rule_create",
+                "description": "Create a smart routing rule (F17). Trigger types: finding_created | task_unassigned | peer_idle | dispatch_stale. Action types: auto_assign | auto_escalate | auto_batch | auto_message. `trigger_filter` is a JSON object with eq/contains/in operators (implicit AND across fields) — unknown operators reject at insert time. `action_params` is action-specific JSON (e.g. `{channel, template, assignee_role, assignee_skill}`). Requires persistence (BRIDGE_DB_PATH).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name":           { "type": "string", "description": "Human-readable name; <= 128 chars" },
+                        "trigger_type":   { "type": "string", "enum": ["finding_created","task_unassigned","peer_idle","dispatch_stale"] },
+                        "trigger_filter": { "type": "object", "description": "JSON filter: {field: literal} or {field: {eq|contains|in: value}}" },
+                        "action_type":    { "type": "string", "enum": ["auto_assign","auto_escalate","auto_batch","auto_message"] },
+                        "action_params":  { "type": "object", "description": "Action-specific JSON" },
+                        "priority":       { "type": "number", "description": "0-100; higher wins on the scanner walk (default 50)" }
+                    },
+                    "required": ["name","trigger_type","action_type"]
+                }
+            },
+            {
+                "name": "routing_rule_list",
+                "description": "List routing rules. Optional `trigger_type` and `enabled` filters compose. Ordered by priority DESC + insertion ASC.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "trigger_type": { "type": "string" },
+                        "enabled":      { "type": "boolean" }
+                    }
+                }
+            },
+            {
+                "name": "routing_rule_toggle",
+                "description": "Toggle `enabled` on a routing rule. Same endpoint as routing_rule_update but takes only the bool — convenience for ops cleanup / quarantine release.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id":      { "type": "string" },
+                        "enabled": { "type": "boolean" }
+                    },
+                    "required": ["id","enabled"]
+                }
+            },
+            {
+                "name": "routing_eval",
+                "description": "Dry-run a synthetic trigger context against enabled rules; returns the actions that WOULD fire without actually firing them. Useful when authoring a rule to verify the filter shape against a real payload before turning it on.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "trigger_type": { "type": "string", "enum": ["finding_created","task_unassigned","peer_idle","dispatch_stale"] },
+                        "payload":      { "type": "object", "description": "Synthetic trigger context — same shape as the real emission point would produce" }
+                    },
+                    "required": ["trigger_type","payload"]
+                }
             }
         ]
     })
@@ -1650,6 +1701,94 @@ async fn main() {
                         }
                     }
 
+                    "routing_rule_create" => {
+                        let res = client
+                            .post(format!("{}/routing-rules", args.server))
+                            .json(&args_val)
+                            .send()
+                            .await;
+                        match res {
+                            Ok(r) if r.status().is_success() => {
+                                let body = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] routing rule created:\n{body}"))
+                            }
+                            Ok(r) => {
+                                let s = r.status();
+                                let b = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] ERROR {s}: {b}"))
+                            }
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+
+                    "routing_rule_list" => {
+                        let mut qs: Vec<(String, String)> = Vec::new();
+                        if let Some(t) = args_val["trigger_type"].as_str() {
+                            qs.push(("trigger_type".into(), t.into()));
+                        }
+                        if let Some(b) = args_val["enabled"].as_bool() {
+                            qs.push(("enabled".into(), b.to_string()));
+                        }
+                        let res = client
+                            .get(format!("{}/routing-rules", args.server))
+                            .query(&qs)
+                            .send()
+                            .await;
+                        match res {
+                            Ok(r) if r.status().is_success() => {
+                                let body = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] routing rules:\n{body}"))
+                            }
+                            Ok(r) => text(id, format!("[bridge] ERROR {}", r.status())),
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+
+                    "routing_rule_toggle" => {
+                        let rid = args_val["id"].as_str().unwrap_or("").to_string();
+                        let en = args_val["enabled"].as_bool();
+                        if rid.is_empty() || en.is_none() {
+                            text(id, "[bridge] ERROR: id + enabled required")
+                        } else {
+                            let body = serde_json::json!({ "enabled": en.unwrap() });
+                            let res = client
+                                .patch(format!("{}/routing-rules/{}", args.server, encode_path_segment(&rid)))
+                                .json(&body)
+                                .send()
+                                .await;
+                            match res {
+                                Ok(r) if r.status().is_success() =>
+                                    text(id, format!("[bridge] routing rule '{rid}' toggled")),
+                                Ok(r) => {
+                                    let s = r.status();
+                                    let b = r.text().await.unwrap_or_default();
+                                    text(id, format!("[bridge] ERROR {s}: {b}"))
+                                }
+                                _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                            }
+                        }
+                    }
+
+                    "routing_eval" => {
+                        let res = client
+                            .post(format!("{}/routing-rules/eval", args.server))
+                            .json(&args_val)
+                            .send()
+                            .await;
+                        match res {
+                            Ok(r) if r.status().is_success() => {
+                                let body = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] routing eval:\n{body}"))
+                            }
+                            Ok(r) => {
+                                let s = r.status();
+                                let b = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] ERROR {s}: {b}"))
+                            }
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+
                     _ => err(id, -32601, "unknown tool"),
                 }
             }
@@ -1829,6 +1968,11 @@ mod tests {
             "peer_health",
             "resume_for",
             "metrics",
+            // F17 routing additions:
+            "routing_rule_create",
+            "routing_rule_list",
+            "routing_rule_toggle",
+            "routing_eval",
         ];
         let expected: std::collections::BTreeSet<String> =
             EXPECTED_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
