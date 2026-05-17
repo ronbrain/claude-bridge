@@ -614,6 +614,19 @@ impl Store {
     /// rows-touched for 404 semantics. Setting `completed_at`
     /// implicitly closes the dispatch even if it was never acked —
     /// some peers just ship and report done.
+    ///
+    /// Per finding `85bdd17a` (0f4543's hypothesis #2, msg
+    /// 1779048382): when a peer calls `complete_dispatch` without
+    /// a prior `ack_dispatch`, the row is closed but `ack_at`
+    /// stays 0. The escalation scanner historically filtered on
+    /// `WHERE ack_at = 0` alone and re-pinged completed dispatches.
+    /// Two layers of defense land here:
+    ///
+    ///   1. The COMPLETE write back-fills `ack_at = completed_at`
+    ///      when ack_at was 0 — restores the invariant "ack_at != 0
+    ///      ⇒ dispatch was engaged at least once".
+    ///   2. The scanner query (`open_dispatches_older_than`) also
+    ///      filters `AND completed_at = 0`.
     pub fn complete_dispatch(
         &self,
         message_id: &str,
@@ -621,7 +634,10 @@ impl Store {
         outcome: &str,
     ) -> SqliteResult<usize> {
         let n = self.conn.lock().execute(
-            "UPDATE dispatches SET completed_at = ?1, outcome = ?2
+            "UPDATE dispatches SET
+                completed_at = ?1,
+                outcome      = ?2,
+                ack_at       = CASE WHEN ack_at = 0 THEN ?1 ELSE ack_at END
              WHERE message_id = ?3 AND completed_at = 0",
             params![completed_at as i64, outcome, message_id],
         )?;
@@ -634,6 +650,11 @@ impl Store {
     /// positives where one peer name is a prefix of another.
     /// Result is newest-first so a fresh dispatch shows up before a
     /// week-old stalemate in a peer-health view.
+    ///
+    /// Filters on both `ack_at = 0` AND `completed_at = 0` so a
+    /// completed-without-prior-ack dispatch doesn't surface as
+    /// "pending" in peer-health (same bug pattern as the scanner
+    /// query — finding `85bdd17a`).
     pub fn open_dispatches_for_peer(
         &self,
         peer: &str,
@@ -645,7 +666,9 @@ impl Store {
             "SELECT id, message_id, from_, to_, channel, sent_at,
                     ack_at, ack_eta_secs, completed_at, outcome
              FROM dispatches
-             WHERE ack_at = 0 AND to_ LIKE ?1
+             WHERE ack_at = 0
+               AND completed_at = 0
+               AND to_ LIKE ?1
              ORDER BY sent_at DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![pattern, limit as i64], |r| {
@@ -670,20 +693,27 @@ impl Store {
             .collect())
     }
 
-    /// Cheap count of every open (unacked) dispatch in the table.
-    /// Used by `/metrics` and the Prometheus exporter — the partial
-    /// index `dispatches_pending` makes this an index-only scan.
+    /// Cheap count of every open dispatch in the table (neither
+    /// acked nor completed). Used by `/metrics` and the Prometheus
+    /// exporter. Same `85bdd17a` defensive filter — both columns
+    /// have to be zero for a dispatch to count as "pending".
     pub fn count_open_dispatches(&self) -> SqliteResult<usize> {
         let n: i64 = self.conn.lock().query_row(
-            "SELECT COUNT(*) FROM dispatches WHERE ack_at = 0",
+            "SELECT COUNT(*) FROM dispatches WHERE ack_at = 0 AND completed_at = 0",
             [],
             |r| r.get(0),
         )?;
         Ok(n as usize)
     }
 
-    /// All open (unacked) dispatches older than `cutoff` (unix-secs).
-    /// Used by `DispatchEscalationScanner` to find work to ping on.
+    /// Open dispatches older than `cutoff` (unix-secs). "Open"
+    /// means BOTH `ack_at = 0` AND `completed_at = 0` — per
+    /// finding `85bdd17a`, a dispatch closed via
+    /// `complete_dispatch` without a prior `ack_dispatch` left
+    /// `ack_at = 0` and the scanner re-pinged it. The
+    /// `complete_dispatch` SQL now back-fills `ack_at` defensively,
+    /// but this query filters on both columns regardless — a
+    /// scanner shouldn't trust a single-column invariant.
     pub fn open_dispatches_older_than(
         &self,
         cutoff: u64,
@@ -694,7 +724,9 @@ impl Store {
             "SELECT id, message_id, from_, to_, channel, sent_at,
                     ack_at, ack_eta_secs, completed_at, outcome
              FROM dispatches
-             WHERE ack_at = 0 AND sent_at < ?1
+             WHERE ack_at = 0
+               AND completed_at = 0
+               AND sent_at < ?1
              ORDER BY sent_at ASC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![cutoff as i64, limit as i64], |r| {
@@ -1762,6 +1794,59 @@ mod tests {
         // The non-existent id returns 0 — server uses this for 404.
         let n = s.complete_dispatch("never-existed", now, "").unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn complete_without_prior_ack_falls_out_of_scanner_query() {
+        // Finding 85bdd17a — completed-via-direct-complete dispatches
+        // (no prior ack) must NOT re-surface in the SLA scanner query,
+        // otherwise the escalation scanner re-pings them.
+        let s = temp_store();
+        let now = crate::now_secs();
+        let mk = |id: &str, message_id: &str, sent_at: u64| crate::Dispatch {
+            id: id.into(),
+            message_id: message_id.into(),
+            from: "alice".into(),
+            to: "bob".into(),
+            channel: "c1".into(),
+            sent_at,
+            ack_at: 0,
+            ack_eta_secs: 0,
+            completed_at: 0,
+            outcome: String::new(),
+        };
+        s.insert_dispatch(&mk("d1", "m1", now - 2000)).unwrap();
+        // Pre-fix sanity: the open scan picks it up while it's still
+        // open + past the cutoff.
+        let stale = s.open_dispatches_older_than(now - 1000, 10).unwrap();
+        assert_eq!(stale.len(), 1);
+        // Close directly via complete_dispatch — no prior ack.
+        let n = s.complete_dispatch("m1", now, "shipped-direct").unwrap();
+        assert_eq!(n, 1);
+        // The defensive completed_at-filter must drop it from the scan,
+        // AND the row's ack_at must be backfilled (closes the
+        // "ack_at = 0 implies engaged-never" gap).
+        let stale = s.open_dispatches_older_than(now - 1000, 10).unwrap();
+        assert!(
+            stale.is_empty(),
+            "completed-without-ack must not be a scanner candidate; got {stale:?}"
+        );
+        let ack_at: i64 = s
+            .conn
+            .lock()
+            .query_row(
+                "SELECT ack_at FROM dispatches WHERE message_id = 'm1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ack_at > 0, "complete_dispatch must back-fill ack_at when ack_at was 0");
+        // Open-count also drops to 0.
+        let pending = s.count_open_dispatches().unwrap();
+        assert_eq!(pending, 0);
+        // Same drop on the per-peer view (peer_health consumer).
+        let peer_view = s.open_dispatches_for_peer("bob", 10).unwrap();
+        assert!(peer_view.is_empty());
     }
 
     #[test]
