@@ -9,15 +9,53 @@ The repo ships three binaries:
 
 | Binary | Role |
 |---|---|
-| `bridge-server` | Central HTTP relay. Holds messages, findings, artifacts, and presence state for every channel. One per topology. |
-| `bridge-mcp` | Stdio MCP client. Each Claude Code instance runs one, points it at the server, exposes twelve tools to the model. |
+| `bridge-server` | Central HTTP relay. Holds messages, findings, artifacts, tasks, shared-memory KV, dispatches, audit log, and presence state for every channel. Authenticates peers via bearer-token registry (fail-closed by default). One per topology. |
+| `bridge-mcp` | Stdio MCP client. Each Claude Code instance runs one, points it at the server, exposes 30 tools to the model. Auto-injects `Authorization: Bearer` + `X-Bridge-From` on every request. |
 | `bridge` | Human CLI — talk to a channel from your terminal without spawning a Claude session. Same env-var contract as `bridge-mcp`. |
 
 Beyond the bus itself the repo ships a coordination layer on top —
-per-session identities, declared roles, addressed messages, and
-channel topics — so N Claude Code instances on the same host stay
+per-session identities, declared roles, addressed messages, channel
+topics, work-queue tasks, shared-memory KV (FTS-indexed), tracked
+dispatches with auto-escalation, an audit log, and a Prometheus
+exporter — so N Claude Code instances on the same host stay
 distinguishable and only act on what's actually for them. See
-[Identity, roles, and addressing](#identity-roles-and-addressing).
+[Identity, roles, and addressing](#identity-roles-and-addressing)
+and [Authentication](#authentication).
+
+## What's new (post-sprint)
+
+Recent sprint (commits `6b4603a → 9cdb7ae → 04fb21c → 763474d`)
+landed a substantial coordination + security overhaul. If you ran
+an earlier bridge, the **breaking changes** you'll notice on
+restart:
+
+- **Persistence is now required by default.** `BRIDGE_DB_PATH` must
+  be set, OR `BRIDGE_DB_EPHEMERAL=1` to opt into ephemeral mode.
+- **Bind defaults to `127.0.0.1:3001`.** `BRIDGE_BIND=0.0.0.0:<port>`
+  is the explicit opt-in for wider exposure.
+- **Auth required in enforce mode.** Without `BRIDGE_AUTH_PERMISSIVE=1`,
+  empty `BRIDGE_AUTH_TOKENS` refuses to start. Peers configure
+  `BRIDGE_AUTH_TOKEN` (raw) in their MCP shim env.
+- **Body `from` field removed from request schemas.** Identity is
+  authoritative from the bearer (or `X-Bridge-From` in permissive
+  mode). Old clients still work — serde silently drops the
+  unknown field.
+
+Substantial **additive** changes:
+
+- **18 new HTTP routes** — tasks, memory KV, dispatch lifecycle,
+  peer health, resume generator, metrics (JSON + Prometheus).
+- **18 new MCP tools** alongside the original 12 — see [Tools
+  exposed to Claude](#tools-exposed-to-claude).
+- **Audit log** records every mutation with before/after hashes.
+- **Background automation loop** — heartbeat, peer-history prune,
+  dispatch escalation (15 min SLA + auto-ping), peer-drop notifier.
+- **Memory KV with FTS5 + ownership enforcement + soft-delete**.
+- **Secret redaction** on `/resume/{name}` (JWT / password /
+  api_key / Stripe / AWS / Gezer / SSH / PEM / Anthropic / GitHub
+  PAT family / Slack).
+- **3 new CLI subcommands**: `bridge health <peer>`,
+  `bridge metrics`, `bridge dispatches`.
 
 ## Build
 
@@ -52,21 +90,36 @@ Pick one of:
 
 | Var | Default | Notes |
 |---|---|---|
-| `PORT` | `3001` | TCP port to listen on. |
-| `BRIDGE_DB_PATH` | _(unset)_ | When set, enables sqlite persistence — see [Persistence](#persistence) below. Example: `/var/lib/claude-bridge/bridge.db`. |
+| `PORT` | `3001` | TCP port. Composed with the safe loopback default into `127.0.0.1:<PORT>` unless `BRIDGE_BIND` overrides. |
+| `BRIDGE_BIND` | _(unset → `127.0.0.1:<PORT>`)_ | Full `host:port` bind string. Setting to `0.0.0.0:<port>` (or `[::]:`/`0:`) fires a SEVERE warn at boot reminding you to pair it with `BRIDGE_AUTH_TOKENS` (finding `dc633d7c`). |
+| `BRIDGE_DB_PATH` | _(unset → refuse-to-start)_ | Path to sqlite file. **Required** unless `BRIDGE_DB_EPHEMERAL=1`. Example: `/var/lib/claude-bridge/bridge.db`. See [Persistence](#persistence). |
+| `BRIDGE_DB_EPHEMERAL` | _(unset)_ | Set to `1` to opt INTO in-memory-only mode (state lost on every restart). Refusing-to-start without it is the fix for finding `c9d0bfd9`. |
+| `BRIDGE_AUTH_TOKENS` | _(unset)_ | CSV of `<sha256-hex>:<identity>` pairs — see [Authentication](#authentication). Operators store hashes, never raw tokens. |
+| `BRIDGE_AUTH_PERMISSIVE` | _(unset)_ | Set to `1` to opt INTO running unauthenticated. Required when `BRIDGE_AUTH_TOKENS` is empty; otherwise the server refuses to start (finding `dc633d7c`). |
+| `BRIDGE_MEMORY_ADMINS` | _(unset)_ | CSV of identities that bypass memory-key ownership checks. Use for ops cleanup paths. |
+| `BRIDGE_HISTORY_LIMIT` | `100` | Per-channel in-memory cap on retained messages. |
+| `BRIDGE_FINDING_LIMIT` | `500` | Per-channel in-memory cap on retained findings. |
+| `BRIDGE_ARTIFACT_LIMIT` | `200` | Global cap on artifacts retained in memory (LRU-evicted by `created_at`). |
+| `BRIDGE_PEER_TTL_SECS` | `120` | Heartbeat staleness threshold — peers idle past this drop off `list_peers`. |
+| `BRIDGE_PEER_HISTORY_TTL_SECS` | `2592000` (30 d) | TTL on rows in `peer_status_history` so the audit trail doesn't grow unbounded. |
+| `BRIDGE_MEMORY_HISTORY_KEEP` | `5` | Versions per memory key retained in `memory_history`. |
 
-> The server currently binds to `0.0.0.0` regardless of any `BIND`
-> env var — restrict via firewall or run on a private interface when
-> multi-VPS. UFW rule: `sudo ufw allow from 10.99.0.0/24 to any port 3001`.
+The bind default flipped to `127.0.0.1:3001` per finding `dc633d7c`.
+Operators wanting wider exposure (multi-VPS, WireGuard mesh, etc.)
+set `BRIDGE_BIND=0.0.0.0:3001` explicitly and pair it with
+`BRIDGE_AUTH_TOKENS`. UFW rule for the explicit-opt-in case:
+`sudo ufw allow from 10.99.0.0/24 to any port 3001`.
 
 ### Persistence
 
-By default the server is **in-memory only** — a restart drops every
-message, finding, and artifact. Coordination tools usually want
-durability across restarts, especially for findings (you don't want
-to lose the open queue when the box reboots).
+The server **refuses to start** when `BRIDGE_DB_PATH` is unset
+unless the operator explicitly opts into ephemeral mode with
+`BRIDGE_DB_EPHEMERAL=1`. This is the
+`ops-rule-no-silent-fail-open-defaults` pattern applied after a
+data-loss incident on sv-s-bcloud — see finding `c9d0bfd9`.
 
-Opt in by setting `BRIDGE_DB_PATH` to a sqlite file path:
+To run with persistence (the recommended path), set
+`BRIDGE_DB_PATH` to a sqlite file path:
 
 ```sh
 sudo mkdir -p /var/lib/claude-bridge
@@ -89,16 +142,32 @@ How it works:
 
 - Sqlite bundled into the binary (`rusqlite + bundled`) — no
   `libsqlite3` runtime dep.
-- Schema is created on first run (`CREATE TABLE IF NOT EXISTS`),
-  WAL mode for write-while-read.
+- Schema is created on first run via a versioned **migration runner**
+  (`run_migrations` in `src/store.rs`) backed by a `schema_version`
+  table. Each migration runs under `BEGIN IMMEDIATE` so partial
+  failure rolls back cleanly. WAL mode for write-while-read.
+- **Downgrade detection** (finding `752cc548`): if `schema_version`
+  has a row newer than this binary knows about, boot refuses with
+  a FATAL error citing the version delta and the recovery
+  procedure — older binaries can't be tricked into skipping
+  invariants by running against a newer DB.
 - Every write path mirrors to disk **after** the in-memory update
   succeeds — the hot read path doesn't block on disk.
-- Boot rehydrates messages / findings / artifacts back into the
-  DashMaps, honouring the same in-memory caps (100 messages /
-  channel, 500 findings / channel, 200 artifacts globally).
+- Boot rehydrates messages / findings / artifacts / topics / tasks /
+  memory back into the DashMaps, honouring the in-memory caps from
+  the env vars table above.
 - A failed sqlite write logs a warning but does NOT fail the HTTP
   request — better to lose a row to crash than reject a working send
   because the disk got tight.
+- **Memory-ownership orphan migration** runs at boot in enforce
+  mode: rows whose `updated_by` doesn't map to a known identity
+  (registry ∪ memory admins) get rewritten ownerless so the first
+  authenticated writer can re-claim. Wrapped in a transaction
+  with a defensive FTS5 rebuild — closes finding `9fe0e927`.
+- **Finding-author orphan migration** parallel: rows authored by
+  identities outside the registry get renamed to `[orphan-<prior>]`
+  so the attribution gap is visible in `list_findings`. Enforce
+  mode only — closes the `saas` orphan-identity class.
 - Channel evictions (when >256 channels) cascade-delete the
   channel's rows from the DB so disk usage stays bounded.
 
@@ -108,6 +177,83 @@ file is the entire state.
 Presence (`/peers`) is intentionally NOT persisted — a peer
 presumed online after a server restart would be misleading. Peers
 re-register via heartbeat within 20 s of the MCP client reconnecting.
+The append-only `peer_status_history` table records every status
+transition for postmortem queries.
+
+### Authentication
+
+The server validates a shared-secret `Authorization: Bearer <token>`
+header on every mutation, stream, and observability route. Operators
+seed the registry via env, peers seed their own shim env with the
+raw bearer; the shim auto-injects both `Authorization` and
+`X-Bridge-From` on every request.
+
+**Default is fail-CLOSED** (finding `dc633d7c`): if
+`BRIDGE_AUTH_TOKENS` is unset/empty AND `BRIDGE_AUTH_PERMISSIVE` is
+not `1`, the server refuses to start with a FATAL error. The
+unsafe path requires an explicit operator-typed opt-in.
+
+**Cut tokens** (recommended: 32 bytes random per peer):
+
+```sh
+# Peer-side: raw token (paste into the peer's BRIDGE_AUTH_TOKEN env).
+RAW=$(openssl rand -hex 32)
+echo "$RAW"
+
+# Server-side: hash (paste into BRIDGE_AUTH_TOKENS, prefixed with identity).
+printf '%s' "$RAW" | sha256sum | awk '{print $1}'
+```
+
+**Configure the server**:
+
+```sh
+BRIDGE_AUTH_TOKENS="\
+<hash-of-alice-token>:alice,\
+<hash-of-bob-token>:bob,\
+<hash-of-ops-token>:ops" \
+BRIDGE_MEMORY_ADMINS=ops \
+BRIDGE_DB_PATH=/var/lib/claude-bridge/bridge.db \
+bridge-server
+```
+
+**Configure each peer** (`bridge-mcp` and `bridge` CLI):
+
+```sh
+export BRIDGE_AUTH_TOKEN=<raw-token-this-peer-was-issued>
+```
+
+The MCP shim picks the env up at startup and constructs its reqwest
+client with the bearer as a default header. The shim flags the
+header as sensitive so reqwest's request-logging redacts the value.
+
+**Permissive (interim) mode** — boot with no registry:
+
+```sh
+BRIDGE_AUTH_PERMISSIVE=1 BRIDGE_DB_PATH=/var/lib/claude-bridge/bridge.db \
+bridge-server
+# SEVERE warn at boot — every request resolves to AuthIdentity::Anonymous.
+# X-Bridge-From header (legacy path) carries identity for audit
+# attribution; ownership checks fall back to it.
+```
+
+Flipping back closed: cut tokens (see above), set
+`BRIDGE_AUTH_TOKENS` + restart, unset `BRIDGE_AUTH_PERMISSIVE`.
+Existing peers using the matching token continue uninterrupted.
+
+**Memory ownership** (finding `0919a7db`): once authenticated,
+`memory_set` and `memory_delete` only allow the original
+`updated_by` to overwrite/delete a key. Operators listed in
+`BRIDGE_MEMORY_ADMINS` bypass for ops cleanup.
+
+**SSE subscribe** (`/stream/{channel}`) is authed too — peers
+connect via reqwest/curl/MCP shim which send headers. Browser
+`EventSource` cannot natively send `Authorization`; front it with
+a reverse proxy if you need a browser subscriber.
+
+`/metrics/prometheus` is the only route deliberately left unauthed
+so existing Prometheus scrapers work without per-scrape token
+config. Front it with a reverse-proxy ACL if needed; the payload
+is aggregate-only counts, no per-peer secrets.
 
 ## systemd unit
 
@@ -143,10 +289,16 @@ they surface in the next session:
 
 ```sh
 claude mcp add -s user bridge /usr/local/bin/bridge-mcp \
+  -e BRIDGE_AUTH_TOKEN=<raw-token-issued-to-this-peer> \
   -- \
   --server http://localhost:3001 \
   --channel main
 ```
+
+`-e BRIDGE_AUTH_TOKEN=...` is required when the server has any
+tokens configured (enforce mode). Omit it only when the server is
+running with `BRIDGE_AUTH_PERMISSIVE=1`. See
+[Authentication](#authentication) for token issuance.
 
 Don't pass `--name` — the MCP auto-derives a per-session identity
 from `CLAUDE_CODE_SESSION_ID` (format: `<6-hex>`) so two sessions on
@@ -224,6 +376,7 @@ contract as `bridge-mcp`:
 export BRIDGE_SERVER=http://YOUR_BRIDGE_SERVER:3001
 export BRIDGE_CHANNEL=general
 export BRIDGE_SELF=$(hostname)
+export BRIDGE_AUTH_TOKEN=<raw-token-issued-to-this-peer>  # required in enforce mode
 ```
 
 ```sh
@@ -236,6 +389,12 @@ bridge triage <finding-id> fixed --note "shipped in v1.2.3"
 bridge upload ./poc.txt --notes "minimum repro for SQLi"
 bridge clear
 
+# Observability subcommands (Group C):
+bridge health <peer>                # composite peer-health snapshot
+bridge metrics                      # bridge-wide aggregates table
+bridge dispatches --for <peer>...   # open-dispatches breakdown
+                                    #   (omit --for for the global count)
+
 # Read or set the role for the current Claude Code session.
 # Works from any subshell launched inside a session.
 bridge role            # read
@@ -247,24 +406,82 @@ Each subcommand has `--help` with the full flag list.
 
 ## Tools exposed to Claude
 
-Twelve tools. All accept an optional `channel` arg to override the
+30 tools. All accept an optional `channel` arg to override the
 default for one call.
+
+> Sender identity for every write tool is derived authoritatively
+> from the auth bundle's bearer token (or `X-Bridge-From` header in
+> permissive mode). The body `from` field that earlier versions
+> accepted is gone; the shim auto-injects the right header per
+> peer config.
+
+### Coordination
 
 | Tool | Purpose | Required args |
 |---|---|---|
-| `send_message` | Free-form note to the channel; optional `to: [<name\|role>]` for addressed delivery | `content` |
+| `send_message` | Free-form note; optional `to: [<name\|role>]` for addressed delivery. Server tracks `to:`-non-empty calls as **dispatches** in a queryable table. | `content` |
 | `read_messages` | Read recent messages; supports `since`, `from`, `limit` filters | — |
-| `list_peers` | Who's connected right now (heartbeat ≤120s) with their declared roles | — |
+| `list_peers` | Who's connected right now (heartbeat ≤120s) with their declared roles + skills + status line | — |
+| `set_status` | Publish this peer's short status line (≤280 chars). Surfaces in `list_peers`. | `status` |
+| `set_skills` | Publish this peer's skills tag list (`svelte,csp,oauth`). Surfaces in `list_peers`. | `skills` |
 | `list_channels` | Every known channel with its declared topic — call before `send_message` if unsure where a message belongs | — |
 | `set_channel_topic` | Declare/update the one-line purpose of a channel | `channel`, `topic` |
-| `share_endpoint` | Hand off an HTTP endpoint for the peer to test | `url`, `method` |
+| `pin_message` / `unpin_message` | Pin a message to the top of `read_messages` listings (skills board, decision log, current state doc) | `id` |
+| `clear_channel` | Wipe message history (findings + artifacts + memory survive) | — |
+| `delete_channel` | Hard-delete a channel — wipes history, findings, topic | `channel` |
+
+### Findings
+
+| Tool | Purpose | Required args |
+|---|---|---|
 | `report_finding` | Log a structured finding (separate stream from chat) | `title`, `severity`, `detail` |
 | `list_findings` | Query findings by `severity` / `status` / `from` | — |
 | `triage_finding` | Update a finding's status (`open` → `triaged` → `fixed`/`wontfix`) | `id`, `status` |
 | `delete_finding` | Hard-delete a finding (false positives, noisy reports) | `id` |
+| `share_endpoint` | Hand off an HTTP endpoint for the peer to test | `url`, `method` |
 | `share_artifact` | Upload a small file (≤10 MB) and share its download URL | `filename`, `content` |
-| `clear_channel` | Wipe message history (findings + artifacts survive) | — |
-| `delete_channel` | Hard-delete a channel — wipes history, findings, topic, and removes it from `list_channels` | `channel` |
+
+### Tasks (work queue)
+
+| Tool | Purpose | Required args |
+|---|---|---|
+| `create_task` | New task. Distinct from `report_finding`: tasks are action items, findings are bugs. Optional `owner` (identity or role) + `blocks` / `depends_on` arrays. | `title` |
+| `list_tasks` | Query by `status` (`todo` / `in_progress` / `blocked` / `done` / `cancelled`) or `owner` | — |
+| `update_task` | Any of `status` / `owner` / `note` changed in one call | `id` |
+| `delete_task` | Hard-delete; for duplicates / created-in-error. Prefer `update_task status=done` to close. | `id` |
+
+### Memory KV (channel-scoped, FTS-indexed, ownership-enforced)
+
+| Tool | Purpose | Required args |
+|---|---|---|
+| `memory_set` | Write a value. Ownership enforced post auth-bundle (only original `updated_by` or `BRIDGE_MEMORY_ADMINS` can overwrite). Optional `ttl_secs` for auto-expiry. | `key`, `value` |
+| `memory_get` | Read a value by key. Channel-scoped. | `key` |
+| `memory_delete` | Delete a key. Ownership-enforced. | `key` |
+| `memory_list` | List every key in the channel's namespace with value + `updated_by` + `updated_at` + `expires_at` | — |
+
+### Dispatch lifecycle
+
+Sending a `send_message` with `to: [peer]` creates a tracked
+dispatch row. The `DispatchEscalationScanner` (60 s tick, 15 min
+SLA per roadmap-v1 F5) auto-posts a `[bridge-auto]` ping into the
+channel when an unacked dispatch ages past SLA.
+
+| Tool | Purpose | Required args |
+|---|---|---|
+| `ack_dispatch` | Acknowledge a dispatch you were addressed in. Optional `eta_secs` commitment. Idempotent — re-ack on closed dispatch is a no-op 404. | `message_id` |
+| `complete_dispatch` | Mark a dispatch done. Free-form `outcome`. Implicitly acks if you never called `ack_dispatch` first. | `message_id` |
+
+### Observability
+
+| Tool | Purpose | Required args |
+|---|---|---|
+| `peer_health` | Composite view: live presence + open dispatches addressed to peer + open findings authored + active tasks owned. `present: bool` + nullable `idle_secs` (no `u64::MAX` sentinel). | `peer` |
+| `resume_for` | Markdown brief assembled for next-session pickup — live presence + open dispatches + authored findings + authored memory keys. `_private_`-prefixed keys excluded, expired-TTL keys excluded, secret-shaped values redacted via `redact_secrets()` (covers JWT / password / api_key / Stripe / AWS / SSH / PEM / Anthropic / GitHub PAT family / Slack). Per-(requester, target) rate-limited 60/min. | `peer` |
+| `metrics` | Bridge-wide JSON snapshot: peers_active, channels, messages_total, findings_total/open, tasks_total/active, artifacts, dispatches_pending, per-channel `sse_lag_drops`. | — |
+
+> `GET /metrics/prometheus` (text-exposition format) is also served
+> for Prometheus scrapers — not exposed as an MCP tool because
+> Prometheus scrapes the HTTP endpoint directly.
 
 ## Identity, roles, and addressing
 
@@ -635,44 +852,104 @@ works for:
 
 ## Security notes
 
-- The server has **no auth** built in. If exposing beyond localhost,
-  put it behind WireGuard / a firewall / a reverse proxy that
-  enforces auth. Anyone who can reach the port can read and write
-  every channel.
-- Messages are held in memory only — `bridge-server` restart drops
-  the channel state. That's intentional: keep coordination
-  ephemeral, push durable state to the codebase.
+- **Auth is shared-secret bearer tokens** seeded via env. Operators
+  store sha256 hashes of tokens (never raw); peers store their
+  raw token and the shim hashes + looks up at request time.
+  Constant-time hash compare via `subtle::ConstantTimeEq` — no
+  timing oracle. See [Authentication](#authentication).
+- **Fail-closed defaults** (`ops-rule-no-silent-fail-open-defaults`):
+  empty `BRIDGE_AUTH_TOKENS` → refuse-to-start unless
+  `BRIDGE_AUTH_PERMISSIVE=1`; missing `BRIDGE_DB_PATH` → refuse
+  unless `BRIDGE_DB_EPHEMERAL=1`. The unsafe path is always an
+  explicit operator opt-in.
+- **Bind defaults to `127.0.0.1`** — wider exposure (`BRIDGE_BIND=0.0.0.0:…`)
+  is an explicit opt-in that fires a SEVERE warn at boot.
+- **Identity in the audit trail is the authed identity** — body
+  `from` fields were removed from request schemas (Item 6). Every
+  audit-log row, every memory-key `updated_by`, every dispatch's
+  `from` is the bearer-resolved identity (or `X-Bridge-From` only
+  in explicit permissive mode).
+- **Audit log** records every mutation (`audit_log` table) with
+  before/after sha256-truncated-128-bit hashes (`canonical_json`
+  for stable serialization). Forensic joins by `target_type` +
+  `target_id`. Reachable via `GET /audit?since=&op=` (capability-
+  gated when wired) or direct SQL.
+- **Memory ownership** enforced — only `updated_by` (or
+  `BRIDGE_MEMORY_ADMINS`) can overwrite/delete. Existing rows with
+  legacy `unknown`/`anonymous` author are auto-orphaned at boot in
+  enforce mode and re-claimable.
+- **Secret redaction** on `/resume/{name}` output — JWT / password /
+  api_key / Stripe / AWS / Gezer / SSH / PEM / Anthropic / GitHub PAT
+  family / Slack token family all redacted.
+- **Body-limit DoS surface bounded** — 1 MB global cap with a
+  per-route 10 MB override for artifact upload.
+- **Schema downgrade** refused — running an older binary against a
+  newer DB exits FATAL at boot with the version delta and the
+  recovery procedure.
+- **Persistence** is now the default — coordination state survives
+  restarts. Ephemeral mode is the opt-in.
 - Don't paste production secrets through `share_endpoint`. Use
   references (`see env var X on box Y`) rather than literal tokens.
+  The bridge's redact pass catches common shapes but isn't a
+  substitute for hygiene at the source.
+
+For multi-VPS deploys you still want a perimeter (WireGuard /
+firewall) — the bridge auth is a complementary control, not a
+substitute. UFW rule for the explicit-opt-in `BRIDGE_BIND=0.0.0.0`
+case: `sudo ufw allow from 10.99.0.0/24 to any port 3001`.
 
 ## HTTP endpoint reference
 
 Use these directly from `curl` or your own client. The MCP and CLI
 binaries are thin wrappers.
 
-| Method | Path | Purpose |
-|---|---|---|
-| POST | `/send/{channel}` | Send a message |
-| GET | `/messages/{channel}?since=&from=&limit=` | List messages (filterable) |
-| DELETE | `/messages/{channel}` | Clear message history |
-| GET | `/stream/{channel}` | Server-sent events stream (one event per new message) |
-| GET | `/channels` | List known channels (returns `[{name, topic, updated_by, updated_at}]`) |
-| GET | `/channels/{channel}/topic` | Get a single channel's topic |
-| PUT | `/channels/{channel}/topic` | Set a channel's topic (body `{from, topic}`) |
-| DELETE | `/channels/{channel}` | Hard-delete a channel (history + findings + topic + sender) |
-| POST | `/findings/{channel}` | Create finding |
-| GET | `/findings/{channel}?severity=&status=&from=` | List findings (filterable) |
-| PATCH | `/findings/{channel}/{id}` | Triage (update status/note) |
-| DELETE | `/findings/{channel}/{id}` | Hard-delete a finding |
-| POST | `/artifacts/{channel}` | Upload artifact (raw bytes, headers: `x-bridge-from`, `x-bridge-filename`, `content-type`) |
-| GET | `/artifacts/{channel}/list` | List artifacts in a channel |
-| GET | `/artifact/{id}` | Download artifact (note: singular `artifact`) |
-| POST | `/presence/{name}` | Heartbeat (body `{channel, roles?}` — name is path-encoded so `/` in identities works) |
-| GET | `/peers` | List online peers (heartbeat ≤120s) with their declared roles |
+Every route except `GET /metrics/prometheus` requires
+`Authorization: Bearer <token>` when the server is in enforce
+mode. `GET` routes have an implicit 1 MB body limit
+(`DefaultBodyLimit::max(1MB)`, finding `ccf87dff`); `POST /artifacts/{channel}`
+has a per-route override to 10 MB.
 
-`POST /send/{channel}` body schema:
-`{from, content, to?: [<name|role>]}` — empty `to` is broadcast.
-Clients filter on receive; the server is a dumb relay.
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| **Coordination** | | | |
+| POST | `/send/{channel}` | ✓ | Send a message. Body `{content, to?: [<name\|role>], thread_id?}` — `from` removed; identity derived from bearer or `X-Bridge-From`. Server inserts a dispatch row when `to:` non-empty. |
+| GET | `/messages/{channel}?since=&from=&limit=` | ✓ | List messages (filterable) |
+| DELETE | `/messages/{channel}` | ✓ | Clear message history |
+| GET | `/stream/{channel}` | ✓ | Server-sent events stream (one event per new message) |
+| POST | `/messages/{channel}/{id}/pin` | ✓ | Pin a message |
+| DELETE | `/messages/{channel}/{id}/pin` | ✓ | Unpin |
+| GET | `/channels` | ✓ | List known channels (`[{name, topic, updated_by, updated_at}]`) |
+| GET | `/channels/{channel}/topic` | ✓ | Get a single channel's topic |
+| PUT | `/channels/{channel}/topic` | ✓ | Set a topic (body `{topic}`) |
+| DELETE | `/channels/{channel}` | ✓ | Hard-delete channel |
+| **Findings** | | | |
+| POST | `/findings/{channel}` | ✓ | Create finding (body `{severity, title, detail, endpoint?}`) |
+| GET | `/findings/{channel}?severity=&status=&from=` | ✓ | List findings (filterable) |
+| PATCH | `/findings/{channel}/{id}` | ✓ | Triage (update status/note) |
+| DELETE | `/findings/{channel}/{id}` | ✓ | Hard-delete a finding |
+| POST | `/artifacts/{channel}` | ✓ | Upload artifact (≤10 MB, headers: `x-bridge-filename`, `content-type`) |
+| GET | `/artifacts/{channel}/list` | ✓ | List artifacts |
+| GET | `/artifact/{id}` | ✓ | Download artifact (singular path) |
+| **Tasks** | | | |
+| POST | `/tasks/{channel}` | ✓ | Create task (body `{title, description?, owner?, blocks?, depends_on?}`) |
+| GET | `/tasks/{channel}?status=&owner=` | ✓ | List tasks |
+| PATCH | `/tasks/{channel}/{id}` | ✓ | Update task (status/owner/note) |
+| DELETE | `/tasks/{channel}/{id}` | ✓ | Hard-delete a task |
+| **Memory KV** | | | |
+| GET | `/memory/{channel}` | ✓ | List all keys in the channel |
+| GET | `/memory/{channel}/{key}` | ✓ | Get one key (lazy-expires past `expires_at`) |
+| PUT | `/memory/{channel}/{key}` | ✓ | Set (body `{value, ttl_secs?}`). Ownership-enforced. |
+| DELETE | `/memory/{channel}/{key}` | ✓ | Delete. Ownership-enforced. |
+| **Dispatches** | | | |
+| POST | `/dispatches/{message_id}/ack` | ✓ | Ack a dispatch (body `{eta_secs?}`). 503 if persistence off; 404 if unknown/closed. |
+| POST | `/dispatches/{message_id}/complete` | ✓ | Complete a dispatch (body `{outcome?}`) |
+| **Presence + observability** | | | |
+| POST | `/presence/{name}` | ✓ | Heartbeat (body `{channel?, roles?, skills?, status?}`) |
+| GET | `/peers` | ✓ | List online peers (heartbeat ≤`BRIDGE_PEER_TTL_SECS`) |
+| GET | `/peer/{name}/health` | ✓ | Composite peer health — JSON `{peer, present, idle_secs, channel, roles, skills, status, pending_dispatches, open_findings, active_tasks}` |
+| GET | `/resume/{name}` | ✓ | Markdown resume brief — see [Tools / Observability](#observability) |
+| GET | `/metrics` | ✓ | JSON aggregates |
+| GET | `/metrics/prometheus` | **✗** | Text-exposition format — left unauthed for scrape compatibility, front with reverse-proxy ACL |
 
 ## Troubleshooting
 
@@ -690,6 +967,17 @@ Clients filter on receive; the server is a dumb relay.
 | `bridge role` says "could not determine session_id" | running outside a Claude Code session, or SessionStart never ran. Fix: install the SessionStart hook and `claude --resume`. |
 | Addressed message woke a peer it wasn't meant for | the peer claimed the role you addressed. Check `list_peers` for who's currently advertising that role; use the identity (short-sid) directly for a 1:1 send. |
 | `delete_channel` returns 204 but channel still appears | older `bridge-server` doesn't have the route; rebuild + restart the server (commit `0caa7ef` or later). |
+| Server exits at boot with `FATAL: BRIDGE_DB_PATH empty and BRIDGE_DB_EPHEMERAL not set` | Set `BRIDGE_DB_PATH=/path/to/bridge.db` (recommended) OR `BRIDGE_DB_EPHEMERAL=1` (explicit in-memory). Finding `c9d0bfd9` made this fail-closed. |
+| Server exits at boot with `FATAL: BRIDGE_AUTH_TOKENS empty and BRIDGE_AUTH_PERMISSIVE not set` | Cut tokens per [Authentication](#authentication) or set `BRIDGE_AUTH_PERMISSIVE=1` to opt INTO running unauthenticated. Finding `dc633d7c`. |
+| Server exits at boot with `FATAL: memory-ownership migration failed in enforce mode` | Likely FTS5 shadow-table inconsistency (finding `9fe0e927`). Run the suggested `sqlite3 "$BRIDGE_DB_PATH" "INSERT INTO memory_fts(memory_fts) VALUES('rebuild');"` to self-repair, then restart. |
+| Server exits at boot with `schema_version has vX applied but this binary only knows up to vY` | Downgrade attempt (finding `752cc548`) — you're running an older binary against a newer DB. Pull the matching tag, or follow the recovery procedure in the FATAL message. |
+| `401 Unauthorized` with `missing Authorization: Bearer` | Peer's `BRIDGE_AUTH_TOKEN` env not set (or shim was started before it was set). MCP shim picks up the env at startup — re-launch `claude` after exporting. |
+| `401 Unauthorized` with `bearer token not recognised` | Token doesn't hash to anything in `BRIDGE_AUTH_TOKENS`. Re-run `printf '%s' "$RAW" \| sha256sum` and re-paste into the server env. |
+| `403 forbidden: not key owner` on `memory_set`/`memory_delete` | Key was authored by a different identity. Either ask the original author to delete, or add yourself to `BRIDGE_MEMORY_ADMINS` for ops cleanup. |
+| `413 Payload Too Large` on `send_message` | Body exceeded the 1 MB default cap (finding `ccf87dff`). Use `share_artifact` for >1 MB payloads (10 MB ceiling). |
+| `bridge-auto` posts auto-pinging your stale dispatches | Per roadmap-v1 F5: dispatches with `to:` non-empty get 15 min SLA. `ack_dispatch` with an ETA or `complete_dispatch` to close. Empty `to:` (broadcast) is never tracked as a dispatch. |
+| Peers tagged `[orphan-<prior>]` in `list_findings` | Boot ran the finding-author orphan migration in enforce mode (Item 7). Rows authored outside the registry got flagged. Investigate via `from=[orphan-...]` filter or re-author from the new identity. |
+| `/metrics/prometheus` 200s, all other routes 401 | Working as intended — Prometheus is the only unauthed route. Front it with a reverse-proxy ACL if you need to gate scraping. |
 
 ## License
 
