@@ -12,6 +12,14 @@ name = "bridge-mcp"
 path = "src/bin/mcp.rs"
 
 [[bin]]
+name = "claude-bridge"
+path = "src/bin/bridge.rs"
+
+# Legacy alias. Some setups still reference `/usr/local/bin/bridge`;
+# iproute2 also ships `bridge` so users hitting PATH collisions
+# should call `claude-bridge` instead. Keeping both targets means
+# old install scripts don't break while the new name takes over.
+[[bin]]
 name = "bridge"
 path = "src/bin/bridge.rs"
 
