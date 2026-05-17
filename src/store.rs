@@ -1241,6 +1241,33 @@ fn run_migrations(conn: &Connection) -> SqliteResult<()> {
         }
     }
 
+    // Downgrade detection (finding `752cc548`, pentest 0f4543
+    // 1779042815): if the DB has an applied migration newer than
+    // the highest version this binary knows about, then either
+    // (a) the operator is running an older binary against a
+    // newer DB, or (b) someone hand-edited schema_version. Either
+    // way the binary lacks the structural assumptions of the
+    // newer schema — running it would either skip invariants or
+    // panic on first SQL hit. Refuse to start so the operator
+    // notices before silent data loss.
+    let highest_known = MIGRATIONS.iter().map(|m| m.version).max().unwrap_or(0);
+    let highest_applied = applied.iter().copied().max().unwrap_or(0);
+    if highest_applied > highest_known {
+        let msg = format!(
+            "schema_version has v{highest_applied} applied but this binary only knows up to v{highest_known}. \
+             Refusing to start — running an older binary against a newer DB would skip migration \
+             invariants. See finding 752cc548. To force re-migrate from scratch, delete the schema_version \
+             row(s) > v{highest_known} AND verify no later-schema tables are in use, then restart."
+        );
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::SchemaChanged,
+                extended_code: 1,
+            },
+            Some(msg),
+        ));
+    }
+
     let now = crate::now_secs() as i64;
     for m in MIGRATIONS {
         if applied.contains(&m.version) {
@@ -1388,6 +1415,32 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, count2);
+    }
+
+    #[test]
+    fn migration_runner_refuses_downgrade() {
+        // Cold-open a store at the current schema, then forge a
+        // schema_version row at version > MIGRATIONS.max() to
+        // simulate someone restarting with an older binary against
+        // a newer DB.
+        let s = temp_store();
+        let max_known = MIGRATIONS.iter().map(|m| m.version).max().unwrap();
+        let future = max_known + 1;
+        s.conn
+            .lock()
+            .execute(
+                "INSERT INTO schema_version (version, name, applied_at) VALUES (?1, 'forged', 0)",
+                rusqlite::params![future as i64],
+            )
+            .unwrap();
+        // Re-run migrations on the same connection — should refuse.
+        let r = run_migrations(&s.conn.lock());
+        assert!(r.is_err(), "downgrade must refuse to start");
+        // Error message contains the diagnostic hint per finding
+        // 752cc548 so an operator hitting this knows what to do.
+        let msg = format!("{}", r.unwrap_err());
+        assert!(msg.contains("752cc548"), "error names finding id: {msg}");
+        assert!(msg.contains(&format!("v{future}")), "error names applied version: {msg}");
     }
 
     #[test]

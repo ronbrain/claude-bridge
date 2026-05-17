@@ -1872,6 +1872,35 @@ fn redact_secrets(s: &str) -> String {
         // Stripe webhook signing secret (operator-provisioned,
         // expected shape from Stripe).
         ("whsec_", "[REDACTED:stripe-webhook-secret]"),
+        // Finding `fe91e015` (pentest 0f4543 1779042794, ops
+        // 1779043036): widen coverage to SSH/PEM private keys,
+        // Anthropic, GitHub PAT family, and Slack tokens. Each
+        // pattern is a prefix that uniquely identifies the secret
+        // family; the per-pattern delimiter walk below truncates
+        // at whitespace/quotes/punctuation so we don't redact
+        // beyond the token itself.
+        ("ssh-rsa AAAA", "[REDACTED:ssh-rsa]"),
+        ("ssh-ed25519 AAAA", "[REDACTED:ssh-ed25519]"),
+        ("ssh-dss AAAA", "[REDACTED:ssh-dss]"),
+        ("ecdsa-sha2-nistp", "[REDACTED:ssh-ecdsa]"),
+        ("-----BEGIN ", "[REDACTED:pem-block]"),
+        ("sk-ant-", "[REDACTED:anthropic-key]"),
+        // GitHub Personal Access Token / OAuth / user-to-server /
+        // server-to-server / refresh-token prefixes — all sized
+        // ~40 chars after the prefix in current GitHub format.
+        ("ghp_", "[REDACTED:github-pat]"),
+        ("gho_", "[REDACTED:github-oauth]"),
+        ("ghu_", "[REDACTED:github-user-token]"),
+        ("ghs_", "[REDACTED:github-server-token]"),
+        ("ghr_", "[REDACTED:github-refresh]"),
+        // Slack token family (xoxb-, xoxp-, xoxa-, xoxs-, xoxr-).
+        // Lower-case-only because Slack docs and runtime emit
+        // them lower; the prefix is the discriminator.
+        ("xoxb-", "[REDACTED:slack-bot]"),
+        ("xoxp-", "[REDACTED:slack-user]"),
+        ("xoxa-", "[REDACTED:slack-app]"),
+        ("xoxs-", "[REDACTED:slack-config]"),
+        ("xoxr-", "[REDACTED:slack-refresh]"),
     ];
     let mut out = String::with_capacity(s.len());
     let mut i = 0usize;
@@ -2185,7 +2214,17 @@ async fn main() {
         // /artifacts/<channel>; download is by global id under
         // /artifact/<id> (singular) so the route shapes don't collide
         // in axum's matcher trie.
-        .route("/artifacts/{channel}", post(upload_artifact))
+        //
+        // Per-route body-limit override: the global 1 MB cap
+        // (finding `ccf87dff`) would clip legitimate artifact
+        // uploads. Bump to ARTIFACT_MAX_BYTES = 10 MB just for
+        // this route; the handler already enforces the same
+        // ceiling itself, so this just lets the request reach the
+        // handler.
+        .route(
+            "/artifacts/{channel}",
+            post(upload_artifact).layer(axum::extract::DefaultBodyLimit::max(ARTIFACT_MAX_BYTES)),
+        )
         .route("/artifacts/{channel}/list", get(list_artifacts))
         .route("/artifact/{id}", get(download_artifact))
         // Pin / unpin messages
@@ -2227,10 +2266,25 @@ async fn main() {
 
     // Store the auth state in the app for handlers that need to
     // consult the memory-admin allowlist or re-resolve identity.
+    //
+    // DefaultBodyLimit (finding `ccf87dff`, pentest 0f4543
+    // 1779042805): axum's implicit 2MB cap was undocumented and
+    // surfaced as "request too long" 413s for legitimate artifact
+    // uploads up to 10MB. Pin it explicitly to 1 MB for the
+    // general router so DoS-by-large-body is bounded; the
+    // artifact-upload route already enforces its own
+    // `ARTIFACT_MAX_BYTES = 10 * 1024 * 1024` ceiling, so we
+    // layer an override on that single route's branch so it
+    // doesn't get clipped at the global limit. /metrics +
+    // /metrics/prometheus + everything else stays at 1 MB.
+    use axum::extract::DefaultBodyLimit;
+    const GLOBAL_BODY_LIMIT_BYTES: usize = 1024 * 1024;
     let app = Router::new()
         .merge(authed)
         .merge(public)
-        .layer(axum::extract::Extension(auth_state));
+        .layer(axum::extract::Extension(auth_state))
+        // Apply 1 MB default to everything…
+        .layer(DefaultBodyLimit::max(GLOBAL_BODY_LIMIT_BYTES));
 
     tracing::info!("claude-bridge server on {}", cfg.bind);
     let listener = tokio::net::TcpListener::bind(&cfg.bind).await.unwrap();
@@ -2315,6 +2369,44 @@ mod tests {
         let r = redact_secrets("STRIPE_WEBHOOK_SECRET=whsec_abc123def456789");
         assert!(r.contains("[REDACTED:stripe-webhook-secret]"), "got: {r}");
         assert!(!r.contains("abc123def456"));
+
+        // Finding fe91e015 expansion: SSH/PEM/Anthropic/GitHub/Slack.
+        let r = redact_secrets("authorized_keys: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDx user@host");
+        assert!(r.contains("[REDACTED:ssh-rsa]"));
+        assert!(!r.contains("AAAAB3NzaC1yc2E"));
+        let r = redact_secrets("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK1234567890 ed25519@host");
+        assert!(r.contains("[REDACTED:ssh-ed25519]"));
+        // PEM header — the BEGIN line is the secret-family marker.
+        let r = redact_secrets("-----BEGIN RSA PRIVATE KEY-----\nMIIEow...");
+        assert!(r.contains("[REDACTED:pem-block]"));
+        // Anthropic API key prefix.
+        let r = redact_secrets("ANTHROPIC_API_KEY=sk-ant-api03-AAAAAA-deadbeef");
+        assert!(r.contains("[REDACTED:anthropic-key]"));
+        assert!(!r.contains("deadbeef"));
+        // GitHub PAT family — each prefix mapped to a distinct tag.
+        for (prefix, tag) in &[
+            ("ghp_AAAA1234567890BBBB", "[REDACTED:github-pat]"),
+            ("gho_AAAA1234567890BBBB", "[REDACTED:github-oauth]"),
+            ("ghu_AAAA1234567890BBBB", "[REDACTED:github-user-token]"),
+            ("ghs_AAAA1234567890BBBB", "[REDACTED:github-server-token]"),
+            ("ghr_AAAA1234567890BBBB", "[REDACTED:github-refresh]"),
+        ] {
+            let r = redact_secrets(&format!("TOKEN={prefix} other"));
+            assert!(r.contains(tag), "got: {r}");
+            assert!(!r.contains("AAAA1234567890BBBB"), "leaked body for {prefix}");
+        }
+        // Slack token family.
+        for (prefix, tag) in &[
+            ("xoxb-1234-5678-abc", "[REDACTED:slack-bot]"),
+            ("xoxp-1234-5678-abc", "[REDACTED:slack-user]"),
+            ("xoxa-1234-5678-abc", "[REDACTED:slack-app]"),
+            ("xoxs-1234-5678-abc", "[REDACTED:slack-config]"),
+            ("xoxr-1234-5678-abc", "[REDACTED:slack-refresh]"),
+        ] {
+            let r = redact_secrets(&format!("SLACK_TOKEN={prefix}"));
+            assert!(r.contains(tag), "got: {r}");
+            assert!(!r.contains("1234-5678-abc"), "leaked body for {prefix}");
+        }
     }
 
     #[test]
