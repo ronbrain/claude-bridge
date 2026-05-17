@@ -374,6 +374,26 @@ struct SetTopicReq {
     topic: String,
 }
 
+/// Hard-delete a channel — wipes messages, findings, topic, the
+/// in-memory broadcast sender, and (if persistence is on) the
+/// corresponding sqlite rows. Used to clean up ghost channels
+/// created by typos or misconfigured clients (`--channel
+/// "a,b,c"` etc.). `clear_channel` only wipes history; this
+/// removes the entry from `list_channels` entirely.
+async fn delete_channel(
+    Path(channel): Path<String>,
+    State(state): State<AppState>,
+) -> StatusCode {
+    state.senders.remove(&channel);
+    state.history.remove(&channel);
+    state.findings.remove(&channel);
+    state.topics.remove(&channel);
+    if let Some(store) = &state.store {
+        let _ = store.drop_channel(&channel);
+    }
+    StatusCode::NO_CONTENT
+}
+
 async fn set_topic(
     Path(channel): Path<String>,
     State(state): State<AppState>,
@@ -812,6 +832,7 @@ async fn main() {
         .route("/stream/{channel}", get(stream_channel))
         .route("/channels", get(list_channels))
         .route("/channels/{channel}/topic", get(get_topic).put(set_topic))
+        .route("/channels/{channel}", delete(delete_channel))
         // Findings
         .route("/findings/{channel}", post(create_finding))
         .route("/findings/{channel}", get(list_findings))

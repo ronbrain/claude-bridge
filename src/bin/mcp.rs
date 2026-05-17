@@ -215,6 +215,15 @@ fn tools_list() -> Value {
                     "type": "object",
                     "properties": { "channel": { "type": "string" } }
                 }
+            },
+            {
+                "name": "delete_channel",
+                "description": "Hard-delete a channel — wipes messages, findings, topic, and removes it from `list_channels`. Use to clean up ghost channels (typos like `general,pale-sdk`, abandoned channels, etc). Stronger than `clear_channel` which only wipes history.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "channel": { "type": "string" } },
+                    "required": ["channel"]
+                }
             }
         ]
     })
@@ -952,6 +961,31 @@ async fn main() {
                             .await;
 
                         text(id, format!("[bridge] channel '{}' cleared", channel))
+                    }
+
+                    "delete_channel" => {
+                        let channel = args_val["channel"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+                        if channel.is_empty() {
+                            text(id, "[bridge] ERROR: channel required")
+                        } else {
+                            let res = client
+                                .delete(format!("{}/channels/{}", args.server, channel))
+                                .send()
+                                .await;
+                            match res {
+                                Ok(r) if r.status().is_success() =>
+                                    text(id, format!("[bridge] channel '{channel}' deleted (entry removed from list_channels)")),
+                                Ok(r) => {
+                                    let s = r.status();
+                                    let body = r.text().await.unwrap_or_default();
+                                    text(id, format!("[bridge] ERROR {s}: {body}"))
+                                }
+                                _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                            }
+                        }
                     }
 
                     _ => err(id, -32601, "unknown tool"),
