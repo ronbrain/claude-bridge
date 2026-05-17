@@ -63,4 +63,15 @@ find "$CACHE_DIR" -maxdepth 1 -name 'session-*' -type f -mtime +30 \
 find "$CACHE_DIR/roles" -maxdepth 1 -type f -mtime +30 \
   -delete 2>/dev/null || true
 
+# Drain any messages that piled up while Claude was down. Without
+# this, the watcher (Stop asyncRewake) only kicks in after the first
+# turn ends and the drain (UserPromptSubmit) only fires when the user
+# types — so after `claude --resume`, messages that arrived during
+# the downtime stay invisible until the user types anything.
+# Forward the SessionStart hook JSON we already consumed to the drain
+# so its session_id detection still works.
+if [[ -x "$HOME/.claude/hooks/bridge-drain-unread.sh" ]]; then
+  printf '%s' "$hook_input" | "$HOME/.claude/hooks/bridge-drain-unread.sh" 2>/dev/null || true
+fi
+
 exit 0
