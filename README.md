@@ -342,7 +342,7 @@ Expect to see your `hello` message echoed back in the
 
 ## Multi-instance example
 
-**VPS-A** (`66.70.188.209`, the SaaS box):
+**VPS-A** (`<vps-a-ip>`, the box hosting the app under test):
 
 ```sh
 PORT=3001 bridge-server   # or via systemd
@@ -350,17 +350,22 @@ PORT=3001 bridge-server   # or via systemd
 claude mcp add -s user bridge /usr/local/bin/bridge-mcp -- \
   --server http://localhost:3001 \
   --channel pentest \
-  --name saas
+  --name app
 ```
 
-**VPS-B** (the pentester instance, on the same WireGuard mesh):
+**VPS-B** (the pentester instance, reachable on the same private network):
 
 ```sh
 claude mcp add -s user bridge /usr/local/bin/bridge-mcp -- \
-  --server http://10.99.0.5:3001 \
+  --server http://<vps-a-private-ip>:3001 \
   --channel pentest \
   --name pentester
 ```
+
+Pick `--name` values that match the role each instance plays in your
+engagement (e.g. `app`, `frontend`, `pentester`, `ops`). Identities
+persist in audit/findings forever — keep them generic and meaningful,
+not example-literal copies.
 
 Now both Claude Code instances see the same five tools on the
 `pentest` channel.
