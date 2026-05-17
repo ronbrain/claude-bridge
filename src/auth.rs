@@ -89,12 +89,14 @@ impl AuthIdentity {
 #[derive(Clone, Debug)]
 pub struct AuthState {
     hashes: Arc<HashMap<[u8; 32], String>>,
-    /// True when the server is configured to reject unauthenticated
-    /// requests outright. Distinct from `hashes.is_empty()` so an
-    /// operator can configure an empty list and still hard-block —
-    /// useful for "drain everything, no peer connects until I add
-    /// tokens" maintenance windows.
-    enforce: bool,
+    /// `true` when the server is running unauthenticated by
+    /// explicit operator choice (`BRIDGE_AUTH_PERMISSIVE=1`).
+    /// Distinct from `hashes.is_empty()` — empty registry +
+    /// `permissive = false` is a startup-refused state and never
+    /// reaches the running server. This flag exists so the
+    /// middleware can short-circuit to `Anonymous` without
+    /// re-reading env per request.
+    permissive: bool,
     /// Identities allowed to bypass memory-key ownership checks.
     /// Loaded from `BRIDGE_MEMORY_ADMINS` env CSV. Read directly by
     /// the memory handlers, not by the middleware — kept here so a
@@ -102,33 +104,69 @@ pub struct AuthState {
     pub memory_admins: Arc<Vec<String>>,
 }
 
+/// Error returned by `AuthState::from_env` when the startup
+/// invariants of pentest finding `dc633d7c` are not met. Surface
+/// at `main()` so the server refuses to come up — fail-closed by
+/// default, the operator must explicitly opt into permissive mode.
+#[derive(Debug, thiserror::Error)]
+pub enum AuthStartupError {
+    #[error(
+        "BRIDGE_AUTH_TOKENS empty and BRIDGE_AUTH_PERMISSIVE not set — \
+         refusing to start with no auth. Set BRIDGE_AUTH_TOKENS=<hash>:<id>,... \
+         OR set BRIDGE_AUTH_PERMISSIVE=1 to explicitly run unauthenticated."
+    )]
+    EmptyRegistryNotPermissive,
+}
+
 impl AuthState {
-    /// Load from env: `BRIDGE_AUTH_TOKENS` = CSV of `<hex>:<name>`,
-    /// `BRIDGE_AUTH_ENFORCE` = `"1"` to hard-block on missing/bad
-    /// bearers (otherwise permissive + warn).
-    /// `BRIDGE_MEMORY_ADMINS` = CSV of identities allowed to write
-    /// any memory key regardless of original owner.
+    /// Load from env. Fail-CLOSED by default (per pentest finding
+    /// `dc633d7c` pre-implementation review 1779043445 + operator
+    /// acceptance 1779043473):
     ///
-    /// Malformed entries are logged at WARN and skipped — a
-    /// single typo doesn't lock the whole server out.
-    pub fn from_env() -> Self {
+    /// - `BRIDGE_AUTH_TOKENS` = CSV of `<sha256-hex>:<identity>`
+    ///   pairs. Operators store hashes, never raw tokens, in env.
+    /// - `BRIDGE_AUTH_PERMISSIVE=1` = explicit opt-in to run
+    ///   unauthenticated. Required when `BRIDGE_AUTH_TOKENS` is
+    ///   empty; otherwise the function returns Err and `main()`
+    ///   refuses to start.
+    /// - `BRIDGE_MEMORY_ADMINS` = CSV of identities that bypass the
+    ///   memory-ownership check (ops cleanup escape hatch).
+    ///
+    /// Malformed token entries are logged at WARN and skipped — a
+    /// single typo doesn't lock the whole server out. A non-zero
+    /// `parse_failures` count surfaces at the startup info line
+    /// so operators notice when an env entry was silently dropped.
+    pub fn from_env() -> Result<Self, AuthStartupError> {
         let raw = std::env::var("BRIDGE_AUTH_TOKENS").unwrap_or_default();
         let mut hashes: HashMap<[u8; 32], String> = HashMap::new();
+        let mut parse_failures = 0usize;
+        let mut suspiciously_short = 0usize;
         for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let Some((hex, identity)) = part.split_once(':') else {
                 tracing::warn!(entry = %part, "BRIDGE_AUTH_TOKENS entry missing ':' — skipping");
+                parse_failures += 1;
                 continue;
             };
             let identity = identity.trim();
             if identity.is_empty() {
                 tracing::warn!(entry = %part, "BRIDGE_AUTH_TOKENS entry has empty identity — skipping");
+                parse_failures += 1;
                 continue;
             }
-            let Some(bytes) = decode_hex_32(hex.trim()) else {
+            let hex_trimmed = hex.trim();
+            // Token entropy belt-and-braces: the parser requires 64
+            // hex chars (the only valid sha256 width). A shorter
+            // value is silently dropped today; surface the count
+            // at boot so operators catch issuance mistakes early.
+            if hex_trimmed.len() != 64 {
+                suspiciously_short += 1;
+            }
+            let Some(bytes) = decode_hex_32(hex_trimmed) else {
                 tracing::warn!(
                     entry = %part,
-                    "BRIDGE_AUTH_TOKENS entry hex side must be 64 hex chars (sha256) — skipping"
+                    "BRIDGE_AUTH_TOKENS entry hex side must be 64 hex chars (sha256 of a >=32-byte random token) — skipping"
                 );
+                parse_failures += 1;
                 continue;
             };
             // Last write wins on duplicate hashes — log so operators
@@ -142,7 +180,7 @@ impl AuthState {
                 );
             }
         }
-        let enforce = std::env::var("BRIDGE_AUTH_ENFORCE")
+        let permissive = std::env::var("BRIDGE_AUTH_PERMISSIVE")
             .ok()
             .as_deref()
             == Some("1");
@@ -152,34 +190,62 @@ impl AuthState {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        if hashes.is_empty() && !enforce {
+
+        // Fail-closed gate. Permissive mode is an explicit operator
+        // choice, not a silent fallback. Matches Pale backend's
+        // ALLOWED_ORIGINS-or-refuse-to-start pattern.
+        if hashes.is_empty() && !permissive {
+            return Err(AuthStartupError::EmptyRegistryNotPermissive);
+        }
+
+        if hashes.is_empty() && permissive {
             tracing::warn!(
-                "SEVERE: BRIDGE_AUTH_TOKENS is empty and enforce mode off — \
-                 every request is treated as Anonymous. The bridge is \
-                 NETWORK-OPEN for every mutation endpoint reachable on \
-                 the bound address. See finding dc633d7c. Set \
-                 BRIDGE_AUTH_TOKENS=<sha256-hex>:<identity>,... in env, \
-                 then set BRIDGE_AUTH_ENFORCE=1 once peers are configured."
-            );
-        } else if hashes.is_empty() && enforce {
-            tracing::warn!(
-                "SEVERE: BRIDGE_AUTH_TOKENS empty but enforce mode ON — \
-                 NO peer can authenticate. Server will 401 every request \
-                 until tokens are configured."
+                "SEVERE: BRIDGE_AUTH_PERMISSIVE=1 — bridge is running unauthenticated by \
+                 explicit operator choice. Every request resolves to AuthIdentity::Anonymous. \
+                 See finding dc633d7c. Cut tokens with `openssl rand -hex 32` (raw, peer-side) \
+                 + `printf '%s' '<raw>' | sha256sum` (hash, server-side env), then unset \
+                 BRIDGE_AUTH_PERMISSIVE and set BRIDGE_AUTH_TOKENS to flip closed."
             );
         } else {
             tracing::info!(
                 tokens = hashes.len(),
-                enforce,
+                permissive,
                 admins = memory_admins.len(),
+                parse_failures,
+                suspiciously_short,
                 "auth registry loaded"
             );
+            if parse_failures > 0 {
+                tracing::warn!(
+                    parse_failures,
+                    "BRIDGE_AUTH_TOKENS had {parse_failures} entries silently dropped at parse time. \
+                     Re-check each entry: format is <sha256-hex 64 chars>:<identity> separated by commas."
+                );
+            }
+            if suspiciously_short > 0 {
+                tracing::warn!(
+                    suspiciously_short,
+                    "BRIDGE_AUTH_TOKENS had {suspiciously_short} hex-side fields that weren't 64 chars. \
+                     Re-issue tokens with `openssl rand -hex 32` and hash with sha256sum — short hashes \
+                     either represent under-entropy tokens or a wrong digest function."
+                );
+            }
         }
-        Self {
+
+        Ok(Self {
             hashes: Arc::new(hashes),
-            enforce,
+            permissive,
             memory_admins: Arc::new(memory_admins),
-        }
+        })
+    }
+
+    /// Snapshot of all known identities in the registry. Used by
+    /// the memory-owner orphan migration at boot to decide whether
+    /// an existing row's `updated_by` maps to anything the new
+    /// auth layer can validate; rows owned by names outside this
+    /// set get rewritten to ownerless (empty string).
+    pub fn known_identities(&self) -> std::collections::HashSet<String> {
+        self.hashes.values().cloned().collect()
     }
 
     /// Look up a bearer's sha256 hash against the registry in
@@ -246,15 +312,16 @@ pub fn hash_bearer(bearer: &str) -> [u8; 32] {
 
 /// Axum middleware: extract the bearer, validate, inject identity.
 ///
-/// Behaviour matrix:
+/// Behaviour matrix (fail-CLOSED — empty + non-permissive can no
+/// longer reach here because `AuthState::from_env` refuses to
+/// construct in that case):
 ///
-/// | registry | enforce | bearer | result               |
-/// |----------|---------|--------|----------------------|
-/// | empty    | off     | any    | Anonymous, 200       |
-/// | empty    | ON      | any    | 401                  |
-/// | non-empty| any     | none   | 401                  |
-/// | non-empty| any     | known  | Peer(identity), 200  |
-/// | non-empty| any     | unknown| 401                  |
+/// | registry | permissive | bearer | result               |
+/// |----------|-----------|--------|----------------------|
+/// | empty    | YES       | any    | Anonymous, 200       |
+/// | non-empty| any       | none   | 401                  |
+/// | non-empty| any       | known  | Peer(identity), 200  |
+/// | non-empty| any       | unknown| 401                  |
 pub async fn require_auth(
     axum::extract::State(state): axum::extract::State<AuthState>,
     mut req: Request,
@@ -267,20 +334,20 @@ pub async fn require_auth(
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(str::trim);
 
-    let identity = match (state.hashes.is_empty(), state.enforce, bearer) {
-        // Empty registry + permissive: every request is anon.
-        (true, false, _) => AuthIdentity::Anonymous,
-        // Empty registry + enforce: lock everything out.
-        (true, true, _) => return unauthorized("server in enforce mode without tokens configured"),
-        // Non-empty registry, no bearer at all.
-        (false, _, None) => return unauthorized("missing Authorization: Bearer"),
-        // Non-empty registry, bearer present — check it.
-        (false, _, Some(tok)) if tok.is_empty() => return unauthorized("empty bearer token"),
-        (false, _, Some(tok)) => {
-            let h = hash_bearer(tok);
-            match state.lookup(&h) {
-                Some(name) => AuthIdentity::Peer(name),
-                None => return unauthorized("bearer token not recognised"),
+    let identity = if state.hashes.is_empty() {
+        // Empty + permissive (the only way an empty registry reaches
+        // the running server post-fail-closed gate).
+        AuthIdentity::Anonymous
+    } else {
+        match bearer {
+            None => return unauthorized("missing Authorization: Bearer"),
+            Some(tok) if tok.is_empty() => return unauthorized("empty bearer token"),
+            Some(tok) => {
+                let h = hash_bearer(tok);
+                match state.lookup(&h) {
+                    Some(name) => AuthIdentity::Peer(name),
+                    None => return unauthorized("bearer token not recognised"),
+                }
             }
         }
     };
@@ -343,7 +410,7 @@ mod tests {
         }
         let state = AuthState {
             hashes: Arc::new(hashes),
-            enforce: true,
+            permissive: false,
             memory_admins: Arc::new(Vec::new()),
         };
         assert_eq!(
@@ -387,12 +454,61 @@ mod tests {
     fn memory_admins_allowlist() {
         let state = AuthState {
             hashes: Arc::new(HashMap::new()),
-            enforce: false,
+            permissive: true,
             memory_admins: Arc::new(vec!["ops".into(), "rust-dev".into()]),
         };
         assert!(state.is_memory_admin("ops"));
         assert!(state.is_memory_admin("rust-dev"));
         assert!(!state.is_memory_admin("alice"));
         assert!(!state.is_memory_admin(""));
+    }
+
+    #[test]
+    fn fail_closed_default_refuses_empty_registry() {
+        // Use a process-isolated env shim: save the var, clear it,
+        // call from_env, then restore. The test is `serial`-ish by
+        // intent — if anyone runs this in parallel with another
+        // `from_env` test, the env may flip. Cargo runs lib tests
+        // in parallel by default; we narrow the risk by saving and
+        // restoring per-call, and using vars unique to this test.
+        let prev_tokens = std::env::var("BRIDGE_AUTH_TOKENS").ok();
+        let prev_perm = std::env::var("BRIDGE_AUTH_PERMISSIVE").ok();
+        std::env::remove_var("BRIDGE_AUTH_TOKENS");
+        std::env::remove_var("BRIDGE_AUTH_PERMISSIVE");
+        let r = AuthState::from_env();
+        assert!(
+            matches!(r, Err(AuthStartupError::EmptyRegistryNotPermissive)),
+            "empty registry without explicit permissive must refuse to start"
+        );
+        // Permissive opt-in admits an empty registry.
+        std::env::set_var("BRIDGE_AUTH_PERMISSIVE", "1");
+        let r = AuthState::from_env();
+        assert!(r.is_ok(), "permissive=1 with empty registry must start");
+        // Restore env so we don't leak state into sibling tests.
+        std::env::remove_var("BRIDGE_AUTH_PERMISSIVE");
+        if let Some(v) = prev_tokens {
+            std::env::set_var("BRIDGE_AUTH_TOKENS", v);
+        }
+        if let Some(v) = prev_perm {
+            std::env::set_var("BRIDGE_AUTH_PERMISSIVE", v);
+        }
+    }
+
+    #[test]
+    fn known_identities_exposes_registry_names() {
+        let mut hashes: HashMap<[u8; 32], String> = HashMap::new();
+        hashes.insert(hash_bearer("ta"), "alice".into());
+        hashes.insert(hash_bearer("tb"), "bob".into());
+        hashes.insert(hash_bearer("tc"), "carol".into());
+        let state = AuthState {
+            hashes: Arc::new(hashes),
+            permissive: false,
+            memory_admins: Arc::new(Vec::new()),
+        };
+        let names = state.known_identities();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains("alice"));
+        assert!(names.contains("bob"));
+        assert!(names.contains("carol"));
     }
 }

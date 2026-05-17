@@ -399,6 +399,55 @@ impl Store {
 
     // ── Shared memory (KV) ──────────────────────────────────────────
 
+    /// At server boot post auth-bundle finding `0919a7db`: rewrite
+    /// any memory row whose `updated_by` isn't in the known
+    /// identity set to ownerless (`updated_by = ''`). Includes the
+    /// pre-auth-bundle placeholders `"unknown"` and `"anonymous"`
+    /// — those came from the X-Bridge-From fallback and don't
+    /// correspond to real registry entities.
+    ///
+    /// `known` is the union of registry identities + memory admins
+    /// at boot. Empty string and `NULL` are already treated as
+    /// ownerless by the column type (TEXT NOT NULL DEFAULT '') so
+    /// only existing non-matching strings need rewriting.
+    ///
+    /// Returns the number of rows whose ownership was reset.
+    pub fn orphan_unmapped_memory_owners(
+        &self,
+        known: &std::collections::HashSet<String>,
+    ) -> SqliteResult<usize> {
+        // Build the IN-clause dynamically — rusqlite expects param
+        // count to match the SQL placeholders. For an empty known
+        // set the IN-clause collapses to "WHERE updated_by != ''",
+        // which is the correct effect: rewrite every non-empty
+        // owner string.
+        let conn = self.conn.lock();
+        if known.is_empty() {
+            let n = conn.execute(
+                "UPDATE memory SET updated_by = '' WHERE updated_by != ''",
+                [],
+            )?;
+            return Ok(n);
+        }
+        // Two passes — first orphan anything that was the literal
+        // historical sentinel strings; then orphan anything whose
+        // owner isn't in the known set. Both can run as a single
+        // UPDATE with a NOT IN, but rusqlite's parameter binding
+        // for slice expansion isn't a one-liner here, so we walk.
+        let names: Vec<String> = known.iter().cloned().collect();
+        let placeholders: String = std::iter::repeat("?")
+            .take(names.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "UPDATE memory SET updated_by = '' \
+             WHERE updated_by != '' AND updated_by NOT IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let n = stmt.execute(rusqlite::params_from_iter(names.iter()))?;
+        Ok(n)
+    }
+
     pub fn memory_set(&self, m: &MemoryEntry) -> SqliteResult<()> {
         self.conn.lock().execute(
             "INSERT OR REPLACE INTO memory
@@ -1369,6 +1418,68 @@ mod tests {
             )
             .unwrap();
         assert_eq!(live, 1);
+    }
+
+    #[test]
+    fn orphan_unmapped_memory_owners_rewrites_unknowns() {
+        let s = temp_store();
+        let conn = s.conn.lock();
+        // Three rows: alice-owned (registry identity), unknown
+        // (legacy placeholder), and a stranger not in any registry.
+        conn.execute(
+            "INSERT INTO memory (channel, key_, value_, updated_by, updated_at)
+             VALUES ('c1', 'alpha', 'v1', 'alice', 0),
+                    ('c1', 'beta',  'v2', 'unknown', 0),
+                    ('c1', 'gamma', 'v3', 'mallory', 0),
+                    ('c1', 'delta', 'v4', '', 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        // Known identity set = { alice, ops-admin }. Mallory and
+        // unknown both get orphaned; alice's row stays; the
+        // already-empty delta row stays empty (untouched).
+        let mut known = std::collections::HashSet::new();
+        known.insert("alice".to_string());
+        known.insert("ops-admin".to_string());
+        let n = s.orphan_unmapped_memory_owners(&known).unwrap();
+        assert_eq!(n, 2, "exactly mallory + unknown should be orphaned");
+        // Verify per-row outcomes.
+        let mut state: Vec<(String, String)> = Vec::new();
+        let conn = s.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT key_, updated_by FROM memory ORDER BY key_")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap();
+        for r in rows {
+            state.push(r.unwrap());
+        }
+        assert_eq!(state[0], ("alpha".into(), "alice".into()));
+        assert_eq!(state[1], ("beta".into(), "".into()));
+        assert_eq!(state[2], ("delta".into(), "".into()));
+        assert_eq!(state[3], ("gamma".into(), "".into()));
+    }
+
+    #[test]
+    fn orphan_with_empty_known_set_clears_every_named_owner() {
+        let s = temp_store();
+        s.conn
+            .lock()
+            .execute(
+                "INSERT INTO memory (channel, key_, value_, updated_by, updated_at)
+                 VALUES ('c1', 'a', 'v', 'alice', 0),
+                        ('c1', 'b', 'v', 'bob',   0),
+                        ('c1', 'c', 'v', '',      0)",
+                [],
+            )
+            .unwrap();
+        let known = std::collections::HashSet::new();
+        let n = s.orphan_unmapped_memory_owners(&known).unwrap();
+        // Two rows had non-empty owners and get rewritten; the
+        // empty one was already ownerless.
+        assert_eq!(n, 2);
     }
 
     #[test]

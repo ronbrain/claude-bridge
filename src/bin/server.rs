@@ -2091,13 +2091,40 @@ async fn main() {
     );
 
     // Load the auth registry once at boot. Per finding `dc633d7c`
-    // bundle: the middleware sits in front of every route that
-    // mutates or streams (and the bind hotfix from Step 1 already
-    // moves the default attack surface off network interfaces).
-    // `/metrics/prometheus` stays exempt so existing Prometheus
-    // scrapers don't break — its payload is aggregate-only and a
-    // separate reverse proxy can ACL it.
-    let auth_state = claude_bridge::auth::AuthState::from_env();
+    // bundle + pentest pre-review 1779043445 + ops accept 1779043473:
+    // FAIL-CLOSED. If BRIDGE_AUTH_TOKENS is empty AND
+    // BRIDGE_AUTH_PERMISSIVE is not explicitly set, the server
+    // refuses to start with the exact error string the operator
+    // approved. Permissive mode is an explicit opt-in only.
+    let auth_state = match claude_bridge::auth::AuthState::from_env() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("FATAL: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    // Memory-ownership migration (finding `0919a7db` bundle): any
+    // existing memory row whose `updated_by` is the pre-auth-bundle
+    // placeholder (`unknown`/`anonymous`) OR doesn't map to a known
+    // registry identity gets rewritten to ownerless. Ownerless
+    // rows are claimable by the first authenticated writer.
+    // Memory-admin allowlist is folded into `known` so admin-
+    // authored rows stay claimed by the admin.
+    if let Some(store_ref) = &store {
+        let mut known = auth_state.known_identities();
+        for a in auth_state.memory_admins.iter() {
+            known.insert(a.clone());
+        }
+        match store_ref.orphan_unmapped_memory_owners(&known) {
+            Ok(0) => tracing::info!("memory-ownership migration: no rows needed orphaning"),
+            Ok(n) => tracing::info!(
+                orphaned = n,
+                "memory-ownership migration: rewrote {n} rows to ownerless (claimable by first authed writer)"
+            ),
+            Err(e) => tracing::warn!(error = %e, "memory-ownership migration failed; existing owners unchanged"),
+        }
+    }
 
     // Split the router into "authed" (everything sensitive) and
     // "public" (Prometheus scrape only) so the layer applies once
