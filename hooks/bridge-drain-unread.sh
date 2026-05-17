@@ -1,53 +1,73 @@
 #!/usr/bin/env bash
 # UserPromptSubmit hook companion to bridge-daemon.sh.
 #
-# When Claude is about to handle a new user prompt, this hook reads
-# everything the daemon accumulated since last time, prints a tidy
-# summary on stdout (injected into the model's context per Claude
-# Code's hook protocol), and truncates the cache.
+# Reads the shared append-only log written by the daemon, surfaces
+# only messages this session hasn't seen yet, then advances the
+# per-session offset. Multiple Claude Code instances on the same
+# machine each maintain their own offset, so every instance sees
+# every message exactly once.
 #
-# Exits 0 with empty stdout when there's nothing to surface — no
-# noise on every turn when the channel is quiet.
+# Exits 0 with empty stdout when there's nothing new — no noise on
+# every turn when the channel is quiet.
 
-set -euo pipefail
+set -uo pipefail
 
-UNREAD_FILE="${BRIDGE_UNREAD_FILE:-$HOME/.cache/bridge/unread.jsonl}"
-LOCK_FILE="${UNREAD_FILE}.lock"
-DRAINING_FILE="${UNREAD_FILE}.draining"
+LOG_FILE="${BRIDGE_LOG_FILE:-$HOME/.cache/bridge/messages.jsonl}"
+OFFSET_DIR="${BRIDGE_OFFSET_DIR:-$HOME/.cache/bridge/offsets}"
 
-# Always clean up the temporary draining file on exit — even if jq
-# panics mid-render or the script is killed. Without this an orphan
-# .draining file could accumulate (and on next run we'd silently
-# discard its contents when `mv` overwrites it).
-trap 'rm -f "$DRAINING_FILE"' EXIT
+# The hook receives a JSON payload on stdin including the session_id
+# Claude Code assigns to this instance. We key the offset on that so
+# each instance has its own cursor. Fall back to PPID when there's no
+# session_id (e.g. someone invokes the hook by hand to test).
+hook_input="$(cat 2>/dev/null || true)"
+sid="$(printf '%s' "$hook_input" | jq -r '.session_id // empty' 2>/dev/null)"
+[[ -z "$sid" ]] && sid="anon-${PPID:-$$}"
+# Defensive: strip anything that could traverse out of OFFSET_DIR — a
+# malformed or forged session_id with slashes would be path traversal.
+sid="${sid//\//_}"
+sid="${sid//../_}"
 
-[[ -s "$UNREAD_FILE" ]] || exit 0
+mkdir -p "$OFFSET_DIR"
+offset_file="$OFFSET_DIR/$sid"
 
-# Atomic snapshot + truncate so messages arriving mid-drain aren't
-# lost. Rename is atomic on the same filesystem.
-mkdir -p "$(dirname "$LOCK_FILE")"
-{
-  flock -x 9
-  if [[ ! -s "$UNREAD_FILE" ]]; then
-    exit 0
-  fi
-  mv "$UNREAD_FILE" "$DRAINING_FILE"
-  : > "$UNREAD_FILE"
-} 9>"$LOCK_FILE"
+# First run for this session: anchor the offset at "now" so we don't
+# replay the entire history of messages that arrived before this
+# instance ever existed. The user starting a fresh session doesn't
+# want a wall of stale chat — only what arrives from here on.
+if [[ ! -f "$offset_file" ]]; then
+  date +%s > "$offset_file"
+  exit 0
+fi
 
-count=$(wc -l < "$DRAINING_FILE")
+offset="$(cat "$offset_file" 2>/dev/null || echo 0)"
+# A corrupted offset file must not break the hook.
+[[ "$offset" =~ ^[0-9]+$ ]] || offset=0
 
-# Render. Each line is a Message JSON; flatten to a chronological
-# bullet list with from/channel/timestamp. The `fromjson?` plus the
-# stream pipe makes jq tolerate any malformed line individually
-# instead of dying mid-stream — partial garbage doesn't drop the
-# whole batch.
+[[ -s "$LOG_FILE" ]] || exit 0
+
+# Filter unread (timestamp > offset). Single jq pass collects them
+# into an array so we can both render and compute the new max.
+# `-n` so jq reads exclusively via `inputs` — without it jq consumes
+# the first JSON value before the filter runs, which on a 1-line log
+# means the only message is silently swallowed.
+unread_json="$(jq -cn --argjson off "$offset" \
+  '[inputs | select(.timestamp > $off)]' \
+  < "$LOG_FILE" 2>/dev/null || echo '[]')"
+
+count="$(printf '%s' "$unread_json" | jq 'length' 2>/dev/null || echo 0)"
+[[ "$count" -eq 0 ]] && exit 0
+
+new_max="$(printf '%s' "$unread_json" | jq 'map(.timestamp) | max // 0' 2>/dev/null)"
+[[ -z "$new_max" || "$new_max" == "null" ]] && new_max="$offset"
+
 {
   echo "📬 Unread bridge messages (${count}) — arrived while you were away:"
   echo
-  jq -Rr 'fromjson? | "[\(.timestamp)] \(.from) on #\(.channel):\n\(.content)\n---"' \
-    < "$DRAINING_FILE"
+  printf '%s' "$unread_json" | jq -r '.[] | "[\(.timestamp)] \(.from) on #\(.channel):\n\(.content)\n---"'
 } 2>/dev/null || true
 
-# `trap` cleans up $DRAINING_FILE — no manual rm needed.
+# Atomic update of the offset so a crash mid-write can't leave a
+# partial number that fails the regex check on the next run.
+printf '%s\n' "$new_max" > "${offset_file}.tmp" && mv "${offset_file}.tmp" "$offset_file"
+
 exit 0
