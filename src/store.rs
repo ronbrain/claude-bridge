@@ -480,6 +480,51 @@ impl Store {
         }
     }
 
+    /// Per ops 1779046844 Item 7 (root-cause cleanup of identity-
+    /// spoofed findings): rewrite the `from_` column on any finding
+    /// whose author isn't in the known identity set to a clearly-
+    /// flagged orphan name (`[orphan-<prior>]`). Mirrors
+    /// `orphan_unmapped_memory_owners` but uses a wrapping name
+    /// rather than emptying the column — findings need an attributed
+    /// author so the audit trail stays coherent; flagging makes the
+    /// orphan status visible to anyone reading list_findings.
+    ///
+    /// Run-once safe: a second call sees the already-`[orphan-…]`-
+    /// prefixed values and (provided they're not in `known`)
+    /// double-wraps them. Callers should only invoke when the
+    /// registry is well-defined (enforce mode); in permissive mode
+    /// every name looks unknown and we'd torch the whole table.
+    /// `server::main` enforces this precondition before calling.
+    ///
+    /// Returns the number of rows renamed.
+    pub fn orphan_unmapped_finding_authors(
+        &self,
+        known: &std::collections::HashSet<String>,
+    ) -> SqliteResult<usize> {
+        let conn = self.conn.lock();
+        if known.is_empty() {
+            // Defensive: caller should never invoke us in this
+            // state, but we still refuse to torch every author
+            // string. Return 0 with no rewrite.
+            return Ok(0);
+        }
+        let names: Vec<String> = known.iter().cloned().collect();
+        let placeholders: String = std::iter::repeat("?")
+            .take(names.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        // Skip rows already flagged so a repeated boot doesn't
+        // double-wrap (e.g. `[orphan-[orphan-foo]]`).
+        let sql = format!(
+            "UPDATE findings SET from_ = '[orphan-' || from_ || ']' \
+             WHERE from_ NOT IN ({placeholders}) \
+               AND from_ NOT LIKE '[orphan-%'"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let n = stmt.execute(rusqlite::params_from_iter(names.iter()))?;
+        Ok(n)
+    }
+
     pub fn memory_set(&self, m: &MemoryEntry) -> SqliteResult<()> {
         self.conn.lock().execute(
             "INSERT OR REPLACE INTO memory
@@ -1545,6 +1590,75 @@ mod tests {
         assert_eq!(state[1], ("beta".into(), "".into()));
         assert_eq!(state[2], ("delta".into(), "".into()));
         assert_eq!(state[3], ("gamma".into(), "".into()));
+    }
+
+    #[test]
+    fn orphan_unmapped_finding_authors_rewrites_strangers_only() {
+        let s = temp_store();
+        let now = crate::now_secs();
+        for (id, author) in [
+            ("f1", "alice"),
+            ("f2", "saas"),
+            ("f3", "saas"),
+            ("f4", "saas"),
+            ("f5", "[orphan-mallory]"),
+        ] {
+            s.conn
+                .lock()
+                .execute(
+                    "INSERT INTO findings (id, channel, from_, severity, title, detail, created_at, updated_at) \
+                     VALUES (?1, 'c1', ?2, 'low', 't', 'd', ?3, ?3)",
+                    rusqlite::params![id, author, now as i64],
+                )
+                .unwrap();
+        }
+        let mut known = std::collections::HashSet::new();
+        known.insert("alice".to_string());
+        let n = s.orphan_unmapped_finding_authors(&known).unwrap();
+        // 3 saas rows renamed; alice stays; already-orphan-prefixed
+        // row left alone (no double-wrap).
+        assert_eq!(n, 3);
+        let rows: Vec<(String, String)> = {
+            let conn = s.conn.lock();
+            let mut stmt = conn
+                .prepare("SELECT id, from_ FROM findings ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(rows[0], ("f1".into(), "alice".into()));
+        assert_eq!(rows[1], ("f2".into(), "[orphan-saas]".into()));
+        assert_eq!(rows[2], ("f3".into(), "[orphan-saas]".into()));
+        assert_eq!(rows[3], ("f4".into(), "[orphan-saas]".into()));
+        assert_eq!(rows[4], ("f5".into(), "[orphan-mallory]".into()));
+        // Second call is a no-op — already-orphan-prefixed rows
+        // are filtered out by the `NOT LIKE '[orphan-%'` guard.
+        let n2 = s.orphan_unmapped_finding_authors(&known).unwrap();
+        assert_eq!(n2, 0, "second call must be idempotent");
+    }
+
+    #[test]
+    fn orphan_finding_authors_refuses_empty_known_set() {
+        let s = temp_store();
+        s.conn
+            .lock()
+            .execute(
+                "INSERT INTO findings (id, channel, from_, severity, title, detail, created_at, updated_at) \
+                 VALUES ('f1', 'c1', 'real', 'low', 't', 'd', 0, 0)",
+                [],
+            )
+            .unwrap();
+        let known = std::collections::HashSet::new();
+        let n = s.orphan_unmapped_finding_authors(&known).unwrap();
+        assert_eq!(n, 0, "empty known must not torch every author");
+        let author: String = s
+            .conn
+            .lock()
+            .query_row("SELECT from_ FROM findings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(author, "real");
     }
 
     #[test]

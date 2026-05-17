@@ -366,7 +366,12 @@ impl AppState {
 
 #[derive(Deserialize)]
 struct SendReq {
-    from: String,
+    // `from` removed per ops 1779046844 (Item 6 / orphan-identity
+    // root-cause). Sender identity is derived authoritatively from
+    // the auth bundle's AuthIdentity extension (or X-Bridge-From in
+    // permissive mode). Any `from` field that legacy peers still
+    // send on the wire is silently ignored — serde drops unknown
+    // fields by default since we don't set deny_unknown_fields.
     content: String,
     /// Optional recipients (identity names or roles). Empty = broadcast.
     /// Clients filter on receive; the server just stores + relays.
@@ -380,11 +385,14 @@ struct SendReq {
 
 async fn send(
     Path(channel): Path<String>,
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
     State(state): State<AppState>,
     Json(req): Json<SendReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     cap!(channel, MAX_CHANNEL_LEN, "channel");
-    cap!(req.from, MAX_FROM_LEN, "from");
+    let from = effective_actor(&headers, ext.as_deref());
+    cap!(from, MAX_FROM_LEN, "actor");
     cap!(req.content, MAX_CONTENT_LEN, "content");
     // Warn-only naming check: only on first-write that lazily
     // creates the channel. Existing channels are grandfathered.
@@ -396,7 +404,7 @@ async fn send(
     let msg = Message {
         id: Uuid::new_v4().to_string(),
         channel: channel.clone(),
-        from: req.from.clone(),
+        from: from.clone(),
         content: req.content,
         timestamp: now_secs(),
         to: req.to,
@@ -470,12 +478,12 @@ async fn send(
     // channel.
     let mut prev = state
         .peers
-        .get(&req.from)
+        .get(&from)
         .map(|kv| kv.value().clone())
         .unwrap_or_default();
     prev.last_seen = now_secs();
     prev.channel = channel.clone();
-    state.peers.insert(req.from.clone(), prev);
+    state.peers.insert(from.clone(), prev);
 
     let _ = state.sender(&channel).send(msg);
 
@@ -604,7 +612,7 @@ async fn list_channels(State(state): State<AppState>) -> Json<Vec<ChannelTopic>>
 
 #[derive(Deserialize)]
 struct SetTopicReq {
-    from: String,
+    // `from` removed per ops 1779046844 (Item 6) — see SendReq.
     topic: String,
 }
 
@@ -630,16 +638,19 @@ async fn delete_channel(
 
 async fn set_topic(
     Path(channel): Path<String>,
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
     State(state): State<AppState>,
     Json(req): Json<SetTopicReq>,
 ) -> Result<Json<ChannelTopic>, (StatusCode, String)> {
     cap!(channel, MAX_CHANNEL_LEN, "channel");
-    cap!(req.from, MAX_FROM_LEN, "from");
     cap!(req.topic, MAX_TOPIC_LEN, "topic");
+    let actor = effective_actor(&headers, ext.as_deref());
+    cap!(actor, MAX_FROM_LEN, "actor");
     let t = ChannelTopic {
         name: channel.clone(),
         topic: req.topic,
-        updated_by: req.from,
+        updated_by: actor,
         updated_at: now_secs(),
     };
     state.topics.insert(channel.clone(), t.clone());
@@ -672,7 +683,7 @@ async fn get_topic(
 
 #[derive(Deserialize)]
 struct CreateFindingReq {
-    from: String,
+    // `from` removed per ops 1779046844 (Item 6) — see SendReq.
     severity: String,
     title: String,
     detail: String,
@@ -682,11 +693,12 @@ struct CreateFindingReq {
 
 async fn create_finding(
     Path(channel): Path<String>,
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
     State(state): State<AppState>,
     Json(req): Json<CreateFindingReq>,
 ) -> Result<Json<Finding>, (StatusCode, String)> {
     cap!(channel, MAX_CHANNEL_LEN, "channel");
-    cap!(req.from, MAX_FROM_LEN, "from");
     cap!(req.endpoint, MAX_ENDPOINT_LEN, "endpoint");
     cap!(req.detail, MAX_DETAIL_LEN, "detail");
     if !SEVERITIES.contains(&req.severity.as_str()) {
@@ -699,12 +711,14 @@ async fn create_finding(
         return Err((StatusCode::BAD_REQUEST, "title required".into()));
     }
     cap!(req.title, MAX_TITLE_LEN, "title");
+    let actor = effective_actor(&headers, ext.as_deref());
+    cap!(actor, MAX_FROM_LEN, "actor");
     ensure_channel_capacity(&state, &channel);
     let now = now_secs();
     let finding = Finding {
         id: Uuid::new_v4().to_string(),
         channel: channel.clone(),
-        from: req.from.clone(),
+        from: actor.clone(),
         severity: req.severity,
         title: req.title,
         detail: req.detail,
@@ -741,12 +755,12 @@ async fn create_finding(
     }
     let mut prev = state
         .peers
-        .get(&req.from)
+        .get(&actor)
         .map(|kv| kv.value().clone())
         .unwrap_or_default();
     prev.last_seen = now_secs();
     prev.channel = channel.clone();
-    state.peers.insert(req.from, prev);
+    state.peers.insert(actor, prev);
     Ok(Json(finding))
 }
 
@@ -1145,7 +1159,7 @@ async fn set_pinned_state(
 
 #[derive(Deserialize)]
 struct CreateTaskReq {
-    from: String,
+    // `from` removed per ops 1779046844 (Item 6) — see SendReq.
     title: String,
     #[serde(default)]
     description: String,
@@ -1163,22 +1177,25 @@ const TASK_LIMIT_PER_CHANNEL: usize = 500;
 
 async fn create_task(
     Path(channel): Path<String>,
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
     State(state): State<AppState>,
     Json(req): Json<CreateTaskReq>,
 ) -> Result<Json<Task>, (StatusCode, String)> {
     cap!(channel, MAX_CHANNEL_LEN, "channel");
-    cap!(req.from, MAX_FROM_LEN, "from");
     cap!(req.title, MAX_TITLE_LEN, "title");
     cap!(req.description, MAX_TASK_DESC_LEN, "description");
     if req.title.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "title required".into()));
     }
+    let actor = effective_actor(&headers, ext.as_deref());
+    cap!(actor, MAX_FROM_LEN, "actor");
     ensure_channel_capacity(&state, &channel);
     let now = now_secs();
     let task = Task {
         id: Uuid::new_v4().to_string(),
         channel: channel.clone(),
-        from: req.from,
+        from: actor,
         title: req.title,
         description: req.description,
         owner: req.owner,
@@ -1337,7 +1354,7 @@ async fn delete_task(
 
 #[derive(Deserialize)]
 struct MemorySetReq {
-    from: String,
+    // `from` removed per ops 1779046844 (Item 6) — see SendReq.
     value: String,
     /// Optional TTL in seconds from now. 0 = no expiry.
     #[serde(default)]
@@ -1358,7 +1375,6 @@ async fn memory_set(
     cap!(channel, MAX_CHANNEL_LEN, "channel");
     cap!(key, MAX_MEMORY_KEY_LEN, "key");
     cap!(req.value, MAX_MEMORY_VAL_LEN, "value");
-    cap!(req.from, MAX_FROM_LEN, "from");
     // Memory ownership (finding `0919a7db`): if a row already
     // exists, the writer's authenticated identity must match the
     // original `updated_by`. Admin allowlist (BRIDGE_MEMORY_ADMINS)
@@ -1393,14 +1409,12 @@ async fn memory_set(
         tracing::warn!(key = %key, "non-compliant memory key (warn-only)");
     }
     let now = now_secs();
-    // `updated_by` must be the AUTHENTICATED identity, not the
-    // body field — `req.from` is spoofable per finding cc3c33d6.
-    // Falls back to body in permissive mode for back-compat.
-    let updated_by = if ext.as_deref().map(|i| i.is_authenticated()).unwrap_or(false) {
-        actor.clone()
-    } else {
-        req.from
-    };
+    // Per Item 6 (ops 1779046844): updated_by is ALWAYS the
+    // effective_actor — never a body field. The body's `from`
+    // was removed; in permissive mode the actor still comes
+    // from X-Bridge-From header (registry-validated when present).
+    cap!(actor, MAX_FROM_LEN, "actor");
+    let updated_by = actor.clone();
     let entry = MemoryEntry {
         channel: channel.clone(),
         key: key.clone(),
@@ -2153,6 +2167,30 @@ async fn main() {
         let mut known = auth_state.known_identities();
         for a in auth_state.memory_admins.iter() {
             known.insert(a.clone());
+        }
+        // Per Item 7 (ops 1779046844): findings authored by
+        // identities that don't map to the auth registry get a
+        // `[orphan-<prior>]` rename so list_findings makes the
+        // attribution gap visible. Enforce mode only — in
+        // permissive mode every identity looks unknown and we'd
+        // torch the whole table.
+        if !auth_state.is_permissive() {
+            match store_ref.orphan_unmapped_finding_authors(&known) {
+                Ok(0) => tracing::info!("finding-author migration: no rows needed orphaning"),
+                Ok(n) => tracing::info!(
+                    renamed = n,
+                    "finding-author migration: rewrote {n} rows to [orphan-…] (identities outside registry+admins)"
+                ),
+                Err(e) => {
+                    eprintln!("FATAL: finding-author migration failed in enforce mode: {e}");
+                    eprintln!("       See finding 9fe0e927 for the FTS-rebuild equivalent on the memory side.");
+                    std::process::exit(2);
+                }
+            }
+        } else {
+            tracing::info!(
+                "finding-author migration skipped — permissive mode (no registry to define orphans against)"
+            );
         }
         match store_ref.orphan_unmapped_memory_owners(&known) {
             Ok(0) => tracing::info!("memory-ownership migration: no rows needed orphaning"),
