@@ -15,6 +15,12 @@ set -uo pipefail
 LOG_FILE="${BRIDGE_LOG_FILE:-$HOME/.cache/bridge/messages.jsonl}"
 OFFSET_DIR="${BRIDGE_OFFSET_DIR:-$HOME/.cache/bridge/offsets}"
 
+# Per-session identity + roles for the `to` addressing filter. A
+# message with non-empty `.to` only surfaces when it includes either
+# our identity or one of our roles.
+SELF_NAME="$(~/.claude/hooks/bridge-identity.sh 2>/dev/null || hostname -s)"
+SELF_ROLES="${BRIDGE_ROLE:-}"
+
 # The hook receives a JSON payload on stdin including the session_id
 # Claude Code assigns to this instance. We key the offset on that so
 # each instance has its own cursor. Fall back to PPID when there's no
@@ -50,24 +56,50 @@ offset="$(cat "$offset_file" 2>/dev/null || echo 0)"
 # `-n` so jq reads exclusively via `inputs` — without it jq consumes
 # the first JSON value before the filter runs, which on a 1-line log
 # means the only message is silently swallowed.
-unread_json="$(jq -cn --argjson off "$offset" \
-  '[inputs | select(.timestamp > $off)]' \
-  < "$LOG_FILE" 2>/dev/null || echo '[]')"
+#
+# Addressing filter inside the same jq: keep messages where `.to` is
+# empty/missing (broadcast) OR includes our identity OR includes one
+# of our roles. Offset still advances for filtered-out messages —
+# they were "seen" even if not surfaced — so a peer message
+# addressed to someone else doesn't replay forever.
+# One jq pass: emit a 2-element array [unread_for_us, absolute_max].
+# Reading the log once is enough — splitting filtered and absolute
+# work into separate jq invocations was wasted I/O.
+combined="$(SELF_NAME="$SELF_NAME" SELF_ROLES="$SELF_ROLES" \
+  jq -cn --argjson off "$offset" '
+    ($ENV.SELF_ROLES // "") | split(",") | map(select(length>0)) as $roles
+    | ($ENV.SELF_NAME // "") as $name
+    | [inputs | select(.timestamp > $off)] as $all
+    | [
+        ($all | map(select(
+            ((.to // []) | length) == 0
+            or ((.to // []) | index($name))
+            or ((.to // []) | map(. as $t | $roles | index($t)) | any)
+          ))),
+        ($all | map(.timestamp) | max // 0)
+      ]' \
+  < "$LOG_FILE" 2>/dev/null || echo '[[],0]')"
 
+unread_json="$(printf '%s' "$combined" | jq -c '.[0]' 2>/dev/null || echo '[]')"
+absolute_max="$(printf '%s' "$combined" | jq -r '.[1]' 2>/dev/null || echo 0)"
 count="$(printf '%s' "$unread_json" | jq 'length' 2>/dev/null || echo 0)"
-[[ "$count" -eq 0 ]] && exit 0
 
-new_max="$(printf '%s' "$unread_json" | jq 'map(.timestamp) | max // 0' 2>/dev/null)"
-[[ -z "$new_max" || "$new_max" == "null" ]] && new_max="$offset"
+# Always advance the offset — even when nothing was addressed to us —
+# so the cursor doesn't get stuck replaying the same not-for-us
+# messages on every turn.
+new_max="$absolute_max"
+[[ -z "$new_max" || "$new_max" == "null" || "$new_max" == "0" ]] && new_max="$offset"
+printf '%s\n' "$new_max" > "${offset_file}.tmp" && mv "${offset_file}.tmp" "$offset_file"
+
+[[ "$count" -eq 0 ]] && exit 0
 
 {
   echo "📬 Unread bridge messages (${count}) — arrived while you were away:"
   echo
-  printf '%s' "$unread_json" | jq -r '.[] | "[\(.timestamp)] \(.from) on #\(.channel):\n\(.content)\n---"'
+  printf '%s' "$unread_json" | jq -r '.[]
+    | ((.to // []) | join(",")) as $to
+    | (if $to != "" then ("→ to: " + $to + "\n") else "" end) as $tl
+    | "[\(.timestamp)] \(.from) on #\(.channel):\n\($tl)\(.content)\n---"'
 } 2>/dev/null || true
-
-# Atomic update of the offset so a crash mid-write can't leave a
-# partial number that fails the regex check on the next run.
-printf '%s\n' "$new_max" > "${offset_file}.tmp" && mv "${offset_file}.tmp" "$offset_file"
 
 exit 0

@@ -10,6 +10,15 @@ pub struct Message {
     pub from: String,
     pub content: String,
     pub timestamp: u64,
+    /// Optional recipient list — identity names or role aliases. When
+    /// empty (the default), the message is a broadcast and every
+    /// subscriber on the channel sees it. When non-empty, clients are
+    /// expected to filter: only surface to the model when this list
+    /// includes the local instance's identity or one of its declared
+    /// roles. Server stays unaware — filtering is client-side so the
+    /// SSE stream doesn't need per-subscriber routing logic.
+    #[serde(default)]
+    pub to: Vec<String>,
 }
 
 /// Severity ladder for structured findings. String-typed in the JSON
@@ -76,6 +85,13 @@ pub struct Peer {
     /// be active on.
     #[serde(default)]
     pub channel: String,
+    /// Roles this peer claims (e.g. ["pentest"], ["integration",
+    /// "ops"]). Used by `send_message` so a sender can address
+    /// `to: ["pentest"]` and the client resolves that to every peer
+    /// currently advertising that role. Empty when the peer hasn't
+    /// declared any.
+    #[serde(default)]
+    pub roles: Vec<String>,
 }
 
 pub fn now_secs() -> u64 {

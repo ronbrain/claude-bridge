@@ -13,7 +13,13 @@ set -uo pipefail
 
 SERVER="${BRIDGE_SERVER:-http://172.16.101.166:3001}"
 CHANNELS_RAW="${BRIDGE_CHANNEL:-general}"
-SELF="${BRIDGE_SELF:-sv-s-bcloud}"
+# Per-session identity (host/short-session-id). Falls back to plain
+# hostname if SessionStart never ran. Other peers address us with
+# this exact string.
+SELF="$(~/.claude/hooks/bridge-identity.sh 2>/dev/null || echo sv-s-bcloud)"
+# Comma-separated roles this instance claims. Used to match messages
+# addressed `to: [<role>]` even when they don't name us literally.
+ROLES_RAW="${BRIDGE_ROLE:-}"
 
 IFS=',' read -ra CHANNELS <<< "$CHANNELS_RAW"
 TRIMMED=()
@@ -47,13 +53,32 @@ watch_one() {
         [[ -z "$from" ]] && continue
         [[ "$from" == "$SELF" ]] && continue
 
-        local content ts
+        # Addressing filter — if `to` is non-empty and doesn't include
+        # us (by identity OR by one of our roles), this message is
+        # for someone else; don't wake. Empty `to` = broadcast.
+        local to_arr
+        to_arr="$(printf '%s' "$payload" | jq -c '.to // []' 2>/dev/null)"
+        if [[ "$to_arr" != "[]" && -n "$to_arr" && "$to_arr" != "null" ]]; then
+            local match
+            match="$(SELF_NAME="$SELF" SELF_ROLES="$ROLES_RAW" \
+                jq -nr --argjson to "$to_arr" '
+                    ($ENV.SELF_ROLES // "") | split(",") | map(select(length>0)) as $roles
+                    | ($ENV.SELF_NAME // "") as $name
+                    | $to | map(select(. == $name or (. as $t | $roles | index($t))))
+                    | length' 2>/dev/null)"
+            [[ "${match:-0}" -eq 0 ]] && continue
+        fi
+
+        local content ts to_display to_line
         content="$(printf '%s' "$payload" | jq -r '.content // ""' 2>/dev/null)"
         ts="$(printf '%s' "$payload" | jq -r '.timestamp // ""' 2>/dev/null)"
+        to_display="$(printf '%s' "$payload" | jq -r '(.to // []) | join(",")' 2>/dev/null)"
+        to_line=""
+        [[ -n "$to_display" ]] && to_line="→ to: ${to_display}"$'\n'
         # Atomic write: build into a `.partial` then mv. The poller
         # only reads slots that are fully formed, so it can't catch
         # us mid-write.
-        printf '[%s] %s on #%s:\n%s\n' "$ts" "$from" "$channel" "$content" > "${slot}.partial"
+        printf '[%s] %s on #%s:\n%s%s\n' "$ts" "$from" "$channel" "$to_line" "$content" > "${slot}.partial"
         mv "${slot}.partial" "$slot"
         return 0
     done < <(curl -sN --no-buffer --max-time 0 "${SERVER}/stream/${channel}" 2>/dev/null)

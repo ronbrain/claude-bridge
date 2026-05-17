@@ -109,11 +109,12 @@ struct AppState {
     history: Arc<DashMap<String, Vec<Message>>>,
     findings: Arc<DashMap<String, Vec<Finding>>>,
     artifacts: Arc<DashMap<String, (Artifact, Vec<u8>)>>,
-    /// `name -> (last_seen_secs, channel)`. Updated by heartbeat
-    /// POST /presence/{name}; read by GET /peers. Intentionally
-    /// NOT persisted — presence is a runtime concept; a peer
-    /// presumed online after a server restart would be misleading.
-    peers: Arc<DashMap<String, (u64, String)>>,
+    /// `name -> (last_seen_secs, channel, roles)`. Updated by
+    /// heartbeat POST /presence/{name}; read by GET /peers.
+    /// Intentionally NOT persisted — presence is a runtime concept;
+    /// a peer presumed online after a server restart would be
+    /// misleading.
+    peers: Arc<DashMap<String, (u64, String, Vec<String>)>>,
     /// Declared channel purposes, keyed by channel name. Returned by
     /// `GET /channels` so peers can discover routing before posting.
     topics: Arc<DashMap<String, ChannelTopic>>,
@@ -206,6 +207,10 @@ impl AppState {
 struct SendReq {
     from: String,
     content: String,
+    /// Optional recipients (identity names or roles). Empty = broadcast.
+    /// Clients filter on receive; the server just stores + relays.
+    #[serde(default)]
+    to: Vec<String>,
 }
 
 async fn send(
@@ -224,6 +229,7 @@ async fn send(
         from: req.from.clone(),
         content: req.content,
         timestamp: now_secs(),
+        to: req.to,
     };
 
     let id = msg.id.clone();
@@ -252,9 +258,16 @@ async fn send(
     // Implicit presence — sending is a sign of life. Saves a separate
     // heartbeat round-trip for CLI-only callers (they don't run the
     // background heartbeat that the MCP client does).
+    // Implicit presence on send. We don't know the sender's roles
+    // here — preserve whatever was last advertised via heartbeat.
+    let existing_roles = state
+        .peers
+        .get(&req.from)
+        .map(|kv| kv.value().2.clone())
+        .unwrap_or_default();
     state
         .peers
-        .insert(req.from.clone(), (now_secs(), channel.clone()));
+        .insert(req.from.clone(), (now_secs(), channel.clone(), existing_roles));
 
     let _ = state.sender(&channel).send(msg);
 
@@ -461,9 +474,14 @@ async fn create_finding(
         }
         let _ = store.prune_findings(&channel, FINDING_LIMIT);
     }
+    let existing_roles = state
+        .peers
+        .get(&req.from)
+        .map(|kv| kv.value().2.clone())
+        .unwrap_or_default();
     state
         .peers
-        .insert(req.from, (now_secs(), channel.clone()));
+        .insert(req.from, (now_secs(), channel.clone(), existing_roles));
     Ok(Json(finding))
 }
 
@@ -695,6 +713,11 @@ async fn list_artifacts(
 struct PresenceReq {
     #[serde(default)]
     channel: String,
+    /// Roles this peer is claiming, e.g. ["pentest"] or
+    /// ["integration","ops"]. Resolved server-side as a simple
+    /// last-write-wins per peer name.
+    #[serde(default)]
+    roles: Vec<String>,
 }
 
 async fn heartbeat(
@@ -704,7 +727,15 @@ async fn heartbeat(
 ) -> Result<StatusCode, (StatusCode, String)> {
     cap(&name, MAX_FROM_LEN, "name")?;
     cap(&req.channel, MAX_CHANNEL_LEN, "channel")?;
-    state.peers.insert(name, (now_secs(), req.channel));
+    // Cheap defense: bound the role list so a buggy/hostile heartbeat
+    // can't blow memory through repeated huge declarations.
+    let roles: Vec<String> = req
+        .roles
+        .into_iter()
+        .filter(|r| !r.is_empty() && r.len() <= 64)
+        .take(16)
+        .collect();
+    state.peers.insert(name, (now_secs(), req.channel, roles));
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -727,12 +758,13 @@ async fn list_peers(State(state): State<AppState>) -> Json<Vec<Peer>> {
         .peers
         .iter()
         .map(|kv| {
-            let (last_seen, channel) = kv.value().clone();
+            let (last_seen, channel, roles) = kv.value().clone();
             Peer {
                 name: kv.key().clone(),
                 last_seen,
                 idle_secs: now.saturating_sub(last_seen),
                 channel,
+                roles,
             }
         })
         .collect();

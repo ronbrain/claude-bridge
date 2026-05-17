@@ -16,9 +16,20 @@ struct Args {
     #[arg(long, default_value = "general")]
     channel: String,
 
-    /// Name shown to the other instance
+    /// Name shown to the other instance. When multiple Claude Code
+    /// sessions on the same host share `--name`, they're
+    /// indistinguishable to peers — recommend appending a short
+    /// per-session id (`paledo/9c4e1d`) so addressed messages can
+    /// reach exactly one instance.
     #[arg(long, default_value = "instance")]
     name: String,
+
+    /// Roles this instance claims (e.g. `pentest`, `integration`,
+    /// `ops`). Comma-separated. Sent on every heartbeat so other
+    /// peers can address `to: ["pentest"]` and have it resolve to
+    /// the live instance(s) claiming that role. Empty = no role.
+    #[arg(long, default_value = "")]
+    role: String,
 }
 
 #[derive(Deserialize)]
@@ -62,12 +73,13 @@ fn tools_list() -> Value {
         "tools": [
             {
                 "name": "send_message",
-                "description": "Send a message to the other Claude Code instance in real time. Use this to share findings, ask questions, or coordinate tasks. **Routing**: each channel has a declared `topic` describing what it's for — call `list_channels` first if unsure where a message belongs. The confirmation echoes the channel's current topic so you can catch misroutes immediately.",
+                "description": "Send a message to the other Claude Code instance in real time. Use this to share findings, ask questions, or coordinate tasks.\n\n**Routing**: each channel has a declared `topic` describing what it's for — call `list_channels` first if unsure where a message belongs. The confirmation echoes the channel's current topic so you can catch misroutes immediately.\n\n**Addressing (optional)**: pass `to` as a list of identity names (`paledo/9c4e1d`) and/or role aliases (`pentest`, `integration`). Roles resolve against the live `/peers` list — the message is delivered to every peer currently advertising that role. Leave `to` empty for a broadcast (every subscriber sees it). Use addressing when only one specific instance should act, even though other instances are subscribed to the channel.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "content": { "type": "string", "description": "Message to send" },
-                        "channel": { "type": "string", "description": "Channel (default: configured channel)" }
+                        "channel": { "type": "string", "description": "Channel (default: configured channel)" },
+                        "to":      { "type": "array",  "items": { "type": "string" }, "description": "Optional recipients — identity names and/or roles. Empty = broadcast." }
                     },
                     "required": ["content"]
                 }
@@ -216,10 +228,18 @@ fn tools_list() -> Value {
 fn spawn_heartbeat(args: Arc<Args>, client: reqwest::Client) -> tokio::task::AbortHandle {
     let h = tokio::spawn(async move {
         let url = format!("{}/presence/{}", args.server, args.name);
+        // Parse roles once. Empty `--role ""` produces an empty Vec,
+        // which the server treats as "no roles declared".
+        let roles: Vec<String> = args
+            .role
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         loop {
             let _ = client
                 .post(&url)
-                .json(&json!({ "channel": args.channel }))
+                .json(&json!({ "channel": args.channel, "roles": roles }))
                 .timeout(Duration::from_secs(5))
                 .send()
                 .await;
@@ -293,10 +313,32 @@ async fn main() {
                             .as_str()
                             .unwrap_or(&args.channel)
                             .to_string();
+                        let to_raw: Vec<String> = args_val["to"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        // Resolve roles to identity names by querying
+                        // /peers — every name that matches an entry's
+                        // `roles` is added. Bare identity names (those
+                        // that match a peer `name`) pass through. This
+                        // happens client-side so the server stays a
+                        // dumb relay.
+                        let resolved_to = resolve_recipients(
+                            &client, &args.server, &to_raw,
+                        )
+                        .await;
 
                         let res = client
                             .post(format!("{}/send/{}", args.server, channel))
-                            .json(&json!({ "from": args.name, "content": content }))
+                            .json(&json!({
+                                "from": args.name,
+                                "content": content,
+                                "to": resolved_to,
+                            }))
                             .send()
                             .await;
 
@@ -319,10 +361,15 @@ async fn main() {
                                         .unwrap_or_default(),
                                     Err(_) => String::new(),
                                 };
-                                let msg = if topic.is_empty() {
-                                    format!("[bridge] sent to '{channel}' ✓ (no topic declared — call set_channel_topic if this channel has a specific purpose)")
+                                let to_tag = if resolved_to.is_empty() {
+                                    " (broadcast)".to_string()
                                 } else {
-                                    format!("[bridge] sent to '{channel}' ✓ — topic: {topic}")
+                                    format!(" — to: {}", resolved_to.join(", "))
+                                };
+                                let msg = if topic.is_empty() {
+                                    format!("[bridge] sent to '{channel}'{to_tag} ✓ (no topic declared — call set_channel_topic if this channel has a specific purpose)")
+                                } else {
+                                    format!("[bridge] sent to '{channel}'{to_tag} ✓ — topic: {topic}")
                                 };
                                 text(id, msg)
                             }
@@ -445,11 +492,23 @@ async fn main() {
                                     let formatted = peers
                                         .iter()
                                         .map(|p| {
+                                            let roles: Vec<String> = p["roles"]
+                                                .as_array()
+                                                .map(|a| a.iter()
+                                                    .filter_map(|v| v.as_str().map(String::from))
+                                                    .collect())
+                                                .unwrap_or_default();
+                                            let role_tag = if roles.is_empty() {
+                                                String::new()
+                                            } else {
+                                                format!(" [roles: {}]", roles.join(","))
+                                            };
                                             format!(
-                                                "• {} — idle {}s on #{}",
+                                                "• {} — idle {}s on #{}{}",
                                                 p["name"].as_str().unwrap_or("?"),
                                                 p["idle_secs"].as_u64().unwrap_or(0),
-                                                p["channel"].as_str().unwrap_or("?")
+                                                p["channel"].as_str().unwrap_or("?"),
+                                                role_tag,
                                             )
                                         })
                                         .collect::<Vec<_>>()
@@ -726,6 +785,58 @@ async fn main() {
         let _ = writer.write_all(out.as_bytes()).await;
         let _ = writer.flush().await;
     }
+}
+
+/// Resolve a list of identity-or-role strings into concrete peer
+/// names. Anything that matches a peer's `roles` array contributes
+/// every matching peer's `name`; anything that matches a peer's
+/// `name` passes through unchanged; bare strings with no match are
+/// kept as-is (so an offline peer's identity stays addressable —
+/// the daemon writes the message to disk and the peer picks it up
+/// on reconnect). De-duplicated; order preserved by first
+/// appearance.
+async fn resolve_recipients(
+    client: &reqwest::Client,
+    server: &str,
+    raw: &[String],
+) -> Vec<String> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    // Single /peers fetch — no point hitting the server per token.
+    let peers: Vec<Value> = match client.get(format!("{server}/peers")).send().await {
+        Ok(r) => r.json().await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut push = |s: String, out: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
+        if seen.insert(s.clone()) {
+            out.push(s);
+        }
+    };
+    for token in raw {
+        let mut matched_role = false;
+        for p in &peers {
+            let roles: Vec<String> = p["roles"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            if roles.iter().any(|r| r == token) {
+                if let Some(name) = p["name"].as_str() {
+                    push(name.to_string(), &mut out, &mut seen);
+                    matched_role = true;
+                }
+            }
+        }
+        if !matched_role {
+            // Either a literal identity or an unknown token; either
+            // way pass it through verbatim so the addressee can match
+            // when they later come online.
+            push(token.clone(), &mut out, &mut seen);
+        }
+    }
+    out
 }
 
 /// Tiny standard-base64 decoder. We avoid the `base64` crate dep

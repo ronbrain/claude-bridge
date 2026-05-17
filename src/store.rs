@@ -49,10 +49,11 @@ impl Store {
     // ── Messages ────────────────────────────────────────────────────
 
     pub fn insert_message(&self, m: &Message) -> SqliteResult<()> {
+        let to_json = serde_json::to_string(&m.to).unwrap_or_else(|_| "[]".into());
         self.conn.lock().execute(
-            "INSERT OR REPLACE INTO messages (id, channel, from_, content, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![m.id, m.channel, m.from, m.content, m.timestamp as i64],
+            "INSERT OR REPLACE INTO messages (id, channel, from_, content, timestamp, to_)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![m.id, m.channel, m.from, m.content, m.timestamp as i64, to_json],
         )?;
         Ok(())
     }
@@ -84,19 +85,23 @@ impl Store {
         // honours HISTORY_LIMIT even if the DB has more rows from a
         // previous run with a higher cap.
         let mut stmt = conn.prepare(
-            "SELECT id, channel, from_, content, timestamp FROM (
+            "SELECT id, channel, from_, content, timestamp,
+                    COALESCE(to_, '[]') AS to_ FROM (
                 SELECT *, ROW_NUMBER() OVER (
                     PARTITION BY channel ORDER BY timestamp DESC
                 ) AS rn FROM messages
             ) WHERE rn <= ?1 ORDER BY channel, timestamp",
         )?;
         let rows = stmt.query_map(params![per_channel_cap as i64], |r| {
+            let to_json: String = r.get(5).unwrap_or_else(|_| "[]".into());
+            let to: Vec<String> = serde_json::from_str(&to_json).unwrap_or_default();
             Ok(Message {
                 id: r.get(0)?,
                 channel: r.get(1)?,
                 from: r.get(2)?,
                 content: r.get(3)?,
                 timestamp: r.get::<_, i64>(4)? as u64,
+                to,
             })
         })?;
         rows.collect()
@@ -274,6 +279,13 @@ impl Store {
 }
 
 fn init(conn: &Connection) -> SqliteResult<()> {
+    // Best-effort column add for existing DBs. Fails harmlessly on
+    // "duplicate column name" when run against a DB that already has
+    // the column; we ignore the error rather than gating on schema
+    // version, since adding nullable/defaulted columns is the only
+    // migration we've needed so far.
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN to_ TEXT NOT NULL DEFAULT '[]'", []);
+
     // `from_` not `from` because `FROM` is a SQL keyword and quoting
     // it across drivers is annoying.
     conn.execute_batch(
@@ -283,10 +295,14 @@ fn init(conn: &Connection) -> SqliteResult<()> {
             channel   TEXT NOT NULL,
             from_     TEXT NOT NULL,
             content   TEXT NOT NULL,
-            timestamp INTEGER NOT NULL
+            timestamp INTEGER NOT NULL,
+            to_       TEXT NOT NULL DEFAULT '[]'
         );
         CREATE INDEX IF NOT EXISTS messages_channel_ts
             ON messages (channel, timestamp);
+        -- Idempotent column add for DBs created before to_ existed.
+        -- SQLite ALTER ADD COLUMN is a no-op on existing column;
+        -- the error from a second run is swallowed at the batch level.
 
         CREATE TABLE IF NOT EXISTS findings (
             id         TEXT PRIMARY KEY,
