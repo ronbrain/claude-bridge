@@ -36,9 +36,13 @@ if [[ -n "$claude_pid" ]]; then
     && mv "${CACHE_DIR}/session-${claude_pid}.tmp" "${CACHE_DIR}/session-${claude_pid}"
 fi
 
-# Auto-role from `.bridge-role` in cwd (or any ancestor dir).
+# Auto-role from `.bridge-role` in cwd (or any ancestor dir). Only
+# applies when the role file for this session doesn't exist yet —
+# otherwise we'd clobber an explicit `bridge role <name>` the user
+# ran in a previous turn every time Claude Code resumes the session.
+# First run wins for auto; manual always wins thereafter.
 role_file="${CACHE_DIR}/roles/${sid}"
-if [[ -n "$cwd" && -d "$cwd" ]]; then
+if [[ ! -s "$role_file" && -n "$cwd" && -d "$cwd" ]]; then
   dir="$cwd"
   while [[ "$dir" != "/" && -n "$dir" ]]; do
     if [[ -f "$dir/.bridge-role" ]]; then
