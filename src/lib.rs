@@ -397,6 +397,32 @@ pub struct AuditEntry {
     pub result: String,
 }
 
+// ─── F26 — Background watcher (roadmap-v2) ─────────────────────────
+
+/// One row in `peer_watchers`. Tracks a bg `claude --bg` subprocess
+/// the bridge spawned to relay addressed messages to a peer whose
+/// own session may have stalled / hooks died. See finding
+/// `e2b0d77a` for the failure mode this closes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerWatcher {
+    pub peer: String,
+    pub channel: String,
+    pub pid: i32,
+    pub spawned_at: u64,
+    pub last_seen: u64,
+    pub ttl_secs: u64,
+    pub spawned_by: String,
+    /// `running` | `exited` | `crashed` | `quarantined`.
+    pub status: String,
+    /// Claude Code session id of the spawned bg session — used by
+    /// the boot re-adopt path to verify the live PID is actually
+    /// our subprocess (cmdline contains `--resume <session_id>`)
+    /// before issuing kill on PID reuse edge cases.
+    pub session_id: String,
+}
+
+pub const WATCHER_STATUSES: &[&str] = &["running", "exited", "crashed", "quarantined"];
+
 // ─── F17 — Smart routing rules (roadmap-v2) ────────────────────────
 
 /// Trigger types a routing rule may register against. String-typed

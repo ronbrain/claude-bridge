@@ -525,6 +525,105 @@ impl Store {
         Ok(n)
     }
 
+    // ── Peer watchers (F26) ────────────────────────────────────────
+
+    /// Insert a freshly-spawned watcher row. Replaces any prior row
+    /// for the same peer (last spawn wins) — the spawn handler is
+    /// expected to have already killed/cleaned any stale process
+    /// for that peer before calling here.
+    pub fn insert_peer_watcher(&self, w: &crate::PeerWatcher) -> SqliteResult<()> {
+        self.conn.lock().execute(
+            "INSERT OR REPLACE INTO peer_watchers
+             (peer, channel, pid, spawned_at, last_seen, ttl_secs,
+              spawned_by, status, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                w.peer,
+                w.channel,
+                w.pid as i64,
+                w.spawned_at as i64,
+                w.last_seen as i64,
+                w.ttl_secs as i64,
+                w.spawned_by,
+                w.status,
+                w.session_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_peer_watcher(&self, peer: &str) -> SqliteResult<Option<crate::PeerWatcher>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT peer, channel, pid, spawned_at, last_seen, ttl_secs,
+                    spawned_by, status, session_id
+             FROM peer_watchers WHERE peer = ?1",
+        )?;
+        let mut rows = stmt.query(params![peer])?;
+        if let Some(r) = rows.next()? {
+            Ok(Some(crate::PeerWatcher {
+                peer: r.get(0)?,
+                channel: r.get(1)?,
+                pid: r.get::<_, i64>(2)? as i32,
+                spawned_at: r.get::<_, i64>(3)? as u64,
+                last_seen: r.get::<_, i64>(4)? as u64,
+                ttl_secs: r.get::<_, i64>(5)? as u64,
+                spawned_by: r.get(6)?,
+                status: r.get(7)?,
+                session_id: r.get(8)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_peer_watchers(&self) -> SqliteResult<Vec<crate::PeerWatcher>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT peer, channel, pid, spawned_at, last_seen, ttl_secs,
+                    spawned_by, status, session_id
+             FROM peer_watchers ORDER BY spawned_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(crate::PeerWatcher {
+                peer: r.get(0)?,
+                channel: r.get(1)?,
+                pid: r.get::<_, i64>(2)? as i32,
+                spawned_at: r.get::<_, i64>(3)? as u64,
+                last_seen: r.get::<_, i64>(4)? as u64,
+                ttl_secs: r.get::<_, i64>(5)? as u64,
+                spawned_by: r.get(6)?,
+                status: r.get(7)?,
+                session_id: r.get(8)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn set_peer_watcher_status(&self, peer: &str, status: &str) -> SqliteResult<usize> {
+        let n = self.conn.lock().execute(
+            "UPDATE peer_watchers SET status = ?1 WHERE peer = ?2",
+            params![status, peer],
+        )?;
+        Ok(n)
+    }
+
+    pub fn touch_peer_watcher_last_seen(&self, peer: &str, now: u64) -> SqliteResult<usize> {
+        let n = self.conn.lock().execute(
+            "UPDATE peer_watchers SET last_seen = ?1 WHERE peer = ?2",
+            params![now as i64, peer],
+        )?;
+        Ok(n)
+    }
+
+    pub fn delete_peer_watcher(&self, peer: &str) -> SqliteResult<usize> {
+        let n = self.conn.lock().execute(
+            "DELETE FROM peer_watchers WHERE peer = ?1",
+            params![peer],
+        )?;
+        Ok(n)
+    }
+
     // ── Routing rules (F17) ─────────────────────────────────────────
 
     /// Insert a new routing rule. Filter + action_params should be
@@ -1521,6 +1620,35 @@ const MIGRATIONS: &[Migration] = &[
                 ON routing_rules (enabled, priority DESC, trigger_type);
         "#,
     },
+    Migration {
+        version: 12,
+        name: "v12_peer_watchers",
+        // F26 — Background watcher per-peer state. Server-side
+        // spawn record: PID + spawned_at + status + TTL. The
+        // bridge tokio task hosts the child process; this table
+        // is the durable handle so a bridge restart can re-adopt
+        // running children (detached process_group means they
+        // survive the bridge crash/restart).
+        //
+        // `spawned_by` matches the auth bundle's `created_by`
+        // ownership pattern — only the spawner or BRIDGE_MEMORY_ADMINS
+        // can stop the watcher.
+        up: r#"
+            CREATE TABLE IF NOT EXISTS peer_watchers (
+                peer        TEXT PRIMARY KEY,
+                channel     TEXT NOT NULL,
+                pid         INTEGER NOT NULL,
+                spawned_at  INTEGER NOT NULL,
+                last_seen   INTEGER NOT NULL,
+                ttl_secs    INTEGER NOT NULL DEFAULT 3600,
+                spawned_by  TEXT NOT NULL DEFAULT '',
+                status      TEXT NOT NULL DEFAULT 'running',
+                session_id  TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS peer_watchers_status
+                ON peer_watchers (status);
+        "#,
+    },
 ];
 
 /// Best-effort column adds for pre-runner DBs. `CREATE TABLE IF
@@ -2013,6 +2141,48 @@ mod tests {
         // Two rows had non-empty owners and get rewritten; the
         // empty one was already ownerless.
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn peer_watcher_crud_round_trips() {
+        let s = temp_store();
+        let now = crate::now_secs();
+        let w = crate::PeerWatcher {
+            peer: "alice".into(),
+            channel: "general".into(),
+            pid: 4242,
+            spawned_at: now,
+            last_seen: now,
+            ttl_secs: 3600,
+            spawned_by: "ops".into(),
+            status: "running".into(),
+            session_id: "sess-abc".into(),
+        };
+        s.insert_peer_watcher(&w).unwrap();
+        let got = s.get_peer_watcher("alice").unwrap().expect("present");
+        assert_eq!(got.pid, 4242);
+        assert_eq!(got.spawned_by, "ops");
+        assert_eq!(got.session_id, "sess-abc");
+        // touch_last_seen advances the column.
+        let later = now + 100;
+        let n = s.touch_peer_watcher_last_seen("alice", later).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(s.get_peer_watcher("alice").unwrap().unwrap().last_seen, later);
+        // Status flip works for the crash path.
+        s.set_peer_watcher_status("alice", "crashed").unwrap();
+        assert_eq!(s.get_peer_watcher("alice").unwrap().unwrap().status, "crashed");
+        // Re-insert replaces (last spawn wins).
+        let mut w2 = w.clone();
+        w2.pid = 9999;
+        w2.status = "running".into();
+        s.insert_peer_watcher(&w2).unwrap();
+        assert_eq!(s.get_peer_watcher("alice").unwrap().unwrap().pid, 9999);
+        assert_eq!(s.get_peer_watcher("alice").unwrap().unwrap().status, "running");
+        // list returns 1.
+        assert_eq!(s.list_peer_watchers().unwrap().len(), 1);
+        // Delete.
+        s.delete_peer_watcher("alice").unwrap();
+        assert!(s.get_peer_watcher("alice").unwrap().is_none());
     }
 
     #[test]

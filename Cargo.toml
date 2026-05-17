@@ -51,6 +51,10 @@ sha2 = "0.10"
 # trait fn async in a `dyn Scanner` requires async_trait until the
 # stable RPITIT path lands for dyn-compatible traits.
 async-trait = "0.1"
+# libc::setsid + libc::kill for the F26 watcher subprocess
+# spawn (detach process group + targeted SIGKILL on stop). Unix-
+# only; the bridge is already Linux-only via systemd unit shape.
+libc = "0.2"
 # Constant-time bytes comparison for the auth-token registry. We
 # never compare hashes with `==` because a timing oracle would let
 # an attacker recover the live token byte-by-byte (per finding

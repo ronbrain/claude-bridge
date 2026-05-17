@@ -2471,6 +2471,346 @@ async fn metrics_prometheus(State(state): State<AppState>) -> impl IntoResponse 
     )
 }
 
+// ── Peer watchers (F26) ─────────────────────────────────────────────
+
+/// Env vars to STRIP from any child `claude --bg` process before
+/// spawn. Per Q4 ops 1779052962 + 0f4543 add-on 1779053200: defense
+/// in depth against env-based code injection into the spawned
+/// subprocess. Removes the entire LD_* / DYLD_* family plus the
+/// runtime-loader hooks (`PYTHONPATH`, `NODE_OPTIONS`, etc.).
+const STRIPPED_CHILD_ENV: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "LD_DEBUG",
+    "LD_BIND_NOW",
+    "LD_BIND_NOT",
+    "LD_TRACE_LOADED_OBJECTS",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_FALLBACK_FRAMEWORK_PATH",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "RUBYOPT",
+    "RUBYLIB",
+];
+
+#[derive(Deserialize)]
+struct WatcherSpawnReq {
+    peer: String,
+    #[serde(default = "default_watcher_ttl")]
+    ttl_secs: u64,
+}
+
+fn default_watcher_ttl() -> u64 {
+    3600
+}
+
+const MAX_WATCHER_PEER_LEN: usize = 64;
+const WATCHER_TTL_MIN: u64 = 60;
+const WATCHER_TTL_MAX: u64 = 24 * 3600;
+
+/// `POST /watchers` — spawn a background watcher for `peer`. Gated
+/// to memory-admin identities per Q2 ops 1779052962 (privileged
+/// operation). Body: `{peer, ttl_secs?}`. Returns the new row.
+async fn watcher_spawn(
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
+    State(state): State<AppState>,
+    Json(req): Json<WatcherSpawnReq>,
+) -> Result<Json<claude_bridge::PeerWatcher>, (StatusCode, String)> {
+    let actor = effective_actor(&headers, ext.as_deref());
+    let is_admin = auth_ext
+        .as_deref()
+        .map(|a| a.is_memory_admin(&actor))
+        .unwrap_or(false);
+    if !is_admin {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "watcher_spawn requires BRIDGE_MEMORY_ADMINS membership; \
+                 '{actor}' is not on the allowlist."
+            ),
+        ));
+    }
+    cap!(req.peer, MAX_WATCHER_PEER_LEN, "peer");
+    if !(WATCHER_TTL_MIN..=WATCHER_TTL_MAX).contains(&req.ttl_secs) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "ttl_secs must be in {}..={}",
+                WATCHER_TTL_MIN, WATCHER_TTL_MAX
+            ),
+        ));
+    }
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "persistence disabled; watchers require BRIDGE_DB_PATH".into(),
+    ))?;
+    // Stop any prior watcher for the same peer before spawning a
+    // fresh one — keeps the table at ≤1 row per peer (PRIMARY KEY)
+    // and avoids leaking the prior subprocess.
+    if let Ok(Some(prior)) = store.get_peer_watcher(&req.peer) {
+        if prior.status == "running" {
+            let _ = kill_watcher_pid_if_ours(prior.pid, &prior.session_id);
+        }
+    }
+    let now = now_secs();
+    let session_id = Uuid::new_v4().to_string();
+    let pid = match spawn_watcher_subprocess(&req.peer, &session_id) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("spawn failed: {e}"),
+            ));
+        }
+    };
+    let watcher = claude_bridge::PeerWatcher {
+        peer: req.peer.clone(),
+        channel: "general".into(), // future: configurable per spawn
+        pid,
+        spawned_at: now,
+        last_seen: now,
+        ttl_secs: req.ttl_secs,
+        spawned_by: actor.clone(),
+        status: "running".into(),
+        session_id,
+    };
+    store.insert_peer_watcher(&watcher).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("persist watcher failed: {e}"),
+        )
+    })?;
+    write_audit(
+        store,
+        &actor,
+        "spawn",
+        "peer_watcher",
+        &watcher.peer,
+        None::<&claude_bridge::PeerWatcher>,
+        Some(&watcher),
+    );
+    Ok(Json(watcher))
+}
+
+async fn watcher_list(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<claude_bridge::PeerWatcher>>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "persistence disabled".into(),
+    ))?;
+    let rows = store
+        .list_peer_watchers()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list failed: {e}")))?;
+    Ok(Json(rows))
+}
+
+async fn watcher_stop(
+    Path(peer): Path<String>,
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let actor = effective_actor(&headers, ext.as_deref());
+    let is_admin = auth_ext
+        .as_deref()
+        .map(|a| a.is_memory_admin(&actor))
+        .unwrap_or(false);
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "persistence disabled".into(),
+    ))?;
+    let row = store
+        .get_peer_watcher(&peer)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read failed: {e}")))?
+        .ok_or((StatusCode::NOT_FOUND, format!("watcher for peer '{peer}' not found")))?;
+    // Ownership: spawner or memory-admin can stop.
+    if !is_admin && row.spawned_by != actor {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "watcher for '{peer}' spawned by '{}'; '{actor}' cannot stop without admin bypass.",
+                row.spawned_by
+            ),
+        ));
+    }
+    let _ = kill_watcher_pid_if_ours(row.pid, &row.session_id);
+    store
+        .set_peer_watcher_status(&peer, "exited")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("status flip failed: {e}")))?;
+    write_audit(
+        store,
+        &actor,
+        "stop",
+        "peer_watcher",
+        &peer,
+        Some(&row),
+        None::<&claude_bridge::PeerWatcher>,
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /watchers/{peer}/heartbeat` — the bg watcher session
+/// itself calls this every loop iteration so the bridge knows it's
+/// alive. Unauthenticated read of the path; the BEARER token in
+/// the request must be the watcher's own, and the watcher's
+/// identity (from auth bundle) must match `<peer>-watcher`.
+async fn watcher_heartbeat(
+    Path(peer): Path<String>,
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let actor = effective_actor(&headers, ext.as_deref());
+    // The heartbeat caller MUST be the watcher's own identity —
+    // `<peer>-watcher` per the spawn-suffix convention. Refuse
+    // foreign callers so a compromised peer can't keep a stale
+    // watcher row alive on someone else's behalf.
+    let expected = format!("{peer}-watcher");
+    if actor != expected {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "heartbeat for '{peer}' must come from identity '{expected}'; \
+                 caller is '{actor}'."
+            ),
+        ));
+    }
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "persistence disabled".into(),
+    ))?;
+    let n = store
+        .touch_peer_watcher_last_seen(&peer, now_secs())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("touch failed: {e}"),
+            )
+        })?;
+    if n == 0 {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no watcher row for peer '{peer}'"),
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Spawn a `claude --bg --resume <session_id>` subprocess detached
+/// from the bridge's process group (so a bridge crash doesn't take
+/// the watcher down). Strips `STRIPPED_CHILD_ENV` from the inherited
+/// env. Sets working dir to `~/.cache/bridge/watchers/<peer>/`
+/// (created if absent). Returns the spawned PID.
+fn spawn_watcher_subprocess(peer: &str, session_id: &str) -> std::io::Result<i32> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let workdir = format!("{home}/.cache/bridge/watchers/{peer}");
+    std::fs::create_dir_all(&workdir)?;
+    let mut cmd = Command::new("claude");
+    cmd.arg("--bg")
+        .arg("--resume")
+        .arg(session_id)
+        .current_dir(&workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: setsid(2) detaches the child from the bridge's
+    // process group so the bridge dying doesn't take it down.
+    // Pre-exec runs after fork in the child only; no shared mutable
+    // state with the parent.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    // Strip dangerous env vars defensively.
+    for v in STRIPPED_CHILD_ENV {
+        cmd.env_remove(v);
+    }
+    let child = cmd.spawn()?;
+    Ok(child.id() as i32)
+}
+
+/// Send SIGKILL to `pid` ONLY if /proc/<pid>/cmdline confirms it's
+/// our `claude --bg --resume <session_id>` subprocess. Closes the
+/// wrong-PID edge case operator flagged on Q3 (msg 1779052962):
+/// without the cmdline match, a PID reassigned between bridge
+/// crash + boot could be mistakenly killed by the re-adopt path.
+fn kill_watcher_pid_if_ours(pid: i32, session_id: &str) -> std::io::Result<bool> {
+    if pid <= 1 {
+        return Ok(false);
+    }
+    let cmdline_path = format!("/proc/{pid}/cmdline");
+    let cmdline = match std::fs::read(&cmdline_path) {
+        Ok(b) => b,
+        Err(_) => return Ok(false), // PID gone or proc inaccessible
+    };
+    // /proc cmdline is NUL-separated. Stringify for the contains check.
+    let cmdline_str = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+    if !cmdline_str.contains(session_id) {
+        tracing::warn!(
+            pid,
+            session_id,
+            cmdline = %cmdline_str.trim(),
+            "watcher pid reassigned to a foreign process; skipping kill"
+        );
+        return Ok(false);
+    }
+    // SAFETY: libc::kill is FFI; pid > 1 verified above.
+    let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(true)
+}
+
+/// Boot-time re-adopt: walk `peer_watchers WHERE status='running'`,
+/// verify each PID's cmdline matches our spawn (via session_id),
+/// flip mismatched/dead rows to `status='crashed'`. Per Q3 +
+/// 0f4543 1779053200 — paranoid pid-reuse guard built in.
+fn reconcile_watchers_on_boot(store: &Store) {
+    let rows = match store.list_peer_watchers() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "watcher reconcile read failed");
+            return;
+        }
+    };
+    for row in rows {
+        if row.status != "running" {
+            continue;
+        }
+        let cmdline_path = format!("/proc/{}/cmdline", row.pid);
+        let alive = std::fs::read(&cmdline_path)
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).replace('\0', " "))
+            .filter(|s| s.contains(&row.session_id))
+            .is_some();
+        if !alive {
+            tracing::info!(
+                peer = %row.peer,
+                pid = row.pid,
+                "watcher row marked running but PID is gone or reassigned; flipping to crashed"
+            );
+            if let Err(e) = store.set_peer_watcher_status(&row.peer, "crashed") {
+                tracing::warn!(peer = %row.peer, error = %e, "reconcile status flip failed");
+            }
+        }
+    }
+}
+
 // ── Routing rules (F17) ─────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -2965,6 +3305,14 @@ async fn main() {
     let state = AppState::new_with_routing(store.clone(), routing_max_depth);
     state.rehydrate();
 
+    // F26 boot reconcile — flip stale `running` watcher rows whose
+    // PID is gone or reassigned to a foreign process. Runs before
+    // any spawn attempts so a `watcher_spawn` racing with reconcile
+    // can't double-spawn against a stale row.
+    if let Some(store_ref) = &store {
+        reconcile_watchers_on_boot(store_ref);
+    }
+
     // Background automation loop. Shared 60s base tick per ops
     // dispatch 1779031875 — every additional scanner pushes into
     // `registry` instead of starting its own interval. Heartbeat
@@ -3194,6 +3542,12 @@ async fn main() {
         .route("/routing-rules", post(create_routing_rule).get(list_routing_rules))
         .route("/routing-rules/{id}", patch(update_routing_rule).delete(delete_routing_rule))
         .route("/routing-rules/eval", post(eval_routing))
+        // F26 watcher control plane. POST gated on is_memory_admin,
+        // DELETE on spawner-OR-admin. Heartbeat path checks the
+        // caller's identity matches `<peer>-watcher` suffix.
+        .route("/watchers", post(watcher_spawn).get(watcher_list))
+        .route("/watchers/{peer}", delete(watcher_stop))
+        .route("/watchers/{peer}/heartbeat", post(watcher_heartbeat))
         // Observability — authed per finding `cc3c33d6` (was world-
         // readable; identity is now needed for per-(requester,
         // target) rate-limit bucket on /resume).

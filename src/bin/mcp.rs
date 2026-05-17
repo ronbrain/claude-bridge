@@ -455,6 +455,32 @@ fn tools_list() -> Value {
                 }
             },
             {
+                "name": "watcher_spawn",
+                "description": "Spawn a background watcher (`claude --bg`) for `peer`. The watcher relays addressed messages to the peer when the peer's own session hooks die or hang (closes finding e2b0d77a). Gated to BRIDGE_MEMORY_ADMINS identities — spawning subprocesses on the bridge host is privileged. `ttl_secs` clamps how long the watcher runs before self-exiting (default 3600, range 60..=86400).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "peer":     { "type": "string", "description": "Identity name to watch — the spawned subprocess gets identity `<peer>-watcher` per the suffix convention" },
+                        "ttl_secs": { "type": "number", "description": "Seconds until watcher self-exits (default 3600)" }
+                    },
+                    "required": ["peer"]
+                }
+            },
+            {
+                "name": "watcher_list",
+                "description": "List every peer watcher with its current PID, spawned_at, last_seen, status (`running`/`exited`/`crashed`/`quarantined`), and TTL. Useful for verifying the bridge's view matches OS process state after a restart or reconcile.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "watcher_stop",
+                "description": "Stop a peer watcher — SIGKILLs the subprocess (with cmdline-match guard so PID reassignment can't hit a foreign process) and flips the row to `status='exited'`. Caller must be the spawner OR on BRIDGE_MEMORY_ADMINS allowlist.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "peer": { "type": "string" } },
+                    "required": ["peer"]
+                }
+            },
+            {
                 "name": "routing_eval",
                 "description": "Dry-run a synthetic trigger context against enabled rules; returns the actions that WOULD fire without actually firing them. Useful when authoring a rule to verify the filter shape against a real payload before turning it on.",
                 "inputSchema": {
@@ -1769,6 +1795,63 @@ async fn main() {
                         }
                     }
 
+                    "watcher_spawn" => {
+                        let res = client
+                            .post(format!("{}/watchers", args.server))
+                            .json(&args_val)
+                            .send()
+                            .await;
+                        match res {
+                            Ok(r) if r.status().is_success() => {
+                                let body = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] watcher spawned:\n{body}"))
+                            }
+                            Ok(r) => {
+                                let s = r.status();
+                                let b = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] ERROR {s}: {b}"))
+                            }
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+
+                    "watcher_list" => {
+                        let res = client
+                            .get(format!("{}/watchers", args.server))
+                            .send()
+                            .await;
+                        match res {
+                            Ok(r) if r.status().is_success() => {
+                                let body = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] watchers:\n{body}"))
+                            }
+                            Ok(r) => text(id, format!("[bridge] ERROR {}", r.status())),
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+
+                    "watcher_stop" => {
+                        let peer = args_val["peer"].as_str().unwrap_or("").to_string();
+                        if peer.is_empty() {
+                            text(id, "[bridge] ERROR: peer required")
+                        } else {
+                            let res = client
+                                .delete(format!("{}/watchers/{}", args.server, encode_path_segment(&peer)))
+                                .send()
+                                .await;
+                            match res {
+                                Ok(r) if r.status().is_success() =>
+                                    text(id, format!("[bridge] watcher for '{peer}' stopped")),
+                                Ok(r) => {
+                                    let s = r.status();
+                                    let b = r.text().await.unwrap_or_default();
+                                    text(id, format!("[bridge] ERROR {s}: {b}"))
+                                }
+                                _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                            }
+                        }
+                    }
+
                     "routing_eval" => {
                         let res = client
                             .post(format!("{}/routing-rules/eval", args.server))
@@ -1973,6 +2056,10 @@ mod tests {
             "routing_rule_list",
             "routing_rule_toggle",
             "routing_eval",
+            // F26 watcher additions:
+            "watcher_spawn",
+            "watcher_list",
+            "watcher_stop",
         ];
         let expected: std::collections::BTreeSet<String> =
             EXPECTED_TOOL_NAMES.iter().map(|s| s.to_string()).collect();

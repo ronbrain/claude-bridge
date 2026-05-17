@@ -86,6 +86,19 @@ impl AuthIdentity {
     pub fn is_authenticated(&self) -> bool {
         matches!(self, AuthIdentity::Peer(_))
     }
+
+    /// F26 Q-bonus (ops 1779052962): identity is recognised as a
+    /// bg watcher when its name ends with the `-watcher` suffix the
+    /// spawner uses. `effective_actor()` callers can opt to apply
+    /// extra restrictions on watcher identities (e.g. refuse
+    /// memory_set writes by watchers) without enforcing v1 — the
+    /// flag is exposed for future tightening, not consumed today.
+    pub fn is_watcher(&self) -> bool {
+        match self {
+            AuthIdentity::Peer(s) => s.ends_with("-watcher"),
+            AuthIdentity::Anonymous => false,
+        }
+    }
 }
 
 /// Shared, immutable registry of `sha256(bearer) -> identity`.
@@ -463,6 +476,21 @@ mod tests {
         assert_eq!(anon.as_actor(), "anonymous");
         assert!(peer.is_authenticated());
         assert!(!anon.is_authenticated());
+    }
+
+    #[test]
+    fn identity_watcher_flag_recognises_suffix() {
+        // F26 Q-bonus: `<peer>-watcher` suffix = bridge-spawned bg
+        // watcher identity. Used by handlers that want to apply
+        // stricter restrictions on watcher-authored writes (not
+        // enforced v1 — exposed for forward investment).
+        assert!(AuthIdentity::Peer("alice-watcher".into()).is_watcher());
+        assert!(AuthIdentity::Peer("ops-watcher".into()).is_watcher());
+        // Non-suffix names + anonymous are NOT watchers.
+        assert!(!AuthIdentity::Peer("alice".into()).is_watcher());
+        assert!(!AuthIdentity::Peer("watcher-alice".into()).is_watcher());
+        assert!(!AuthIdentity::Peer("watcher".into()).is_watcher());
+        assert!(!AuthIdentity::Anonymous.is_watcher());
     }
 
     #[test]
