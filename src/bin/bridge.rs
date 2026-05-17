@@ -125,37 +125,6 @@ struct Cfg {
     name: String,
 }
 
-/// Walk up the PPID chain looking for ~/.cache/bridge/session-${pid}
-/// (left by the SessionStart hook). Returns the session_id from the
-/// first hit. Used by `bridge role` so the CLI knows which session
-/// it belongs to when invoked from inside Claude Code.
-fn resolve_session_id(cache_dir: &str) -> Option<String> {
-    let mut pid = std::os::unix::process::parent_id();
-    for _ in 0..6 {
-        let path = format!("{cache_dir}/session-{pid}");
-        if let Ok(s) = std::fs::read_to_string(&path) {
-            let s = s.trim();
-            if !s.is_empty() {
-                return Some(s.to_string());
-            }
-        }
-        // Walk up one level.
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        // /proc/<pid>/stat field 4 is PPID, but the executable name in
-        // field 2 can contain spaces/parens, so anchor at the last ')'.
-        let after = stat.rsplit_once(')').map(|(_, rest)| rest)?.trim();
-        let parts: Vec<&str> = after.split_whitespace().collect();
-        if parts.len() < 2 {
-            return None;
-        }
-        pid = parts[1].parse().ok()?;
-        if pid <= 1 {
-            return None;
-        }
-    }
-    None
-}
-
 fn cfg(cli: &Cli) -> Cfg {
     Cfg {
         server: cli
@@ -187,15 +156,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.cmd {
         Cmd::Role { name } => {
-            // No network — this is a local-only registry op. Look up
-            // session_id via the same PPID walk the hooks use, then
-            // read or write ~/.cache/bridge/roles/<sid>.
+            // No network — this is a local-only registry op. Reads
+            // $CLAUDE_CODE_SESSION_ID directly (Claude Code sets it
+            // in every child process's env), so no PPID walk is
+            // needed and `bridge role` works from any subshell
+            // launched inside a session.
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
             let cache_dir = std::env::var("BRIDGE_CACHE_DIR")
                 .unwrap_or_else(|_| format!("{home}/.cache/bridge"));
-            let sid = resolve_session_id(&cache_dir);
-            let Some(sid) = sid else {
-                eprintln!("error: no session_id for current PPID chain — is the SessionStart hook installed?");
+            let sid = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
+            let Some(sid) = sid.filter(|s| !s.is_empty()) else {
+                eprintln!("error: CLAUDE_CODE_SESSION_ID not set — run this from inside a Claude Code session, or export the var manually.");
                 std::process::exit(2);
             };
             let role_file = format!("{cache_dir}/roles/{sid}");

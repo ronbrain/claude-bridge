@@ -252,6 +252,8 @@ fn spawn_heartbeat(args: Arc<Args>, client: reqwest::Client) -> tokio::task::Abo
 /// `--name` is left at the default. Mirrors what bridge-identity.sh
 /// does for the shell-side hooks so MCP, watcher, and drain all
 /// agree on the same identity for the same Claude Code session.
+/// Reads `$CLAUDE_CODE_SESSION_ID` — Claude Code propagates it to
+/// every child process, so no PPID dance is needed.
 fn derive_name() -> String {
     let host = std::process::Command::new("hostname")
         .arg("-s")
@@ -261,10 +263,7 @@ fn derive_name() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "instance".into());
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let cache_dir =
-        std::env::var("BRIDGE_CACHE_DIR").unwrap_or_else(|_| format!("{home}/.cache/bridge"));
-    if let Some(sid) = resolve_session_id(&cache_dir) {
+    if let Ok(sid) = std::env::var("CLAUDE_CODE_SESSION_ID") {
         let short: String = sid.chars().filter(|c| c.is_ascii_hexdigit()).take(6).collect();
         if !short.is_empty() {
             return format!("{host}/{short}");
@@ -276,10 +275,8 @@ fn derive_name() -> String {
 /// Roles resolution precedence (highest first):
 ///   1. `--role` flag explicitly set.
 ///   2. `$BRIDGE_ROLE` env var.
-///   3. `~/.cache/bridge/roles/<session_id>`, where session_id is
-///      discovered by walking the PPID chain back to the Claude
-///      Code process (matches what bridge-identity.sh does for the
-///      identity string).
+///   3. `~/.cache/bridge/roles/<CLAUDE_CODE_SESSION_ID>` — the file
+///      the `bridge role` CLI and the SessionStart hook write.
 fn resolve_roles(flag: &str) -> Vec<String> {
     let split_csv = |s: &str| -> Vec<String> {
         s.split(',')
@@ -295,45 +292,16 @@ fn resolve_roles(flag: &str) -> Vec<String> {
             return split_csv(&env);
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let cache_dir =
-        std::env::var("BRIDGE_CACHE_DIR").unwrap_or_else(|_| format!("{home}/.cache/bridge"));
-    if let Some(sid) = resolve_session_id(&cache_dir) {
+    if let Ok(sid) = std::env::var("CLAUDE_CODE_SESSION_ID") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let cache_dir = std::env::var("BRIDGE_CACHE_DIR")
+            .unwrap_or_else(|_| format!("{home}/.cache/bridge"));
         let role_file = format!("{cache_dir}/roles/{sid}");
         if let Ok(s) = std::fs::read_to_string(&role_file) {
             return split_csv(&s);
         }
     }
     Vec::new()
-}
-
-/// Walk up the PPID chain looking for `~/.cache/bridge/session-${pid}`
-/// (left by the SessionStart hook). Returns the session_id from the
-/// first hit. Matches the lookup the CLI subcommand `bridge role`
-/// and the shell helpers use, so all three agree on the same
-/// session_id for the running Claude Code instance.
-fn resolve_session_id(cache_dir: &str) -> Option<String> {
-    let mut pid = std::os::unix::process::parent_id();
-    for _ in 0..6 {
-        let path = format!("{cache_dir}/session-{pid}");
-        if let Ok(s) = std::fs::read_to_string(&path) {
-            let s = s.trim();
-            if !s.is_empty() {
-                return Some(s.to_string());
-            }
-        }
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        let after = stat.rsplit_once(')').map(|(_, rest)| rest)?.trim();
-        let parts: Vec<&str> = after.split_whitespace().collect();
-        if parts.len() < 2 {
-            return None;
-        }
-        pid = parts[1].parse().ok()?;
-        if pid <= 1 {
-            return None;
-        }
-    }
-    None
 }
 
 #[tokio::main]

@@ -21,12 +21,13 @@ OFFSET_DIR="${BRIDGE_OFFSET_DIR:-$HOME/.cache/bridge/offsets}"
 SELF_NAME="$(~/.claude/hooks/bridge-identity.sh 2>/dev/null || hostname -s)"
 SELF_ROLES="$(~/.claude/hooks/bridge-role.sh 2>/dev/null || echo)"
 
-# The hook receives a JSON payload on stdin including the session_id
-# Claude Code assigns to this instance. We key the offset on that so
-# each instance has its own cursor. Fall back to PPID when there's no
-# session_id (e.g. someone invokes the hook by hand to test).
+# Per-session offset key. CLAUDE_CODE_SESSION_ID is in our env (set
+# by Claude Code on every child process); the hook input also
+# carries .session_id which is identical. Fall back to PPID only
+# for hand-invocation outside a real session.
 hook_input="$(cat 2>/dev/null || true)"
-sid="$(printf '%s' "$hook_input" | jq -r '.session_id // empty' 2>/dev/null)"
+sid="${CLAUDE_CODE_SESSION_ID:-}"
+[[ -z "$sid" ]] && sid="$(printf '%s' "$hook_input" | jq -r '.session_id // empty' 2>/dev/null)"
 [[ -z "$sid" ]] && sid="anon-${PPID:-$$}"
 # Defensive: strip anything that could traverse out of OFFSET_DIR — a
 # malformed or forged session_id with slashes would be path traversal.
