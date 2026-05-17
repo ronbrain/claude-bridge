@@ -230,12 +230,18 @@ fn tools_list() -> Value {
 /// running until the OS reaps us.
 fn spawn_heartbeat(args: Arc<Args>, client: reqwest::Client) -> tokio::task::AbortHandle {
     let h = tokio::spawn(async move {
-        let url = format!("{}/presence/{}", args.server, args.name);
         loop {
-            // Re-resolve roles every heartbeat so a user running
-            // `bridge role <name>` from inside the session takes
-            // effect within 20s — no MCP restart needed.
+            // Re-resolve BOTH name and roles on every heartbeat.
+            // SessionStart may write the rendezvous file after the
+            // MCP child has started (race: Claude Code spawns MCP
+            // and SessionStart in parallel with no ordering
+            // guarantee). Re-deriving each tick means the first
+            // heartbeat after SessionStart wins, and the peer entry
+            // corrects itself within 20s instead of staying stuck
+            // on `hostname` until the next MCP restart.
+            let name = current_name(&args.name);
             let roles = resolve_roles(&args.role);
+            let url = format!("{}/presence/{}", args.server, name);
             let _ = client
                 .post(&url)
                 .json(&json!({ "channel": args.channel, "roles": roles }))
@@ -246,6 +252,17 @@ fn spawn_heartbeat(args: Arc<Args>, client: reqwest::Client) -> tokio::task::Abo
         }
     });
     h.abort_handle()
+}
+
+/// Resolve the name to use right now. Explicit `--name foo` wins;
+/// otherwise derive `<host>/<short-sid>` (or hostname fallback).
+/// Called per-heartbeat and per-send so a delayed SessionStart
+/// auto-corrects the peer identity within one tick.
+fn current_name(flag: &str) -> String {
+    if flag != "auto" && flag != "instance" && !flag.is_empty() {
+        return flag.to_string();
+    }
+    derive_name()
 }
 
 /// Build the auto-derived `<host>/<short-session-id>` name used when
@@ -391,13 +408,7 @@ fn resolve_roles(flag: &str) -> Vec<String> {
 
 #[tokio::main]
 async fn main() {
-    let mut parsed = Args::parse();
-    // Auto-derive name when the user didn't override. Falls back to
-    // hostname when SessionStart hasn't run yet — better than
-    // collisions on a shared default.
-    if parsed.name == "auto" || parsed.name == "instance" {
-        parsed.name = derive_name();
-    }
+    let parsed = Args::parse();
     let args = Arc::new(parsed);
     let client = reqwest::Client::new();
 
@@ -482,7 +493,7 @@ async fn main() {
                         let res = client
                             .post(format!("{}/send/{}", args.server, channel))
                             .json(&json!({
-                                "from": args.name,
+                                "from": current_name(&args.name),
                                 "content": content,
                                 "to": resolved_to,
                             }))
@@ -564,7 +575,7 @@ async fn main() {
                         } else {
                             let res = client
                                 .put(format!("{}/channels/{}/topic", args.server, channel))
-                                .json(&json!({ "from": args.name, "topic": topic }))
+                                .json(&json!({ "from": current_name(&args.name), "topic": topic }))
                                 .send()
                                 .await;
                             match res {
@@ -687,7 +698,7 @@ async fn main() {
 
                         let _ = client
                             .post(format!("{}/send/{}", args.server, channel))
-                            .json(&json!({ "from": args.name, "content": content }))
+                            .json(&json!({ "from": current_name(&args.name), "content": content }))
                             .send()
                             .await;
 
@@ -707,7 +718,7 @@ async fn main() {
                         let res = client
                             .post(format!("{}/findings/{}", args.server, channel))
                             .json(&json!({
-                                "from": args.name,
+                                "from": current_name(&args.name),
                                 "severity": severity,
                                 "title": title,
                                 "detail": detail,
@@ -729,7 +740,7 @@ async fn main() {
                                 );
                                 let _ = client
                                     .post(format!("{}/send/{}", args.server, channel))
-                                    .json(&json!({ "from": args.name, "content": ping }))
+                                    .json(&json!({ "from": current_name(&args.name), "content": ping }))
                                     .send()
                                     .await;
                                 text(id, format!("[bridge] finding reported (id {})", fid))
@@ -868,7 +879,7 @@ async fn main() {
                         let res = client
                             .post(format!("{}/artifacts/{}", args.server, channel))
                             .header("content-type", &mime)
-                            .header("x-bridge-from", &args.name)
+                            .header("x-bridge-from", current_name(&args.name))
                             .header("x-bridge-filename", &filename)
                             .body(bytes)
                             .send()
@@ -886,7 +897,7 @@ async fn main() {
                                 );
                                 let _ = client
                                     .post(format!("{}/send/{}", args.server, channel))
-                                    .json(&json!({ "from": args.name, "content": ping }))
+                                    .json(&json!({ "from": current_name(&args.name), "content": ping }))
                                     .send()
                                     .await;
                                 text(
