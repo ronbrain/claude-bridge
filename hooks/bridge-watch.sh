@@ -11,7 +11,7 @@
 
 set -uo pipefail
 
-SERVER="${BRIDGE_SERVER:-http://localhost:3001}"
+SERVER="${BRIDGE_SERVER:-http://172.16.101.166:3001}"
 CHANNELS_RAW="${BRIDGE_CHANNEL:-general}"
 # Per-session identity (host/short-session-id). Falls back to plain
 # hostname if SessionStart never ran. Other peers address us with
@@ -79,9 +79,11 @@ watch_one() {
         # Addressing filter — if `to` is non-empty and doesn't include
         # us (by identity OR by one of our roles), this message is
         # for someone else; don't wake. Empty `to` = broadcast.
+        # $BRIDGE_DRAIN_ALL=1 bypasses the filter (ops firehose).
         local to_arr
         to_arr="$(printf '%s' "$payload" | jq -c '.to // []' 2>/dev/null)"
-        if [[ "$to_arr" != "[]" && -n "$to_arr" && "$to_arr" != "null" ]]; then
+        if [[ -z "${BRIDGE_DRAIN_ALL:-}" || "${BRIDGE_DRAIN_ALL}" == "0" ]] \
+            && [[ "$to_arr" != "[]" && -n "$to_arr" && "$to_arr" != "null" ]]; then
             local match
             match="$(SELF_NAME="$SELF" SELF_ROLES="$ROLES_RAW" \
                 jq -nr --argjson to "$to_arr" '

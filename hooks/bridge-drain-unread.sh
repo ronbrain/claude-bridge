@@ -25,6 +25,18 @@ TRACE_FILE="${BRIDGE_DRAIN_TRACE:-$HOME/.cache/bridge/drain.log}"
 SELF_NAME="$(~/.claude/hooks/bridge-identity.sh 2>/dev/null || hostname -s)"
 SELF_ROLES="$(~/.claude/hooks/bridge-role.sh 2>/dev/null || echo)"
 
+# Firehose mode: surface every peer message regardless of the
+# `to` addressing filter. Use for ops / observability roles that
+# need the full feed. Enabled by:
+#   - $BRIDGE_DRAIN_ALL in env (any non-empty value), or
+#   - touch ~/.cache/bridge/drain-all/<session_id>
+DRAIN_ALL=0
+if [[ -n "${BRIDGE_DRAIN_ALL:-}" ]]; then
+  DRAIN_ALL=1
+elif [[ -n "${CLAUDE_CODE_SESSION_ID:-}" && -f "${BRIDGE_CACHE_DIR:-$HOME/.cache/bridge}/drain-all/${CLAUDE_CODE_SESSION_ID}" ]]; then
+  DRAIN_ALL=1
+fi
+
 # Per-session offset key.
 hook_input="$(cat 2>/dev/null || true)"
 sid="${CLAUDE_CODE_SESSION_ID:-}"
@@ -70,14 +82,16 @@ if [[ ! -s "$LOG_FILE" ]]; then
   exit 0
 fi
 
-combined="$(SELF_NAME="$SELF_NAME" SELF_ROLES="$SELF_ROLES" \
+combined="$(SELF_NAME="$SELF_NAME" SELF_ROLES="$SELF_ROLES" DRAIN_ALL="$DRAIN_ALL" \
   jq -cn --argjson off "$offset" '
     ($ENV.SELF_ROLES // "") | split(",") | map(select(length>0)) as $roles
     | ($ENV.SELF_NAME // "") as $name
+    | (($ENV.DRAIN_ALL // "0") != "0") as $firehose
     | [inputs | select(.timestamp > $off)] as $all
     | [
         ($all | map(select(
-            ((.to // []) | length) == 0
+            $firehose
+            or ((.to // []) | length) == 0
             or ((.to // []) | index($name))
             or ((.to // []) | map(. as $t | $roles | index($t)) | any)
           ))),
