@@ -5,6 +5,7 @@ pub mod auth;
 pub mod automation;
 pub mod config;
 pub mod dashboard;
+pub mod embeddings;
 pub mod error;
 pub mod routing;
 pub mod store;

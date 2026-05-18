@@ -39,7 +39,7 @@ dashmap = "6"
 # Bundled sqlite — no system libsqlite3 needed at runtime, single
 # static binary. Used by the optional persistence layer (enabled
 # when BRIDGE_DB_PATH is set in the server's env).
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "load_extension"] }
 parking_lot = "0.12"
 thiserror = "1"
 # Audit-log content hashing. We only need a fixed-output one-way
@@ -68,3 +68,18 @@ subtle = "2"
 # explicitly so the middleware module's `from_fn` style is
 # stable across axum minor versions.
 tower = { version = "0.5", features = ["util"] }
+# F18 — semantic search. sqlite-vec is the vec0 vtab provider
+# (replaces unmaintained sqlite-vss). Always pulled because the
+# vec0 schema is created on every fresh DB — search still falls
+# back to FTS5 when no model is loaded.
+sqlite-vec = "=0.1.9"
+# F18 — fastembed pulls onnxruntime + downloads ~80MB model on
+# first use. Gated behind the `embeddings` feature so default
+# release builds stay slim. Enable with `cargo build --features
+# embeddings` to opt in (and BRIDGE_EMBEDDINGS_ENABLED=1 at
+# runtime).
+fastembed = { version = "5", optional = true }
+
+[features]
+default = []
+embeddings = ["dep:fastembed"]

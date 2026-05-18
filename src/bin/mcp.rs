@@ -361,6 +361,19 @@ fn tools_list() -> Value {
                 }
             },
             {
+                "name": "memory_search_semantic",
+                "description": "Semantic (vector) search over memory keys + values. Returns up to `k` (default 10, max 50) hits ordered by cosine distance ascending. Quality depends on the server-side embedder: `BRIDGE_EMBEDDINGS_ENABLED=1` + `--features embeddings` build yields real ML embeddings (bge-small-en-v1.5); otherwise a deterministic hash fallback runs that's worse than FTS5 and exists only so the route never 503s. Returns empty list (not error) for empty query.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query":   { "type": "string" },
+                        "k":       { "type": "integer", "minimum": 1, "maximum": 50 },
+                        "channel": { "type": "string" }
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
                 "name": "delete_channel",
                 "description": "Hard-delete a channel — wipes messages, findings, topic, and removes it from `list_channels`. Use to clean up ghost channels (typos like `general,pale-sdk`, abandoned channels, etc). Stronger than `clear_channel` which only wipes history.",
                 "inputSchema": {
@@ -1774,6 +1787,56 @@ async fn main() {
                         }
                     }
 
+                    "memory_search_semantic" => {
+                        let query = args_val["query"].as_str().unwrap_or("").to_string();
+                        let k = args_val["k"].as_u64().unwrap_or(10);
+                        let channel = args_val["channel"]
+                            .as_str()
+                            .unwrap_or(&args.channel)
+                            .to_string();
+                        let body = serde_json::json!({
+                            "query": query,
+                            "k": k,
+                            "channel": channel,
+                        });
+                        let res = client
+                            .post(format!("{}/memory/search/semantic", args.server))
+                            .json(&body)
+                            .send()
+                            .await;
+                        match res {
+                            Ok(r) if r.status().is_success() => {
+                                let hits: Vec<Value> = r.json().await.unwrap_or_default();
+                                if hits.is_empty() {
+                                    text(id, "[bridge] no semantic matches".to_string())
+                                } else {
+                                    let formatted = hits.iter().map(|h| {
+                                        let v = h["value"].as_str().unwrap_or("");
+                                        let preview = if v.len() > 120 {
+                                            format!("{}…", &v[..120])
+                                        } else {
+                                            v.into()
+                                        };
+                                        format!(
+                                            "• [{:.3}] {}/{} = {}",
+                                            h["distance"].as_f64().unwrap_or(0.0),
+                                            h["channel"].as_str().unwrap_or("?"),
+                                            h["key"].as_str().unwrap_or("?"),
+                                            preview
+                                        )
+                                    }).collect::<Vec<_>>().join("\n");
+                                    text(id, formatted)
+                                }
+                            }
+                            Ok(r) => text(id, format!(
+                                "[bridge] ERROR {}: {}",
+                                r.status(),
+                                r.text().await.unwrap_or_default()
+                            )),
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+
                     "clear_channel" => {
                         let channel = args_val["channel"]
                             .as_str()
@@ -2446,6 +2509,7 @@ mod tests {
             "memory_set",
             "memory_delete",
             "memory_list",
+            "memory_search_semantic",
             "delete_channel",
             // Group B/C additions:
             "ack_dispatch",

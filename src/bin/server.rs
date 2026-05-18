@@ -704,6 +704,11 @@ struct AppState {
     /// and flushes any (rule, key) whose age exceeds the rule's
     /// configured window into a single batched message.
     routing_batches: Arc<DashMap<(String, String), (u64, Vec<serde_json::Value>)>>,
+    /// F18 — text→vector embedder. Hash fallback by default; real
+    /// fastembed when `BRIDGE_EMBEDDINGS_ENABLED=1` AND the binary
+    /// is built with `--features embeddings`. Wrapped in Arc so
+    /// background tasks + sync hooks share one model load.
+    embedder: Arc<dyn claude_bridge::embeddings::Embedder>,
 }
 
 impl AppState {
@@ -729,6 +734,7 @@ impl AppState {
             routing_max_depth: 1,
             routing_batches: Arc::new(DashMap::new()),
             dashboard_events: Arc::new(tokio::sync::broadcast::channel(256).0),
+            embedder: Arc::from(claude_bridge::embeddings::embedder_from_env()),
         }
     }
 
@@ -1963,6 +1969,19 @@ async fn memory_set(
             before.as_ref(),
             Some(&entry),
         );
+        // F18 — embed the (key + value) so semantic_search can match
+        // both metadata keywords and body content. Best-effort: a
+        // failure logs but doesn't block the write.
+        let embed_text = format!("{key}\n{}", entry.value);
+        if let Some(v) = state.embedder.embed(&embed_text) {
+            let entity_id = format!("{channel}/{key}");
+            let h = claude_bridge::embeddings::content_hash(&embed_text);
+            if let Err(e) =
+                store.upsert_embedding("memory", &entity_id, &channel, &h, &v)
+            {
+                tracing::warn!(error = %e, entity_id = %entity_id, "embedding upsert failed");
+            }
+        }
     }
     Ok(Json(entry))
 }
@@ -2026,6 +2045,10 @@ async fn memory_delete(
             before.as_ref(),
             None::<&MemoryEntry>,
         );
+        // F18 — drop the embedding row so deleted keys don't keep
+        // surfacing in semantic_search.
+        let entity_id = format!("{channel}/{key}");
+        let _ = store.delete_embedding("memory", &entity_id);
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2044,6 +2067,96 @@ async fn memory_list(
         .collect();
     v.sort_by(|a, b| a.key.cmp(&b.key));
     Json(v)
+}
+
+// ── F18: semantic memory search ─────────────────────────────────────
+
+#[derive(Deserialize)]
+struct MemorySearchReq {
+    query: String,
+    #[serde(default = "default_search_k")]
+    k: usize,
+    /// Optional channel scope — empty/missing = global.
+    #[serde(default)]
+    channel: String,
+}
+
+fn default_search_k() -> usize {
+    10
+}
+
+#[derive(serde::Serialize)]
+struct MemorySearchHit {
+    channel: String,
+    key: String,
+    value: String,
+    distance: f32,
+    updated_by: String,
+    updated_at: u64,
+}
+
+const MAX_SEARCH_QUERY_LEN: usize = 8 * 1024;
+const MAX_SEARCH_K: usize = 50;
+
+async fn memory_search_semantic(
+    State(state): State<AppState>,
+    Json(req): Json<MemorySearchReq>,
+) -> Result<Json<Vec<MemorySearchHit>>, (StatusCode, String)> {
+    cap!(req.query, MAX_SEARCH_QUERY_LEN, "query");
+    if !req.channel.is_empty() {
+        cap!(req.channel, MAX_CHANNEL_LEN, "channel");
+    }
+    let k = req.k.clamp(1, MAX_SEARCH_K);
+    let Some(store) = &state.store else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "semantic search requires BRIDGE_DB_PATH (persistence disabled)".into(),
+        ));
+    };
+    let Some(qv) = state.embedder.embed(&req.query) else {
+        return Ok(Json(vec![]));
+    };
+    let ch_filter = if req.channel.is_empty() {
+        None
+    } else {
+        Some(req.channel.as_str())
+    };
+    let hits = store
+        .semantic_search(&qv, k, Some("memory"), ch_filter)
+        .map_err(|e| {
+            tracing::warn!(error = %e, "semantic_search failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "semantic search failed".to_string(),
+            )
+        })?;
+    let now = now_secs();
+    let mut out = Vec::with_capacity(hits.len());
+    for h in hits {
+        // entity_id is "channel/key" — split on the first slash.
+        let Some((ch, key)) = h.entity_id.split_once('/') else {
+            continue;
+        };
+        let Some(entry) = state
+            .memory
+            .get(&(ch.to_string(), key.to_string()))
+            .map(|kv| kv.value().clone())
+        else {
+            continue;
+        };
+        if entry.expires_at != 0 && entry.expires_at < now {
+            continue;
+        }
+        out.push(MemorySearchHit {
+            channel: entry.channel,
+            key: entry.key,
+            value: entry.value,
+            distance: h.distance,
+            updated_by: entry.updated_by,
+            updated_at: entry.updated_at,
+        });
+    }
+    Ok(Json(out))
 }
 
 // ── Peer health + resume + metrics ──────────────────────────────────
@@ -4842,6 +4955,11 @@ async fn main() {
         .route("/memory/{channel}", get(memory_list))
         .route("/memory/{channel}/{key}",
                get(memory_get).put(memory_set).delete(memory_delete))
+        // F18 — semantic search over memory KV. POST body picks query
+        // + optional channel scope + k. Always returns 200 with a
+        // (possibly empty) list; never 404s. 503 when persistence is
+        // off (no embeddings table to query).
+        .route("/memory/search/semantic", post(memory_search_semantic))
         // Presence
         .route("/presence/{name}", post(heartbeat))
         .route("/peers", get(list_peers))

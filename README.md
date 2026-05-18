@@ -463,6 +463,38 @@ default for one call.
 | `memory_get` | Read a value by key. Channel-scoped. | `key` |
 | `memory_delete` | Delete a key. Ownership-enforced. | `key` |
 | `memory_list` | List every key in the channel's namespace with value + `updated_by` + `updated_at` + `expires_at` | — |
+| `memory_search_semantic` | Cosine k-NN search over memory keys + values. Returns hits ordered by distance ascending (closer = more similar). Quality depends on server-side embedder: real ML when `BRIDGE_EMBEDDINGS_ENABLED=1` + `--features embeddings`, hash fallback otherwise. | `query` |
+
+#### Semantic search (F18)
+
+The bridge embeds every `memory_set` value into a 384-dim vector
+and stores it in a `sqlite-vec` `vec0` virtual table. Two
+embedders ship:
+
+- **HashEmbedder** (default) — deterministic SHA-256-derived
+  vectors. Always available, no model download. Search quality
+  is **worse than FTS5** — present so the search route never
+  503s when the real model isn't loaded.
+- **FastembedEmbedder** (`--features embeddings` + `BRIDGE_EMBEDDINGS_ENABLED=1`)
+  — `BAAI/bge-small-en-v1.5` via `fastembed-rs`. Downloads
+  ~80MB on first use to `$HOME/.cache/claude-bridge/models`.
+  Pulls in onnxruntime; adds ~2-3 min to release build and
+  ~50MB to binary size — that's why it's opt-in.
+
+Server-side wiring is symmetric:
+- `memory_set` upserts an embedding for `(channel, key)` —
+  embeds `"{key}\n{value}"`.
+- `memory_delete` drops the embedding row.
+- `POST /memory/search/semantic` body `{query, k?, channel?}`
+  returns up to `k` (default 10, max 50) hits.
+- Returns `503` only when persistence is disabled
+  (`BRIDGE_DB_PATH` unset). Empty query returns `[]`, never
+  errors.
+
+Switching from hash to fastembed requires re-embedding existing
+keys (rebuild + restart with the env var; new writes pick up
+the real embedder, old keys retain hash vectors until next
+overwrite). A bulk re-embed tool is on the F18.1 follow-up list.
 
 ### Dispatch lifecycle
 

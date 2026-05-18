@@ -21,7 +21,24 @@
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, Result as SqliteResult};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
+
+/// F18 — register the sqlite-vec extension as a SQLite auto-extension
+/// exactly once per process. Subsequent `Connection::open` calls pick
+/// it up automatically (registers the `vec0` virtual table module
+/// + scalar fns like `vec_distance_cosine`). Idempotent thanks to
+/// `Once`. Safe because sqlite3_auto_extension is a known global
+/// FFI hook and we pass a function pointer with C ABI.
+fn register_sqlite_vec_once() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+    });
+}
 
 use crate::{Artifact, AuditEntry, ChannelTopic, Finding, MemoryEntry, Message, Task};
 
@@ -125,6 +142,11 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
+        // F18 — register sqlite-vec as a SQLite auto-extension before
+        // opening any connection. The hook is process-global and
+        // applies to every Connection::open that follows; vec0 vtab
+        // calls in v18 migration succeed because of this.
+        register_sqlite_vec_once();
         let conn = Connection::open(path)?;
         // WAL for concurrent reads with one writer — only matters if
         // we ever add a read replica, but cheap and safer than the
@@ -1774,6 +1796,173 @@ impl Store {
         })?;
         rows.collect()
     }
+
+    // ── F18: embeddings ────────────────────────────────────────────
+
+    /// Insert or replace an embedding for an entity. Vector must be
+    /// exactly 384 dims (the migration-declared width). On re-embed of
+    /// the same (entity_type, entity_id), the old vec0 row is deleted
+    /// first so dim/cosine math stays clean.
+    pub fn upsert_embedding(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        channel: &str,
+        content_hash: &str,
+        vector: &[f32],
+    ) -> SqliteResult<()> {
+        if vector.len() != 384 {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::ConstraintViolation,
+                    extended_code: 1,
+                },
+                Some(format!("embedding must be 384 dims, got {}", vector.len())),
+            ));
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        // Resolve existing rowid (if any) so we can DELETE the vec0
+        // row before inserting the new one. vec0 has no UPSERT.
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT rowid FROM embeddings_meta
+                 WHERE entity_type = ?1 AND entity_id = ?2",
+                params![entity_type, entity_id],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(rowid) = existing {
+            tx.execute(
+                "DELETE FROM embeddings_vec WHERE rowid = ?1",
+                params![rowid],
+            )?;
+            tx.execute(
+                "DELETE FROM embeddings_meta WHERE rowid = ?1",
+                params![rowid],
+            )?;
+        }
+        // vec0 takes a JSON array literal OR a blob of f32 le-bytes.
+        // Bytes are the canonical fast path.
+        let bytes = vec_to_bytes(vector);
+        tx.execute(
+            "INSERT INTO embeddings_vec (embedding) VALUES (?1)",
+            params![bytes],
+        )?;
+        let rowid = tx.last_insert_rowid();
+        let now = crate::now_secs() as i64;
+        tx.execute(
+            "INSERT INTO embeddings_meta
+             (rowid, entity_type, entity_id, channel, content_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![rowid, entity_type, entity_id, channel, content_hash, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// k-NN semantic search using cosine distance. Returns up to `k`
+    /// hits ordered by distance ascending (closer = more similar).
+    /// `entity_type_filter` is optional; `channel_filter` is optional
+    /// (empty string matches the broadcast/no-channel entries too).
+    pub fn semantic_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        entity_type_filter: Option<&str>,
+        channel_filter: Option<&str>,
+    ) -> SqliteResult<Vec<SemanticHit>> {
+        if query.len() != 384 {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::ConstraintViolation,
+                    extended_code: 1,
+                },
+                Some(format!("query embedding must be 384 dims, got {}", query.len())),
+            ));
+        }
+        let conn = self.conn.lock();
+        let bytes = vec_to_bytes(query);
+        // Generous over-fetch: vec0 doesn't support WHERE pushdown
+        // into the MATCH operator, so we filter post-knn. 4× the
+        // requested k bounds tail latency while making it unlikely
+        // we run out of matches after the filter.
+        let knn_k = (k * 4).max(20) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT v.rowid, v.distance, m.entity_type, m.entity_id, m.channel
+             FROM embeddings_vec v
+             JOIN embeddings_meta m ON m.rowid = v.rowid
+             WHERE v.embedding MATCH ?1 AND k = ?2
+             ORDER BY v.distance ASC",
+        )?;
+        let rows = stmt.query_map(params![bytes, knn_k], |r| {
+            Ok(SemanticHit {
+                rowid: r.get::<_, i64>(0)?,
+                distance: r.get::<_, f32>(1)?,
+                entity_type: r.get(2)?,
+                entity_id: r.get(3)?,
+                channel: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::with_capacity(k);
+        for hit in rows {
+            let hit = hit?;
+            if let Some(et) = entity_type_filter {
+                if hit.entity_type != et {
+                    continue;
+                }
+            }
+            if let Some(ch) = channel_filter {
+                if !ch.is_empty() && hit.channel != ch {
+                    continue;
+                }
+            }
+            out.push(hit);
+            if out.len() >= k {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete the embedding row for an entity (called on memory_delete
+    /// / task delete / finding delete). No-op if absent.
+    pub fn delete_embedding(&self, entity_type: &str, entity_id: &str) -> SqliteResult<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        if let Ok(rowid) = tx.query_row(
+            "SELECT rowid FROM embeddings_meta
+             WHERE entity_type = ?1 AND entity_id = ?2",
+            params![entity_type, entity_id],
+            |r| r.get::<_, i64>(0),
+        ) {
+            tx.execute("DELETE FROM embeddings_vec WHERE rowid = ?1", params![rowid])?;
+            tx.execute("DELETE FROM embeddings_meta WHERE rowid = ?1", params![rowid])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+/// Result row for [`Store::semantic_search`]. `distance` is cosine
+/// distance ∈ [0, 2] (0 = identical direction, 1 = orthogonal, 2 =
+/// opposite). Lower is better.
+#[derive(Debug, Clone)]
+pub struct SemanticHit {
+    pub rowid: i64,
+    pub distance: f32,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub channel: String,
+}
+
+/// Pack a [`Vec<f32>`] into the little-endian byte buffer vec0 expects.
+fn vec_to_bytes(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
 }
 
 /// One numbered migration. `up` runs as a single sqlite batch — if
@@ -2306,6 +2495,36 @@ const MIGRATIONS: &[Migration] = &[
                 ON pull_requests (state);
         "#,
     },
+    Migration {
+        version: 18,
+        name: "v18_embeddings_vec0",
+        // F18 — semantic search. vec0 vtab stores the actual floats
+        // (384 dims = MiniLM / fastembed-default). `embeddings_meta`
+        // joins back to the entity (memory_key / message id /
+        // finding id / task id) and the channel for scoped queries.
+        // rowid is shared between the two tables — vec0 assigns it,
+        // we mirror it into meta. ON DELETE CASCADE on the meta row
+        // is enough; vec0 rows are explicitly DELETEd when meta goes.
+        //
+        // Default-feature builds without the `embeddings` Cargo
+        // feature still create this schema: search just returns
+        // empty results until an embedder is wired in.
+        up: r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS embeddings_vec
+                USING vec0(embedding float[384]);
+            CREATE TABLE IF NOT EXISTS embeddings_meta (
+                rowid         INTEGER PRIMARY KEY,
+                entity_type   TEXT NOT NULL,
+                entity_id     TEXT NOT NULL,
+                channel       TEXT NOT NULL DEFAULT '',
+                content_hash  TEXT NOT NULL DEFAULT '',
+                created_at    INTEGER NOT NULL,
+                UNIQUE (entity_type, entity_id)
+            );
+            CREATE INDEX IF NOT EXISTS embeddings_meta_entity
+                ON embeddings_meta (entity_type, channel);
+        "#,
+    },
 ];
 
 /// Best-effort column adds for pre-runner DBs. `CREATE TABLE IF
@@ -2442,6 +2661,33 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         Store::open(&p).expect("open temp db")
+    }
+
+    #[test]
+    fn embeddings_round_trip_and_search() {
+        let s = temp_store();
+        let mk_vec = |seed: u8| -> Vec<f32> {
+            (0..384).map(|i| ((i as u8).wrapping_add(seed) as f32) / 255.0).collect()
+        };
+        s.upsert_embedding("memory", "c1/alpha", "c1", "h1", &mk_vec(1)).unwrap();
+        s.upsert_embedding("memory", "c1/beta", "c1", "h2", &mk_vec(2)).unwrap();
+        s.upsert_embedding("memory", "c1/gamma", "c1", "h3", &mk_vec(60)).unwrap();
+        // Query near alpha — alpha should rank first.
+        let hits = s.semantic_search(&mk_vec(1), 3, Some("memory"), Some("c1")).unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].entity_id, "c1/alpha");
+        // Wrong-length input rejected.
+        let bad = vec![0.0; 100];
+        assert!(s.semantic_search(&bad, 3, None, None).is_err());
+        assert!(s.upsert_embedding("memory", "c1/x", "c1", "h", &bad).is_err());
+        // Delete drops the row.
+        s.delete_embedding("memory", "c1/alpha").unwrap();
+        let hits2 = s.semantic_search(&mk_vec(1), 5, Some("memory"), Some("c1")).unwrap();
+        assert!(hits2.iter().all(|h| h.entity_id != "c1/alpha"));
+        // Channel filter excludes mismatches.
+        s.upsert_embedding("memory", "c2/delta", "c2", "h4", &mk_vec(2)).unwrap();
+        let hits3 = s.semantic_search(&mk_vec(2), 10, Some("memory"), Some("c2")).unwrap();
+        assert!(hits3.iter().all(|h| h.channel == "c2"));
     }
 
     #[test]
