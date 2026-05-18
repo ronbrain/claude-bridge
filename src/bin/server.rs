@@ -2515,6 +2515,94 @@ async fn metrics_prometheus(State(state): State<AppState>) -> impl IntoResponse 
     )
 }
 
+// ── Goals (F20) ─────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CreateGoalReq {
+    name: String,
+    #[serde(default)]
+    description: String,
+    target_metric: String,
+    target_value: i64,
+    #[serde(default = "default_goal_comparator")]
+    comparator: String,
+    #[serde(default)]
+    deadline: u64,
+    #[serde(default)]
+    channel: String,
+}
+
+fn default_goal_comparator() -> String {
+    ">=".into()
+}
+
+const MAX_GOAL_NAME_LEN: usize = 128;
+const MAX_GOAL_DESC_LEN: usize = 4096;
+
+async fn create_goal(
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    State(state): State<AppState>,
+    Json(req): Json<CreateGoalReq>,
+) -> Result<Json<claude_bridge::Goal>, (StatusCode, String)> {
+    cap!(req.name, MAX_GOAL_NAME_LEN, "name");
+    cap!(req.description, MAX_GOAL_DESC_LEN, "description");
+    if !claude_bridge::GOAL_METRICS.contains(&req.target_metric.as_str()) {
+        return Err((StatusCode::BAD_REQUEST, format!("target_metric must be one of {:?}", claude_bridge::GOAL_METRICS)));
+    }
+    if !claude_bridge::GOAL_COMPARATORS.contains(&req.comparator.as_str()) {
+        return Err((StatusCode::BAD_REQUEST, format!("comparator must be one of {:?}", claude_bridge::GOAL_COMPARATORS)));
+    }
+    let actor = effective_actor(&headers, ext.as_deref());
+    let store = state.store.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE, "persistence disabled".into()))?;
+    let now = now_secs();
+    let goal = claude_bridge::Goal {
+        id: Uuid::new_v4().to_string(),
+        channel: req.channel, name: req.name, description: req.description,
+        target_metric: req.target_metric, target_value: req.target_value,
+        current_value: 0, comparator: req.comparator, created_by: actor.clone(),
+        deadline: req.deadline, status: "pending".into(),
+        created_at: now, updated_at: now,
+    };
+    store.insert_goal(&goal).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("persist failed: {e}")))?;
+    write_audit(store, &actor, "create", "goal", &goal.id,
+                None::<&claude_bridge::Goal>, Some(&goal));
+    dashboard_event(&state, "goal_created", serde_json::json!({"id": goal.id, "name": goal.name}));
+    Ok(Json(goal))
+}
+
+async fn list_goals(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<claude_bridge::Goal>>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE, "persistence disabled".into()))?;
+    let goals = store.list_goals().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list failed: {e}")))?;
+    Ok(Json(goals))
+}
+
+async fn cancel_goal(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let actor = effective_actor(&headers, ext.as_deref());
+    let store = state.store.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE, "persistence disabled".into()))?;
+    let goal = store.get_goal(&id).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read failed: {e}")))?
+        .ok_or((StatusCode::NOT_FOUND, format!("goal '{id}' not found")))?;
+    let is_admin = auth_ext.as_deref().map(|a| a.is_memory_admin(&actor)).unwrap_or(false);
+    if !is_admin && goal.created_by != actor {
+        return Err((StatusCode::FORBIDDEN, format!("goal '{id}' owned by '{}'; not deletable by '{actor}'", goal.created_by)));
+    }
+    let n = store.cancel_goal(&id, now_secs()).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel failed: {e}")))?;
+    if n == 0 {
+        return Err((StatusCode::CONFLICT, "goal not in 'pending' status".into()));
+    }
+    write_audit(store, &actor, "cancel", "goal", &id, None::<&claude_bridge::Goal>, None::<&claude_bridge::Goal>);
+    dashboard_event(&state, "goal_cancelled", serde_json::json!({"id": id, "by": actor}));
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ── Task coordination (F29) ─────────────────────────────────────────
 
 #[derive(Deserialize, Default)]
@@ -3989,6 +4077,45 @@ async fn main() {
             flush: auto_batch_flush,
         }),
         Arc::new(claude_bridge::automation::TaskReadyScanner::default()),
+        Arc::new(claude_bridge::automation::GoalScanner {
+            metrics_provider: {
+                let state_for_metrics = state.clone();
+                Arc::new(move |metric: &str| -> Option<i64> {
+                    match metric {
+                        "peers_active" => Some(state_for_metrics.peers.len() as i64),
+                        "findings_open" => {
+                            let mut n = 0i64;
+                            for kv in state_for_metrics.findings.iter() {
+                                for f in kv.value() {
+                                    if f.status == "open" { n += 1; }
+                                }
+                            }
+                            Some(n)
+                        }
+                        "tasks_active" => {
+                            let mut n = 0i64;
+                            for kv in state_for_metrics.tasks.iter() {
+                                for t in kv.value() {
+                                    if t.status == "todo" || t.status == "in_progress" {
+                                        n += 1;
+                                    }
+                                }
+                            }
+                            Some(n)
+                        }
+                        "dispatches_pending" => state_for_metrics
+                            .store
+                            .as_ref()
+                            .and_then(|s| s.count_open_dispatches().ok())
+                            .map(|n| n as i64),
+                        // sla_met_pct: requires historical tracking
+                        // (deferred to F20.1; provider returns None
+                        // so the goal scanner silently skips).
+                        _ => None,
+                    }
+                })
+            },
+        }),
     ];
     let _automation_handle = claude_bridge::automation::spawn_loop(
         Duration::from_secs(60),
@@ -4143,6 +4270,9 @@ async fn main() {
         .route("/tasks/{channel}/{id}/plan", post(submit_plan))
         .route("/tasks/{channel}/{id}/plan/approve", post(approve_plan))
         .route("/tasks/{channel}/{id}/plan/reject", post(reject_plan))
+        // F20 goals
+        .route("/goals", post(create_goal).get(list_goals))
+        .route("/goals/{id}", delete(cancel_goal))
         // Shared memory KV
         .route("/memory/{channel}", get(memory_list))
         .route("/memory/{channel}/{key}",

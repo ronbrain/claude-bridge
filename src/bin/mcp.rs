@@ -456,6 +456,37 @@ fn tools_list() -> Value {
                 }
             },
             {
+                "name": "goal_create",
+                "description": "Create an operator goal — target_metric ∈ {peers_active, findings_open, tasks_active, dispatches_pending, sla_met_pct}, target_value is the threshold, comparator is `>=` (default) / `<=` / `==`. Optional `deadline` (unix-secs) and `channel` (display-only). Background scanner updates current_value every base tick; fires `goal_achieved` routing trigger on the pending→met transition edge.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name":          { "type": "string" },
+                        "description":   { "type": "string" },
+                        "target_metric": { "type": "string", "enum": ["peers_active","findings_open","tasks_active","dispatches_pending","sla_met_pct"] },
+                        "target_value":  { "type": "number" },
+                        "comparator":    { "type": "string", "enum": [">=","<=","=="] },
+                        "deadline":      { "type": "number", "description": "Unix-secs; 0 = no deadline" },
+                        "channel":       { "type": "string" }
+                    },
+                    "required": ["name", "target_metric", "target_value"]
+                }
+            },
+            {
+                "name": "goal_list",
+                "description": "List every goal with current_value vs target_value + status (pending|met|missed|cancelled).",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "goal_cancel",
+                "description": "Cancel a pending goal. Owner (creator) or BRIDGE_MEMORY_ADMINS only. Met/missed/cancelled goals can't be re-cancelled.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "id": { "type": "string" } },
+                    "required": ["id"]
+                }
+            },
+            {
                 "name": "claim_task",
                 "description": "Atomic claim of an unowned task — first-wins via UPDATE WHERE owner='' AND status='todo'. Returns 204 on success, 409 if task is already owned / wrong status / missing. Bumps the row's claim_count counter for observability.",
                 "inputSchema": {
@@ -1859,6 +1890,52 @@ async fn main() {
                         }
                     }
 
+                    "goal_create" => {
+                        let res = client.post(format!("{}/goals", args.server))
+                            .json(&args_val).send().await;
+                        match res {
+                            Ok(r) if r.status().is_success() => {
+                                let b = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] goal created:\n{b}"))
+                            }
+                            Ok(r) => {
+                                let s = r.status();
+                                let b = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] ERROR {s}: {b}"))
+                            }
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+                    "goal_list" => {
+                        let res = client.get(format!("{}/goals", args.server)).send().await;
+                        match res {
+                            Ok(r) if r.status().is_success() => {
+                                let b = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] goals:\n{b}"))
+                            }
+                            Ok(r) => text(id, format!("[bridge] ERROR {}", r.status())),
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+                    "goal_cancel" => {
+                        let gid = args_val["id"].as_str().unwrap_or("").to_string();
+                        if gid.is_empty() {
+                            text(id, "[bridge] ERROR: id required")
+                        } else {
+                            let res = client.delete(format!("{}/goals/{}", args.server, encode_path_segment(&gid)))
+                                .send().await;
+                            match res {
+                                Ok(r) if r.status().is_success() => text(id, format!("[bridge] goal '{gid}' cancelled")),
+                                Ok(r) => {
+                                    let s = r.status();
+                                    let b = r.text().await.unwrap_or_default();
+                                    text(id, format!("[bridge] ERROR {s}: {b}"))
+                                }
+                                _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                            }
+                        }
+                    }
+
                     "claim_task" | "complete_task" | "submit_plan" | "approve_plan" | "reject_plan" => {
                         let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
                         let task_id = args_val["id"].as_str().unwrap_or("").to_string();
@@ -2180,6 +2257,10 @@ mod tests {
             "submit_plan",
             "approve_plan",
             "reject_plan",
+            // F20 goals:
+            "goal_create",
+            "goal_list",
+            "goal_cancel",
         ];
         let expected: std::collections::BTreeSet<String> =
             EXPECTED_TOOL_NAMES.iter().map(|s| s.to_string()).collect();

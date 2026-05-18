@@ -398,6 +398,40 @@ pub struct AuditEntry {
     pub result: String,
 }
 
+// ─── F20 — Goals (roadmap-v2) ──────────────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Goal {
+    pub id: String,
+    pub channel: String,
+    pub name: String,
+    pub description: String,
+    /// One of GOAL_METRICS.
+    pub target_metric: String,
+    pub target_value: i64,
+    pub current_value: i64,
+    /// `>=` | `<=` | `==`. Default `>=` (most goals are "reach at
+    /// least X"; some are "stay under X" for SLA breach counts).
+    pub comparator: String,
+    pub created_by: String,
+    /// Unix-secs. 0 = no deadline.
+    pub deadline: u64,
+    /// `pending` | `met` | `missed` | `cancelled`.
+    pub status: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+pub const GOAL_METRICS: &[&str] = &[
+    "peers_active",
+    "findings_open",
+    "tasks_active",
+    "dispatches_pending",
+    "sla_met_pct",
+];
+pub const GOAL_COMPARATORS: &[&str] = &[">=", "<=", "=="];
+pub const GOAL_STATUSES: &[&str] = &["pending", "met", "missed", "cancelled"];
+
 // ─── F26 — Background watcher (roadmap-v2) ─────────────────────────
 
 /// One row in `peer_watchers`. Tracks a bg `claude --bg` subprocess

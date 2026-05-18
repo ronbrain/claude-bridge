@@ -549,6 +549,134 @@ impl Store {
         Ok(n)
     }
 
+    // ── Goals (F20) ────────────────────────────────────────────────
+
+    pub fn insert_goal(&self, g: &crate::Goal) -> SqliteResult<()> {
+        self.conn.lock().execute(
+            "INSERT INTO goals
+             (id, channel, name, description, target_metric, target_value,
+              current_value, comparator, created_by, deadline, status,
+              created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                g.id, g.channel, g.name, g.description, g.target_metric,
+                g.target_value, g.current_value, g.comparator, g.created_by,
+                g.deadline as i64, g.status, g.created_at as i64, g.updated_at as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_goals(&self) -> SqliteResult<Vec<crate::Goal>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, channel, name, description, target_metric, target_value,
+                    current_value, comparator, created_by, deadline, status,
+                    created_at, updated_at
+             FROM goals ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(crate::Goal {
+                id: r.get(0)?, channel: r.get(1)?, name: r.get(2)?,
+                description: r.get(3)?, target_metric: r.get(4)?,
+                target_value: r.get(5)?, current_value: r.get(6)?,
+                comparator: r.get(7)?, created_by: r.get(8)?,
+                deadline: r.get::<_, i64>(9)? as u64,
+                status: r.get(10)?,
+                created_at: r.get::<_, i64>(11)? as u64,
+                updated_at: r.get::<_, i64>(12)? as u64,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn get_goal(&self, id: &str) -> SqliteResult<Option<crate::Goal>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, channel, name, description, target_metric, target_value,
+                    current_value, comparator, created_by, deadline, status,
+                    created_at, updated_at
+             FROM goals WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(r) = rows.next()? {
+            Ok(Some(crate::Goal {
+                id: r.get(0)?, channel: r.get(1)?, name: r.get(2)?,
+                description: r.get(3)?, target_metric: r.get(4)?,
+                target_value: r.get(5)?, current_value: r.get(6)?,
+                comparator: r.get(7)?, created_by: r.get(8)?,
+                deadline: r.get::<_, i64>(9)? as u64,
+                status: r.get(10)?,
+                created_at: r.get::<_, i64>(11)? as u64,
+                updated_at: r.get::<_, i64>(12)? as u64,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Scanner-side update: refresh `current_value` + flip `status`
+    /// to 'met' when the comparator passes (transition-edge), or
+    /// 'missed' when the deadline passes without met. Returns the
+    /// pre/post status pair so the caller can fire `goal_achieved`
+    /// trigger only on the pending→met edge.
+    pub fn update_goal_progress(
+        &self,
+        id: &str,
+        new_current: i64,
+        comparator: &str,
+        target: i64,
+        deadline: u64,
+        now: u64,
+    ) -> SqliteResult<(String, String)> {
+        let conn = self.conn.lock();
+        let prior: String = conn.query_row(
+            "SELECT status FROM goals WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        let met = match comparator {
+            ">=" => new_current >= target,
+            "<=" => new_current <= target,
+            "==" => new_current == target,
+            _ => false,
+        };
+        let new_status: String = if prior == "pending" {
+            if met {
+                "met".into()
+            } else if deadline != 0 && now > deadline {
+                "missed".into()
+            } else {
+                "pending".into()
+            }
+        } else {
+            prior.clone()
+        };
+        conn.execute(
+            "UPDATE goals SET current_value = ?1, status = ?2, updated_at = ?3
+             WHERE id = ?4",
+            params![new_current, &new_status, now as i64, id],
+        )?;
+        Ok((prior, new_status))
+    }
+
+    pub fn cancel_goal(&self, id: &str, now: u64) -> SqliteResult<usize> {
+        let n = self.conn.lock().execute(
+            "UPDATE goals SET status = 'cancelled', updated_at = ?1
+             WHERE id = ?2 AND status = 'pending'",
+            params![now as i64, id],
+        )?;
+        Ok(n)
+    }
+
+    pub fn delete_goal(&self, id: &str) -> SqliteResult<usize> {
+        let n = self.conn.lock().execute(
+            "DELETE FROM goals WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(n)
+    }
+
     // ── Tasks (F29 additions) ──────────────────────────────────────
 
     /// Atomic claim of an unowned task — pattern-atomic-status-flip.
@@ -1826,6 +1954,36 @@ const MIGRATIONS: &[Migration] = &[
                 ON tasks (channel, plan_status);
         "#,
     },
+    Migration {
+        version: 14,
+        name: "v14_goals",
+        // F20 — Operator-set targets. target_metric is a closed
+        // string vocab: 'peers_active' | 'findings_open' |
+        // 'tasks_active' | 'dispatches_pending' | 'sla_met_pct'.
+        // current_value updated by GoalScanner every 60s.
+        // status: 'pending' | 'met' | 'missed' | 'cancelled'.
+        // Routing trigger `goal_achieved` fires when current crosses
+        // target (transition-edge, not every tick at target).
+        up: r#"
+            CREATE TABLE IF NOT EXISTS goals (
+                id            TEXT PRIMARY KEY,
+                channel       TEXT NOT NULL DEFAULT '',
+                name          TEXT NOT NULL,
+                description   TEXT NOT NULL DEFAULT '',
+                target_metric TEXT NOT NULL,
+                target_value  INTEGER NOT NULL,
+                current_value INTEGER NOT NULL DEFAULT 0,
+                comparator    TEXT NOT NULL DEFAULT '>=',
+                created_by    TEXT NOT NULL DEFAULT '',
+                deadline      INTEGER NOT NULL DEFAULT 0,
+                status        TEXT NOT NULL DEFAULT 'pending',
+                created_at    INTEGER NOT NULL,
+                updated_at    INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS goals_status
+                ON goals (status);
+        "#,
+    },
 ];
 
 /// Best-effort column adds for pre-runner DBs. `CREATE TABLE IF
@@ -2337,6 +2495,45 @@ mod tests {
             .unwrap();
         s.checkpoint_wal_on_shutdown().expect("first checkpoint");
         s.checkpoint_wal_on_shutdown().expect("second checkpoint idempotent");
+    }
+
+    #[test]
+    fn f20_goal_progress_transitions_to_met_and_stays() {
+        let s = temp_store();
+        let now = crate::now_secs();
+        let g = crate::Goal {
+            id: "g1".into(), channel: "c1".into(), name: "5 peers".into(),
+            description: String::new(), target_metric: "peers_active".into(),
+            target_value: 5, current_value: 0, comparator: ">=".into(),
+            created_by: "ops".into(), deadline: 0, status: "pending".into(),
+            created_at: now, updated_at: now,
+        };
+        s.insert_goal(&g).unwrap();
+        // 3 peers → still pending.
+        let (prior, new) = s.update_goal_progress("g1", 3, ">=", 5, 0, now).unwrap();
+        assert_eq!(prior, "pending"); assert_eq!(new, "pending");
+        // 5 peers → met.
+        let (prior, new) = s.update_goal_progress("g1", 5, ">=", 5, 0, now + 1).unwrap();
+        assert_eq!(prior, "pending"); assert_eq!(new, "met");
+        // 3 peers again → stays met (no rollback once met, by design).
+        let (prior, new) = s.update_goal_progress("g1", 3, ">=", 5, 0, now + 2).unwrap();
+        assert_eq!(prior, "met"); assert_eq!(new, "met");
+    }
+
+    #[test]
+    fn f20_goal_misses_deadline() {
+        let s = temp_store();
+        let g = crate::Goal {
+            id: "g2".into(), channel: "".into(), name: "x".into(),
+            description: String::new(), target_metric: "findings_open".into(),
+            target_value: 0, current_value: 10, comparator: "<=".into(),
+            created_by: "ops".into(), deadline: 100, status: "pending".into(),
+            created_at: 0, updated_at: 0,
+        };
+        s.insert_goal(&g).unwrap();
+        // now > deadline + not met → status flips to 'missed'.
+        let (prior, new) = s.update_goal_progress("g2", 10, "<=", 0, 100, 200).unwrap();
+        assert_eq!(prior, "pending"); assert_eq!(new, "missed");
     }
 
     #[test]

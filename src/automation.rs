@@ -237,6 +237,70 @@ impl Scanner for DispatchEscalationScanner {
     }
 }
 
+/// GoalScanner (F20) — every base tick, walks pending goals,
+/// recomputes current_value from the requested metric, fires
+/// `goal_achieved` routing trigger on the pending→met transition
+/// edge (not every tick at met). Metrics queried via the
+/// `metrics_provider` closure threaded into the ctx so the
+/// scanner stays decoupled from AppState.
+pub struct GoalScanner {
+    /// Closure returning the live metric value for a given metric
+    /// name. Wired from server.rs::main with a state-clone capture.
+    pub metrics_provider: Arc<dyn Fn(&str) -> Option<i64> + Send + Sync>,
+}
+
+#[async_trait::async_trait]
+impl Scanner for GoalScanner {
+    fn name(&self) -> &'static str {
+        "goal_scanner"
+    }
+    fn every(&self) -> u64 {
+        1
+    }
+    async fn tick(&self, ctx: &AutomationCtx) {
+        let Some(store) = &ctx.store else { return };
+        let Some(emit) = &ctx.routing_emit else { return };
+        let goals = match store.list_goals() {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(error = %e, "goal scan read failed");
+                return;
+            }
+        };
+        let now = crate::now_secs();
+        for g in goals {
+            if g.status != "pending" {
+                continue;
+            }
+            let Some(new_current) = (self.metrics_provider)(&g.target_metric) else {
+                tracing::debug!(metric = %g.target_metric, "no provider for goal metric");
+                continue;
+            };
+            let (prior, new_status) = match store.update_goal_progress(
+                &g.id, new_current, &g.comparator, g.target_value,
+                g.deadline, now,
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(error = %e, goal_id = %g.id, "goal progress update failed");
+                    continue;
+                }
+            };
+            if prior == "pending" && new_status == "met" {
+                let payload = serde_json::json!({
+                    "goal_id":       g.id,
+                    "name":          g.name,
+                    "target_metric": g.target_metric,
+                    "target_value":  g.target_value,
+                    "current_value": new_current,
+                    "channel":       g.channel,
+                });
+                emit("goal_achieved", payload);
+            }
+        }
+    }
+}
+
 /// TaskReadyScanner (F29) — emits `task_ready` triggers when a
 /// task's `depends_on` chain transitions from "any unmet" to "all
 /// satisfied". Dedup via per-scanner DashSet so a single ready
