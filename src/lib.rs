@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub mod auth;
 pub mod automation;
 pub mod config;
+pub mod dashboard;
 pub mod error;
 pub mod routing;
 pub mod store;

@@ -691,6 +691,11 @@ struct AppState {
     /// range). Threaded into `fire_routing_actions` so future
     /// AutoMessage-fires-AutoMessage paths can't loop.
     routing_max_depth: u8,
+    /// F19 — aggregated dashboard event stream. Mutation handlers
+    /// fan one tiny `{event, payload}` JSON value into this
+    /// broadcast; dashboard SSE consumers subscribe + selectively
+    /// patch the DOM. Cleared on restart (presence-style ephemeral).
+    dashboard_events: Arc<tokio::sync::broadcast::Sender<serde_json::Value>>,
     /// F17 Phase 3 — AutoBatch deferred-window accumulator. Key is
     /// (rule_id, batch_key) where batch_key is derived from
     /// `action_params.batch_by` (a payload field name).
@@ -723,6 +728,7 @@ impl AppState {
             routing_rate: Arc::new(claude_bridge::routing::RateBucket::default()),
             routing_max_depth: 1,
             routing_batches: Arc::new(DashMap::new()),
+            dashboard_events: Arc::new(tokio::sync::broadcast::channel(256).0),
         }
     }
 
@@ -915,6 +921,20 @@ async fn send(
             Some(&msg),
         );
     }
+    // F19 dashboard — bump the alive-ticker + give SSE consumers a
+    // hook to render the new message inline. Payload kept compact;
+    // dashboard's "recent messages" panel re-queries on its next
+    // render rather than maintaining a client-side cache.
+    dashboard_event(
+        &state,
+        "message_sent",
+        serde_json::json!({
+            "id": msg.id,
+            "channel": msg.channel,
+            "from": msg.from,
+            "to": msg.to,
+        }),
+    );
 
     // Implicit presence — sending is a sign of life. Saves a separate
     // heartbeat round-trip for CLI-only callers (they don't run the
@@ -1209,6 +1229,18 @@ async fn create_finding(
     prev.last_seen = now_secs();
     prev.channel = channel.clone();
     state.peers.insert(actor, prev);
+    // F19 dashboard event hook for finding_created.
+    dashboard_event(
+        &state,
+        "finding_created",
+        serde_json::json!({
+            "id": finding.id,
+            "severity": finding.severity,
+            "title": finding.title,
+            "channel": finding.channel,
+            "from": finding.from,
+        }),
+    );
     // F17 Phase 2 emission — fire any routing rules that match
     // the `finding_created` trigger. Synchronous so the action
     // (e.g. auto_assign addressed message) shows up on the same
@@ -1689,6 +1721,18 @@ async fn create_task(
             Some(&task),
         );
     }
+    // F19 dashboard event hook for task_created.
+    dashboard_event(
+        &state,
+        "task_created",
+        serde_json::json!({
+            "id": task.id,
+            "title": task.title,
+            "owner": task.owner,
+            "channel": task.channel,
+            "status": task.status,
+        }),
+    );
     // F17 Phase 2 emission — `task_unassigned` trigger fires only
     // when `owner` is empty (the trigger semantics literally mean
     // "this task needs someone to claim it"). Use the auto_assign
@@ -2469,6 +2513,302 @@ async fn metrics_prometheus(State(state): State<AppState>) -> impl IntoResponse 
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         out,
     )
+}
+
+// ── Dashboard (F19) ─────────────────────────────────────────────────
+
+/// Admin guard for dashboard routes. Returns Err if the request's
+/// AuthIdentity isn't on `BRIDGE_MEMORY_ADMINS`. Bare-bones — the
+/// existing `require_auth` middleware already verified the bearer
+/// is registry-resolvable; this layer adds the operator-only check.
+fn dashboard_admin_check(
+    ext: Option<&claude_bridge::auth::AuthIdentity>,
+    auth_ext: Option<&claude_bridge::auth::AuthState>,
+) -> Result<String, (StatusCode, String)> {
+    let identity = ext.cloned().unwrap_or(claude_bridge::auth::AuthIdentity::Anonymous);
+    let actor = identity.as_actor().to_string();
+    let is_admin = auth_ext
+        .map(|a| a.is_memory_admin(&actor))
+        .unwrap_or(false);
+    if !is_admin {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "dashboard requires BRIDGE_MEMORY_ADMINS membership; \
+                 '{actor}' is not on the allowlist."
+            ),
+        ));
+    }
+    Ok(actor)
+}
+
+fn html_response(markup: maud::Markup) -> Response {
+    let body = markup.into_string();
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        body,
+    )
+        .into_response()
+}
+
+async fn dashboard_landing(
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, String)> {
+    let _ = headers; // bearer already validated upstream
+    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref())?;
+    let peers_active = state.peers.len();
+    let mut sev_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for kv in state.findings.iter() {
+        for f in kv.value() {
+            if f.status == "open" {
+                *sev_counts.entry(f.severity.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    let open_findings_by_severity: Vec<(String, usize)> = sev_counts.into_iter().collect();
+    let dispatches_pending = state
+        .store
+        .as_ref()
+        .map(|s| s.count_open_dispatches().unwrap_or(0))
+        .unwrap_or(0);
+    let mut tasks_active = 0usize;
+    for kv in state.tasks.iter() {
+        for t in kv.value() {
+            if t.status == "todo" || t.status == "in_progress" {
+                tasks_active += 1;
+            }
+        }
+    }
+    // Pull last ~20 messages across all channels (newest first).
+    let mut recent: Vec<(String, String, String, u64)> = Vec::new();
+    for kv in state.history.iter() {
+        for m in kv.value() {
+            recent.push((m.channel.clone(), m.from.clone(), m.content.clone(), m.timestamp));
+        }
+    }
+    recent.sort_by_key(|(_, _, _, ts)| std::cmp::Reverse(*ts));
+    recent.truncate(20);
+    let recent_view: Vec<(String, String, String)> = recent
+        .into_iter()
+        .map(|(c, f, m, _)| (c, f, m))
+        .collect();
+    Ok(html_response(claude_bridge::dashboard::landing(
+        peers_active,
+        &open_findings_by_severity,
+        dispatches_pending,
+        tasks_active,
+        &recent_view,
+    )))
+}
+
+async fn dashboard_peers(
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, String)> {
+    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref())?;
+    let now = now_secs();
+    let mut rows: Vec<claude_bridge::dashboard::PeerRow> = state
+        .peers
+        .iter()
+        .map(|kv| {
+            let p = kv.value();
+            let open_dispatches = state
+                .store
+                .as_ref()
+                .and_then(|s| s.open_dispatches_for_peer(kv.key(), 50).ok())
+                .map(|v| v.len())
+                .unwrap_or(0);
+            claude_bridge::dashboard::PeerRow {
+                name: kv.key().clone(),
+                idle_secs: now.saturating_sub(p.last_seen),
+                channel: p.channel.clone(),
+                roles: p.roles.clone(),
+                skills: p.skills.clone(),
+                open_dispatches,
+                status: p.status.clone(),
+            }
+        })
+        .collect();
+    rows.sort_by_key(|r| r.idle_secs);
+    Ok(html_response(claude_bridge::dashboard::peers_page(&rows)))
+}
+
+#[derive(Deserialize, Default)]
+struct DashboardFindingsQuery {
+    severity: Option<String>,
+    status: Option<String>,
+}
+
+async fn dashboard_findings(
+    Query(q): Query<DashboardFindingsQuery>,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, String)> {
+    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref())?;
+    let mut rows: Vec<claude_bridge::dashboard::FindingRow> = Vec::new();
+    for kv in state.findings.iter() {
+        for f in kv.value() {
+            if let Some(sev) = q.severity.as_deref() {
+                if !sev.is_empty() && f.severity != sev {
+                    continue;
+                }
+            }
+            if let Some(st) = q.status.as_deref() {
+                if !st.is_empty() && f.status != st {
+                    continue;
+                }
+            }
+            rows.push(claude_bridge::dashboard::FindingRow {
+                id: f.id.clone(),
+                severity: f.severity.clone(),
+                status: f.status.clone(),
+                title: f.title.clone(),
+                endpoint: f.endpoint.clone(),
+                from: f.from.clone(),
+                channel: f.channel.clone(),
+            });
+        }
+    }
+    rows.sort_by(|a, b| a.severity.cmp(&b.severity).then(a.id.cmp(&b.id)));
+    Ok(html_response(claude_bridge::dashboard::findings_page(
+        &rows,
+        q.severity.as_deref().filter(|s| !s.is_empty()),
+        q.status.as_deref().filter(|s| !s.is_empty()),
+    )))
+}
+
+async fn dashboard_tasks(
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, String)> {
+    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref())?;
+    let mut rows: Vec<claude_bridge::dashboard::TaskRow> = Vec::new();
+    for kv in state.tasks.iter() {
+        for t in kv.value() {
+            rows.push(claude_bridge::dashboard::TaskRow {
+                id: t.id.clone(),
+                status: t.status.clone(),
+                title: t.title.clone(),
+                owner: t.owner.clone(),
+                channel: t.channel.clone(),
+            });
+        }
+    }
+    Ok(html_response(claude_bridge::dashboard::tasks_page(&rows)))
+}
+
+async fn dashboard_dispatches(
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, String)> {
+    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref())?;
+    let now = now_secs();
+    let rows: Vec<claude_bridge::dashboard::DispatchRow> = state
+        .store
+        .as_ref()
+        .and_then(|s| s.open_dispatches_older_than(u64::MAX / 2, 500).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| claude_bridge::dashboard::DispatchRow {
+            message_id: d.message_id,
+            from: d.from,
+            to: d.to,
+            channel: d.channel,
+            sent_at: d.sent_at,
+        })
+        .collect();
+    Ok(html_response(claude_bridge::dashboard::dispatches_page(
+        &rows,
+        now,
+        15 * 60,
+    )))
+}
+
+async fn dashboard_routing(
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, String)> {
+    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref())?;
+    let rows: Vec<claude_bridge::dashboard::RoutingRow> = state
+        .store
+        .as_ref()
+        .and_then(|s| s.list_routing_rules(None, None).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| claude_bridge::dashboard::RoutingRow {
+            name: r.name,
+            trigger_type: r.trigger_type,
+            action_type: r.action_type,
+            priority: r.priority,
+            enabled: r.enabled,
+        })
+        .collect();
+    Ok(html_response(claude_bridge::dashboard::routing_page(&rows)))
+}
+
+async fn dashboard_watchers(
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, String)> {
+    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref())?;
+    let now = now_secs();
+    let rows: Vec<claude_bridge::dashboard::WatcherRow> = state
+        .store
+        .as_ref()
+        .and_then(|s| s.list_peer_watchers().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|w| claude_bridge::dashboard::WatcherRow {
+            peer: w.peer,
+            pid: w.pid,
+            status: w.status,
+            spawned_by: w.spawned_by,
+            spawned_at: w.spawned_at,
+            last_seen: w.last_seen,
+            ttl_secs: w.ttl_secs,
+        })
+        .collect();
+    Ok(html_response(claude_bridge::dashboard::watchers_page(&rows, now)))
+}
+
+async fn dashboard_sse(
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
+    State(state): State<AppState>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
+    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref())?;
+    let rx = state.dashboard_events.subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(|result| match result {
+        Ok(v) => {
+            let data = serde_json::to_string(&v).unwrap_or_default();
+            Some(Ok::<_, Infallible>(Event::default().data(data)))
+        }
+        Err(_) => None,
+    });
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("ping"),
+    ))
+}
+
+/// Helper for mutation handlers to fan an event into the dashboard
+/// stream. Best-effort: zero subscribers → `send` returns Err and
+/// we drop. Not load-bearing for correctness.
+fn dashboard_event(state: &AppState, event: &str, payload: serde_json::Value) {
+    let v = serde_json::json!({ "event": event, "payload": payload });
+    let _ = state.dashboard_events.send(v);
 }
 
 // ── Peer watchers (F26) ─────────────────────────────────────────────
@@ -3548,6 +3888,18 @@ async fn main() {
         .route("/watchers", post(watcher_spawn).get(watcher_list))
         .route("/watchers/{peer}", delete(watcher_stop))
         .route("/watchers/{peer}/heartbeat", post(watcher_heartbeat))
+        // F19 dashboard — operator-only surface. All routes go
+        // through dashboard_admin_check inside the handler (in
+        // addition to the bearer middleware), so a non-admin
+        // authed caller gets a 403 instead of a render.
+        .route("/dashboard", get(dashboard_landing))
+        .route("/dashboard/peers", get(dashboard_peers))
+        .route("/dashboard/findings", get(dashboard_findings))
+        .route("/dashboard/tasks", get(dashboard_tasks))
+        .route("/dashboard/dispatches", get(dashboard_dispatches))
+        .route("/dashboard/routing", get(dashboard_routing))
+        .route("/dashboard/watchers", get(dashboard_watchers))
+        .route("/dashboard/sse", get(dashboard_sse))
         // Observability — authed per finding `cc3c33d6` (was world-
         // readable; identity is now needed for per-(requester,
         // target) rate-limit bucket on /resume).
