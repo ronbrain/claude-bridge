@@ -549,6 +549,119 @@ impl Store {
         Ok(n)
     }
 
+    // ── Pull requests (F22) ────────────────────────────────────────
+
+    pub fn upsert_pull_request(&self, p: &crate::PullRequest) -> SqliteResult<()> {
+        self.conn.lock().execute(
+            "INSERT INTO pull_requests
+             (id, repo, number, title, state, author, base_branch, head_branch,
+              url, linked_findings, linked_decisions, linked_goal_id, body,
+              created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             ON CONFLICT(repo, number) DO UPDATE SET
+                title = excluded.title,
+                state = excluded.state,
+                base_branch = excluded.base_branch,
+                head_branch = excluded.head_branch,
+                url = excluded.url,
+                body = excluded.body,
+                updated_at = excluded.updated_at",
+            params![
+                p.id, p.repo, p.number, p.title, p.state, p.author,
+                p.base_branch, p.head_branch, p.url,
+                p.linked_findings, p.linked_decisions, p.linked_goal_id,
+                p.body, p.created_at as i64, p.updated_at as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_pull_requests(
+        &self,
+        state_filter: Option<&str>,
+        repo_filter: Option<&str>,
+    ) -> SqliteResult<Vec<crate::PullRequest>> {
+        let conn = self.conn.lock();
+        let mut sql = String::from(
+            "SELECT id, repo, number, title, state, author, base_branch,
+                    head_branch, url, linked_findings, linked_decisions,
+                    linked_goal_id, body, created_at, updated_at
+             FROM pull_requests WHERE 1=1",
+        );
+        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(s) = state_filter {
+            sql.push_str(" AND state = ?");
+            bound.push(Box::new(s.to_string()));
+        }
+        if let Some(r) = repo_filter {
+            sql.push_str(" AND repo = ?");
+            bound.push(Box::new(r.to_string()));
+        }
+        sql.push_str(" ORDER BY updated_at DESC");
+        let mut stmt = conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(refs.as_slice(), |r| {
+            Ok(crate::PullRequest {
+                id: r.get(0)?, repo: r.get(1)?, number: r.get(2)?,
+                title: r.get(3)?, state: r.get(4)?, author: r.get(5)?,
+                base_branch: r.get(6)?, head_branch: r.get(7)?, url: r.get(8)?,
+                linked_findings: r.get(9)?, linked_decisions: r.get(10)?,
+                linked_goal_id: r.get(11)?, body: r.get(12)?,
+                created_at: r.get::<_, i64>(13)? as u64,
+                updated_at: r.get::<_, i64>(14)? as u64,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn get_pull_request_by_repo_number(
+        &self,
+        repo: &str,
+        number: i64,
+    ) -> SqliteResult<Option<crate::PullRequest>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, repo, number, title, state, author, base_branch,
+                    head_branch, url, linked_findings, linked_decisions,
+                    linked_goal_id, body, created_at, updated_at
+             FROM pull_requests WHERE repo = ?1 AND number = ?2",
+        )?;
+        let mut rows = stmt.query(params![repo, number])?;
+        if let Some(r) = rows.next()? {
+            Ok(Some(crate::PullRequest {
+                id: r.get(0)?, repo: r.get(1)?, number: r.get(2)?,
+                title: r.get(3)?, state: r.get(4)?, author: r.get(5)?,
+                base_branch: r.get(6)?, head_branch: r.get(7)?, url: r.get(8)?,
+                linked_findings: r.get(9)?, linked_decisions: r.get(10)?,
+                linked_goal_id: r.get(11)?, body: r.get(12)?,
+                created_at: r.get::<_, i64>(13)? as u64,
+                updated_at: r.get::<_, i64>(14)? as u64,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn update_pull_request_links(
+        &self,
+        id: &str,
+        linked_findings: &str,
+        linked_decisions: &str,
+        linked_goal_id: &str,
+        now: u64,
+    ) -> SqliteResult<usize> {
+        let n = self.conn.lock().execute(
+            "UPDATE pull_requests
+             SET linked_findings = ?1,
+                 linked_decisions = ?2,
+                 linked_goal_id = ?3,
+                 updated_at = ?4
+             WHERE id = ?5",
+            params![linked_findings, linked_decisions, linked_goal_id, now as i64, id],
+        )?;
+        Ok(n)
+    }
+
     // ── Peer recovery config (F23) ─────────────────────────────────
 
     pub fn upsert_peer_recovery_config(&self, c: &crate::PeerRecoveryConfig) -> SqliteResult<()> {
@@ -2161,6 +2274,36 @@ const MIGRATIONS: &[Migration] = &[
                 last_fired_at  INTEGER NOT NULL DEFAULT 0,
                 fire_count     INTEGER NOT NULL DEFAULT 0
             );
+        "#,
+    },
+    Migration {
+        version: 17,
+        name: "v17_pull_requests",
+        // F22 — PR management. Webhook receivers + manual link tools
+        // both write here. linked_* are JSON arrays opaque to sqlite
+        // (walked Rust-side on render). UNIQUE(repo, number) so
+        // GitHub `synchronize` deliveries upsert cleanly.
+        up: r#"
+            CREATE TABLE IF NOT EXISTS pull_requests (
+                id                TEXT PRIMARY KEY,
+                repo              TEXT NOT NULL,
+                number            INTEGER NOT NULL,
+                title             TEXT NOT NULL DEFAULT '',
+                state             TEXT NOT NULL DEFAULT 'open',
+                author            TEXT NOT NULL DEFAULT '',
+                base_branch       TEXT NOT NULL DEFAULT '',
+                head_branch       TEXT NOT NULL DEFAULT '',
+                url               TEXT NOT NULL DEFAULT '',
+                linked_findings   TEXT NOT NULL DEFAULT '[]',
+                linked_decisions  TEXT NOT NULL DEFAULT '[]',
+                linked_goal_id    TEXT NOT NULL DEFAULT '',
+                body              TEXT NOT NULL DEFAULT '',
+                created_at        INTEGER NOT NULL,
+                updated_at        INTEGER NOT NULL,
+                UNIQUE (repo, number)
+            );
+            CREATE INDEX IF NOT EXISTS pull_requests_state
+                ON pull_requests (state);
         "#,
     },
 ];

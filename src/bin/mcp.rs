@@ -456,6 +456,32 @@ fn tools_list() -> Value {
                 }
             },
             {
+                "name": "pr_list",
+                "description": "List pull requests tracked by the bridge. Optional `state` (open/closed/merged) + `repo` (org/repo) filters compose.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "state": { "type": "string", "enum": ["open","closed","merged"] },
+                        "repo":  { "type": "string" }
+                    }
+                }
+            },
+            {
+                "name": "pr_link",
+                "description": "Manually attach finding ids / decision keys / a goal id to a tracked PR. Adds (does not replace) — passing existing entries is a no-op. Use to link findings the webhook didn't auto-detect from the body.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo":          { "type": "string", "description": "org/repo" },
+                        "number":        { "type": "number" },
+                        "add_findings":  { "type": "array", "items": { "type": "string" } },
+                        "add_decisions": { "type": "array", "items": { "type": "string" } },
+                        "goal_id":       { "type": "string" }
+                    },
+                    "required": ["repo", "number"]
+                }
+            },
+            {
                 "name": "recovery_config_set",
                 "description": "Configure a routine URL the bridge POSTs to when `peer` drops off (idle >5min) AND has pending unread dispatches. Body shape: `{peer, dispatches:[...], idle_secs}`. SSRF-guarded: URL must be https:// or http://localhost; private-range IP literals refused. Admin-only.",
                 "inputSchema": {
@@ -1949,6 +1975,39 @@ async fn main() {
                         }
                     }
 
+                    "pr_list" => {
+                        let mut qs: Vec<(String, String)> = Vec::new();
+                        if let Some(s) = args_val["state"].as_str() {
+                            qs.push(("state".into(), s.into()));
+                        }
+                        if let Some(r) = args_val["repo"].as_str() {
+                            qs.push(("repo".into(), r.into()));
+                        }
+                        let res = client.get(format!("{}/pull-requests", args.server))
+                            .query(&qs).send().await;
+                        match res {
+                            Ok(r) if r.status().is_success() => {
+                                let b = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] PRs:\n{b}"))
+                            }
+                            Ok(r) => text(id, format!("[bridge] ERROR {}", r.status())),
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+                    "pr_link" => {
+                        let res = client.post(format!("{}/pull-requests/link", args.server))
+                            .json(&args_val).send().await;
+                        match res {
+                            Ok(r) if r.status().is_success() => text(id, "[bridge] PR links updated"),
+                            Ok(r) => {
+                                let s = r.status();
+                                let b = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] ERROR {s}: {b}"))
+                            }
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+
                     "recovery_config_set" => {
                         let res = client.post(format!("{}/recovery-config", args.server))
                             .json(&args_val).send().await;
@@ -2421,6 +2480,9 @@ mod tests {
             "recovery_config_set",
             "recovery_config_list",
             "recovery_config_delete",
+            // F22 PR management:
+            "pr_list",
+            "pr_link",
         ];
         let expected: std::collections::BTreeSet<String> =
             EXPECTED_TOOL_NAMES.iter().map(|s| s.to_string()).collect();

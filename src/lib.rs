@@ -432,6 +432,33 @@ pub const GOAL_METRICS: &[&str] = &[
 pub const GOAL_COMPARATORS: &[&str] = &[">=", "<=", "=="];
 pub const GOAL_STATUSES: &[&str] = &["pending", "met", "missed", "cancelled"];
 
+// ─── F22 — PR management (roadmap-v2) ──────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PullRequest {
+    pub id: String,
+    /// `org/repo` form (e.g. `ronbrain/claude-bridge`).
+    pub repo: String,
+    pub number: i64,
+    pub title: String,
+    /// `open` | `closed` | `merged`.
+    pub state: String,
+    pub author: String,
+    pub base_branch: String,
+    pub head_branch: String,
+    pub url: String,
+    /// JSON array of finding ids auto-extracted from `Closes #...`
+    /// body refs OR manually added via pr_link.
+    pub linked_findings: String,
+    pub linked_decisions: String,
+    pub linked_goal_id: String,
+    pub body: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+pub const PR_STATES: &[&str] = &["open", "closed", "merged"];
+
 // ─── F23 — External recovery webhook (roadmap-v2) ──────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

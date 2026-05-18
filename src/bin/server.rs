@@ -2515,6 +2515,269 @@ async fn metrics_prometheus(State(state): State<AppState>) -> impl IntoResponse 
     )
 }
 
+// ── Pull requests (F22) ─────────────────────────────────────────────
+
+/// Auto-extract `Closes #<id>` / `Fixes #<id>` references from a PR
+/// body — the `<id>` can be an integer (GitHub PR ref, ignored here)
+/// OR a UUID-shaped string we treat as a finding id. Returns the
+/// set of UUID-shaped ids referenced. Cheap regex-less scan.
+fn extract_finding_refs(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for keyword in ["Closes ", "closes ", "Fixes ", "fixes ", "Resolves ", "resolves "] {
+        let mut i = 0;
+        while let Some(pos) = body[i..].find(keyword) {
+            let after = i + pos + keyword.len();
+            // Skip optional `#`.
+            let mut j = after;
+            if body.as_bytes().get(j) == Some(&b'#') {
+                j += 1;
+            }
+            // Scan a token of UUID-shape characters (hex, dash).
+            let mut k = j;
+            while k < body.len()
+                && (body.as_bytes()[k].is_ascii_hexdigit() || body.as_bytes()[k] == b'-')
+            {
+                k += 1;
+            }
+            let token = &body[j..k];
+            // Accept either full UUID (36 chars with dashes) or short
+            // 8-hex-char prefix — common finding id forms in our channels.
+            if looks_like_finding_id(token) && !out.contains(&token.to_string()) {
+                out.push(token.to_string());
+            }
+            i = k.max(i + pos + keyword.len());
+        }
+    }
+    out
+}
+
+fn looks_like_finding_id(s: &str) -> bool {
+    // UUID: 36 chars with dashes at 8/13/18/23.
+    if s.len() == 36 {
+        return s.chars().enumerate().all(|(i, c)| {
+            let dash = matches!(i, 8 | 13 | 18 | 23);
+            if dash { c == '-' } else { c.is_ascii_hexdigit() }
+        });
+    }
+    // Short prefix: 8 hex chars (common shorthand).
+    if s.len() == 8 {
+        return s.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    false
+}
+
+/// GitHub webhook signature verification per the X-Hub-Signature-256
+/// header convention. Computes hmac-sha256(secret, body) and
+/// constant-time compares against the header value (stripped of the
+/// `sha256=` prefix). Reuses the `sha2` crate already pulled in for
+/// audit_hash.
+fn verify_github_signature(secret: &str, body: &[u8], header: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    use subtle::ConstantTimeEq;
+    let Some(stripped) = header.strip_prefix("sha256=") else {
+        return false;
+    };
+    let Some(expected_bytes) = decode_hex_bytes(stripped) else {
+        return false;
+    };
+    // HMAC-SHA256 hand-rolled (avoid pulling in `hmac` crate for one site).
+    // Spec: H((k XOR opad) || H((k XOR ipad) || m))
+    let key_block = {
+        let mut k = [0u8; 64];
+        if secret.len() > 64 {
+            let mut h = Sha256::new();
+            h.update(secret.as_bytes());
+            let d = h.finalize();
+            k[..32].copy_from_slice(&d);
+        } else {
+            k[..secret.len()].copy_from_slice(secret.as_bytes());
+        }
+        k
+    };
+    let mut ipad = [0u8; 64];
+    let mut opad = [0u8; 64];
+    for i in 0..64 {
+        ipad[i] = key_block[i] ^ 0x36;
+        opad[i] = key_block[i] ^ 0x5c;
+    }
+    let inner = {
+        let mut h = Sha256::new();
+        h.update(ipad);
+        h.update(body);
+        h.finalize()
+    };
+    let outer = {
+        let mut h = Sha256::new();
+        h.update(opad);
+        h.update(inner);
+        h.finalize()
+    };
+    if outer.len() != expected_bytes.len() {
+        return false;
+    }
+    outer.as_slice().ct_eq(&expected_bytes).into()
+}
+
+fn decode_hex_bytes(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for chunk in bytes.chunks(2) {
+        let hi = match chunk[0] {
+            b'0'..=b'9' => chunk[0] - b'0',
+            b'a'..=b'f' => chunk[0] - b'a' + 10,
+            b'A'..=b'F' => chunk[0] - b'A' + 10,
+            _ => return None,
+        };
+        let lo = match chunk[1] {
+            b'0'..=b'9' => chunk[1] - b'0',
+            b'a'..=b'f' => chunk[1] - b'a' + 10,
+            b'A'..=b'F' => chunk[1] - b'A' + 10,
+            _ => return None,
+        };
+        out.push((hi << 4) | lo);
+    }
+    Some(out)
+}
+
+async fn pr_webhook(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, (StatusCode, String)> {
+    // GitHub signs with HMAC-SHA256; secret comes from env so it
+    // can rotate without code change.
+    let secret = std::env::var("BRIDGE_PR_WEBHOOK_SECRET").unwrap_or_default();
+    if secret.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BRIDGE_PR_WEBHOOK_SECRET not configured".into(),
+        ));
+    }
+    let sig = headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !verify_github_signature(&secret, &body, sig) {
+        return Err((StatusCode::UNAUTHORIZED, "bad signature".into()));
+    }
+    // Parse the payload — minimal extraction (full GitHub schema is
+    // huge; we read only the fields we care about). Body size capped
+    // by router DefaultBodyLimit so this won't OOM.
+    let v: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad json: {e}")))?;
+    let pr = match v.get("pull_request") {
+        Some(p) => p,
+        None => return Ok(StatusCode::NO_CONTENT), // not a PR event; ignore
+    };
+    let repo = v["repository"]["full_name"].as_str().unwrap_or("").to_string();
+    let number = pr["number"].as_i64().unwrap_or(0);
+    let title = pr["title"].as_str().unwrap_or("").to_string();
+    let state_str = if pr["merged"].as_bool().unwrap_or(false) {
+        "merged"
+    } else {
+        pr["state"].as_str().unwrap_or("open")
+    };
+    let author = pr["user"]["login"].as_str().unwrap_or("").to_string();
+    let base = pr["base"]["ref"].as_str().unwrap_or("").to_string();
+    let head = pr["head"]["ref"].as_str().unwrap_or("").to_string();
+    let url = pr["html_url"].as_str().unwrap_or("").to_string();
+    let body_text = pr["body"].as_str().unwrap_or("").to_string();
+    if repo.is_empty() || number == 0 {
+        return Err((StatusCode::BAD_REQUEST, "missing repo/number".into()));
+    }
+    let auto_findings = extract_finding_refs(&body_text);
+    let now = now_secs();
+    let id = format!("{repo}#{number}");
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "persistence disabled".into(),
+    ))?;
+    let p = claude_bridge::PullRequest {
+        id: id.clone(),
+        repo, number, title, state: state_str.into(),
+        author, base_branch: base, head_branch: head, url,
+        linked_findings: serde_json::to_string(&auto_findings).unwrap_or_else(|_| "[]".into()),
+        linked_decisions: "[]".into(),
+        linked_goal_id: String::new(),
+        body: body_text,
+        created_at: now, updated_at: now,
+    };
+    store
+        .upsert_pull_request(&p)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("persist failed: {e}")))?;
+    write_audit(store, "github-webhook", "upsert", "pull_request", &id,
+                None::<&claude_bridge::PullRequest>, Some(&p));
+    dashboard_event(&state, "pr_upsert",
+                    serde_json::json!({"id": id, "state": state_str}));
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn pr_list(
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<claude_bridge::PullRequest>>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE, "persistence disabled".into()))?;
+    let state_f = q.get("state").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let repo_f = q.get("repo").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let prs = store.list_pull_requests(state_f, repo_f)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list failed: {e}")))?;
+    Ok(Json(prs))
+}
+
+#[derive(Deserialize)]
+struct PrLinkReq {
+    repo: String,
+    number: i64,
+    #[serde(default)]
+    add_findings: Vec<String>,
+    #[serde(default)]
+    add_decisions: Vec<String>,
+    #[serde(default)]
+    goal_id: Option<String>,
+}
+
+async fn pr_link(
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    State(state): State<AppState>,
+    Json(req): Json<PrLinkReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let actor = effective_actor(&headers, ext.as_deref());
+    let store = state.store.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE, "persistence disabled".into()))?;
+    let mut pr = store.get_pull_request_by_repo_number(&req.repo, req.number)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read failed: {e}")))?
+        .ok_or((StatusCode::NOT_FOUND, format!("PR {}#{} not found", req.repo, req.number)))?;
+    let mut findings: Vec<String> = serde_json::from_str(&pr.linked_findings).unwrap_or_default();
+    for f in req.add_findings {
+        if !findings.contains(&f) {
+            findings.push(f);
+        }
+    }
+    let mut decisions: Vec<String> = serde_json::from_str(&pr.linked_decisions).unwrap_or_default();
+    for d in req.add_decisions {
+        if !decisions.contains(&d) {
+            decisions.push(d);
+        }
+    }
+    if let Some(g) = req.goal_id {
+        pr.linked_goal_id = g;
+    }
+    store.update_pull_request_links(
+        &pr.id,
+        &serde_json::to_string(&findings).unwrap_or_else(|_| "[]".into()),
+        &serde_json::to_string(&decisions).unwrap_or_else(|_| "[]".into()),
+        &pr.linked_goal_id,
+        now_secs(),
+    ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("update failed: {e}")))?;
+    write_audit(store, &actor, "link", "pull_request", &pr.id,
+                None::<&claude_bridge::PullRequest>, None::<&claude_bridge::PullRequest>);
+    dashboard_event(&state, "pr_linked", serde_json::json!({"id": pr.id, "by": actor}));
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ── Peer recovery webhook (F23) ─────────────────────────────────────
 
 /// SSRF guard for routine URLs. Refuses anything that isn't an
@@ -4572,6 +4835,9 @@ async fn main() {
         // F23 peer recovery webhook config (admin-only mutations)
         .route("/recovery-config", post(recovery_config_upsert).get(recovery_config_list))
         .route("/recovery-config/{peer}", delete(recovery_config_delete))
+        // F22 pull requests
+        .route("/pull-requests", get(pr_list))
+        .route("/pull-requests/link", post(pr_link))
         // Shared memory KV
         .route("/memory/{channel}", get(memory_list))
         .route("/memory/{channel}/{key}",
@@ -4625,6 +4891,12 @@ async fn main() {
         // proxy ACL. The payload is aggregate-only counts, no
         // per-peer secrets.
         .route("/metrics/prometheus", get(metrics_prometheus))
+        // F22 PR webhook receiver — unauthed at the bearer layer,
+        // gated by HMAC-SHA256 X-Hub-Signature-256 against
+        // BRIDGE_PR_WEBHOOK_SECRET env. GitHub-format. Per-route
+        // override on body limit to 256 KB (PR bodies can be long).
+        .route("/webhooks/pr",
+            post(pr_webhook).layer(axum::extract::DefaultBodyLimit::max(256 * 1024)))
         .with_state(state.clone());
 
     // Store the auth state in the app for handlers that need to
@@ -4731,6 +5003,39 @@ mod tests {
         assert!(!channel_name_valid("under_score"));
         assert!(!channel_name_valid("a,b,c"));
         assert!(!channel_name_valid(&"x".repeat(64)));
+    }
+
+    #[test]
+    fn extract_finding_refs_finds_uuid_and_short_forms() {
+        let body = "Closes #dc633d7c\nFixes #9fe0e927-9d65-44a1-90f0-34674371b931\nNo refs here.\nResolves #00000000";
+        let refs = extract_finding_refs(body);
+        assert!(refs.contains(&"dc633d7c".to_string()));
+        assert!(refs.contains(&"9fe0e927-9d65-44a1-90f0-34674371b931".to_string()));
+        assert!(refs.contains(&"00000000".to_string()));
+        // Dedup: same id twice → once.
+        let body2 = "Closes #abcdef01\nFixes #abcdef01";
+        assert_eq!(extract_finding_refs(body2), vec!["abcdef01".to_string()]);
+        // Non-hex shouldn't pass.
+        assert!(extract_finding_refs("Closes #not-a-uuid").is_empty());
+        // PR refs (integer) shouldn't pass.
+        assert!(extract_finding_refs("Closes #42").is_empty());
+    }
+
+    #[test]
+    fn verify_github_signature_accepts_correct_rejects_wrong() {
+        // Computed via Python: hmac.new(b"sekret", b"hello world", sha256).hexdigest()
+        let body = b"hello world";
+        let secret = "sekret";
+        let good = "sha256=db01f81141eb418fa05284d1901be1cce4103d3029032f854eec892092af000c";
+        assert!(verify_github_signature(secret, body, good));
+        // One char flipped → rejected (constant-time compare so no
+        // timing leak either, but we don't assert that here).
+        let bad = "sha256=db01f81141eb418fa05284d1901be1cce4103d3029032f854eec892092af000d";
+        assert!(!verify_github_signature(secret, body, bad));
+        // Missing prefix → rejected.
+        assert!(!verify_github_signature(secret, body, "734cc62f"));
+        // Wrong secret → rejected.
+        assert!(!verify_github_signature("wrong", body, good));
     }
 
     #[test]
