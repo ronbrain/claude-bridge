@@ -456,6 +456,39 @@ fn tools_list() -> Value {
                 }
             },
             {
+                "name": "plan_create",
+                "description": "Create a multi-step plan. `steps` is an array of {id, title, depends_on?, status?} — step ids must be unique within the plan; depends_on refs must point to other step ids in the same plan. Status defaults to 'todo' if omitted. Plan auto-closes when all steps are done/cancelled (via plan_advance).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "title":       { "type": "string" },
+                        "description": { "type": "string" },
+                        "channel":     { "type": "string" },
+                        "owner":       { "type": "string" },
+                        "steps":       { "type": "array", "items": { "type": "object" } }
+                    },
+                    "required": ["title"]
+                }
+            },
+            {
+                "name": "plan_list",
+                "description": "List every plan with steps_json + status (active/done/cancelled).",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "plan_advance",
+                "description": "Transition a step to a new status. Refuses if depends_on aren't all done/cancelled (when advancing to in_progress or done). Auto-closes the parent plan when ALL steps terminal.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "plan_id":    { "type": "string" },
+                        "step_id":    { "type": "string" },
+                        "new_status": { "type": "string", "enum": ["todo","in_progress","done","cancelled"] }
+                    },
+                    "required": ["plan_id", "step_id", "new_status"]
+                }
+            },
+            {
                 "name": "goal_create",
                 "description": "Create an operator goal — target_metric ∈ {peers_active, findings_open, tasks_active, dispatches_pending, sla_met_pct}, target_value is the threshold, comparator is `>=` (default) / `<=` / `==`. Optional `deadline` (unix-secs) and `channel` (display-only). Background scanner updates current_value every base tick; fires `goal_achieved` routing trigger on the pending→met transition edge.",
                 "inputSchema": {
@@ -1890,6 +1923,56 @@ async fn main() {
                         }
                     }
 
+                    "plan_create" => {
+                        let res = client.post(format!("{}/plans", args.server))
+                            .json(&args_val).send().await;
+                        match res {
+                            Ok(r) if r.status().is_success() => {
+                                let b = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] plan created:\n{b}"))
+                            }
+                            Ok(r) => {
+                                let s = r.status();
+                                let b = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] ERROR {s}: {b}"))
+                            }
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+                    "plan_list" => {
+                        let res = client.get(format!("{}/plans", args.server)).send().await;
+                        match res {
+                            Ok(r) if r.status().is_success() => {
+                                let b = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] plans:\n{b}"))
+                            }
+                            Ok(r) => text(id, format!("[bridge] ERROR {}", r.status())),
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+                    "plan_advance" => {
+                        let pid = args_val["plan_id"].as_str().unwrap_or("").to_string();
+                        if pid.is_empty() {
+                            text(id, "[bridge] ERROR: plan_id required")
+                        } else {
+                            let body = serde_json::json!({
+                                "step_id": args_val["step_id"].as_str().unwrap_or(""),
+                                "new_status": args_val["new_status"].as_str().unwrap_or(""),
+                            });
+                            let res = client.post(format!("{}/plans/{}/advance", args.server, encode_path_segment(&pid)))
+                                .json(&body).send().await;
+                            match res {
+                                Ok(r) if r.status().is_success() => text(id, format!("[bridge] plan_advance OK for {pid}")),
+                                Ok(r) => {
+                                    let s = r.status();
+                                    let b = r.text().await.unwrap_or_default();
+                                    text(id, format!("[bridge] ERROR {s}: {b}"))
+                                }
+                                _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                            }
+                        }
+                    }
+
                     "goal_create" => {
                         let res = client.post(format!("{}/goals", args.server))
                             .json(&args_val).send().await;
@@ -2261,6 +2344,10 @@ mod tests {
             "goal_create",
             "goal_list",
             "goal_cancel",
+            // F21 plans:
+            "plan_create",
+            "plan_list",
+            "plan_advance",
         ];
         let expected: std::collections::BTreeSet<String> =
             EXPECTED_TOOL_NAMES.iter().map(|s| s.to_string()).collect();

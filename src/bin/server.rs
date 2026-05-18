@@ -2515,6 +2515,174 @@ async fn metrics_prometheus(State(state): State<AppState>) -> impl IntoResponse 
     )
 }
 
+// ── Plans (F21) ─────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CreatePlanReq {
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    channel: String,
+    #[serde(default)]
+    owner: String,
+    /// Initial steps — each gets status='todo' if not specified.
+    /// Step ids must be unique within the plan; depends_on refs
+    /// must point to other ids in the same plan (validated at
+    /// insert + advance time).
+    #[serde(default)]
+    steps: Vec<claude_bridge::PlanStep>,
+}
+
+const MAX_PLAN_TITLE_LEN: usize = 256;
+const MAX_PLAN_DESC_LEN: usize = 8 * 1024;
+const MAX_PLAN_STEPS: usize = 100;
+
+fn validate_plan_steps(steps: &[claude_bridge::PlanStep]) -> Result<(), String> {
+    if steps.len() > MAX_PLAN_STEPS {
+        return Err(format!("plan has {} steps; max {MAX_PLAN_STEPS}", steps.len()));
+    }
+    let ids: std::collections::HashSet<&str> = steps.iter().map(|s| s.id.as_str()).collect();
+    if ids.len() != steps.len() {
+        return Err("step ids must be unique within the plan".into());
+    }
+    for s in steps {
+        if s.id.is_empty() {
+            return Err("step id required".into());
+        }
+        for d in &s.depends_on {
+            if !ids.contains(d.as_str()) {
+                return Err(format!(
+                    "step '{}' depends_on '{}' which isn't a step in the plan", s.id, d
+                ));
+            }
+        }
+        if !claude_bridge::PLAN_STEP_STATUSES.contains(&s.status.as_str()) {
+            return Err(format!(
+                "step '{}' status must be one of {:?}", s.id, claude_bridge::PLAN_STEP_STATUSES
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn create_plan(
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    State(state): State<AppState>,
+    Json(req): Json<CreatePlanReq>,
+) -> Result<Json<claude_bridge::Plan>, (StatusCode, String)> {
+    cap!(req.title, MAX_PLAN_TITLE_LEN, "title");
+    cap!(req.description, MAX_PLAN_DESC_LEN, "description");
+    // Default any step's missing status to 'todo' so callers can
+    // submit shorter payloads.
+    let mut steps = req.steps;
+    for s in &mut steps {
+        if s.status.is_empty() {
+            s.status = "todo".into();
+        }
+    }
+    if let Err(e) = validate_plan_steps(&steps) {
+        return Err((StatusCode::BAD_REQUEST, e));
+    }
+    let actor = effective_actor(&headers, ext.as_deref());
+    let store = state.store.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE, "persistence disabled".into()))?;
+    let steps_json = serde_json::to_string(&steps).unwrap_or_else(|_| "[]".into());
+    let now = now_secs();
+    let plan = claude_bridge::Plan {
+        id: Uuid::new_v4().to_string(),
+        channel: req.channel, title: req.title, description: req.description,
+        steps_json, status: "active".into(),
+        owner: if req.owner.is_empty() { actor.clone() } else { req.owner },
+        created_by: actor.clone(),
+        created_at: now, updated_at: now,
+    };
+    store.insert_plan(&plan).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("persist failed: {e}")))?;
+    write_audit(store, &actor, "create", "plan", &plan.id,
+                None::<&claude_bridge::Plan>, Some(&plan));
+    dashboard_event(&state, "plan_created", serde_json::json!({"id": plan.id, "title": plan.title}));
+    Ok(Json(plan))
+}
+
+async fn list_plans(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<claude_bridge::Plan>>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE, "persistence disabled".into()))?;
+    let plans = store.list_plans().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list failed: {e}")))?;
+    Ok(Json(plans))
+}
+
+#[derive(Deserialize)]
+struct AdvanceStepReq {
+    step_id: String,
+    /// New status for the step. Must be in PLAN_STEP_STATUSES.
+    new_status: String,
+}
+
+/// Atomically transition `step_id` to `new_status` inside `plan_id`'s
+/// steps_json. Refuses if any depends_on isn't yet `done`/`cancelled`
+/// (the dep-resolution guard — closes the "step advanced before deps"
+/// race). Auto-marks the plan itself `done` when ALL steps are
+/// `done`/`cancelled`.
+async fn plan_advance(
+    Path(plan_id): Path<String>,
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    State(state): State<AppState>,
+    Json(req): Json<AdvanceStepReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !claude_bridge::PLAN_STEP_STATUSES.contains(&req.new_status.as_str()) {
+        return Err((StatusCode::BAD_REQUEST, format!("new_status must be in {:?}", claude_bridge::PLAN_STEP_STATUSES)));
+    }
+    let actor = effective_actor(&headers, ext.as_deref());
+    let store = state.store.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE, "persistence disabled".into()))?;
+    let plan = store.get_plan(&plan_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read failed: {e}")))?
+        .ok_or((StatusCode::NOT_FOUND, format!("plan '{plan_id}' not found")))?;
+    if plan.status != "active" {
+        return Err((StatusCode::CONFLICT, format!("plan '{plan_id}' is '{}', not active", plan.status)));
+    }
+    let mut steps: Vec<claude_bridge::PlanStep> =
+        serde_json::from_str(&plan.steps_json).unwrap_or_default();
+    // Build done set BEFORE mutation so the dep check sees pre-state.
+    let done_ids: std::collections::HashSet<String> = steps
+        .iter()
+        .filter(|s| s.status == "done" || s.status == "cancelled")
+        .map(|s| s.id.clone())
+        .collect();
+    let step_idx = steps.iter().position(|s| s.id == req.step_id)
+        .ok_or((StatusCode::NOT_FOUND, format!("step '{}' not in plan", req.step_id)))?;
+    // Dep guard — only enforce when advancing to in_progress or done
+    // (cancel + back-to-todo are always allowed).
+    if req.new_status == "in_progress" || req.new_status == "done" {
+        let unmet: Vec<&String> = steps[step_idx].depends_on.iter()
+            .filter(|d| !done_ids.contains(*d))
+            .collect();
+        if !unmet.is_empty() {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("step '{}' depends_on unmet: {unmet:?}", req.step_id),
+            ));
+        }
+    }
+    steps[step_idx].status = req.new_status.clone();
+    // Auto-close the plan when every step is terminal.
+    let now = now_secs();
+    let all_done = steps.iter().all(|s| s.status == "done" || s.status == "cancelled");
+    let new_steps_json = serde_json::to_string(&steps).unwrap_or_else(|_| "[]".into());
+    store.write_plan_steps(&plan_id, &new_steps_json, now)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write failed: {e}")))?;
+    if all_done && plan.status == "active" {
+        let _ = store.set_plan_status(&plan_id, "done", now);
+        dashboard_event(&state, "plan_done", serde_json::json!({"id": plan_id}));
+    }
+    write_audit(store, &actor, "advance_step", "plan", &plan_id,
+                None::<&claude_bridge::Plan>, None::<&claude_bridge::Plan>);
+    dashboard_event(&state, "plan_step_advanced",
+                    serde_json::json!({"plan_id": plan_id, "step_id": req.step_id, "new_status": req.new_status}));
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ── Goals (F20) ─────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -4273,6 +4441,9 @@ async fn main() {
         // F20 goals
         .route("/goals", post(create_goal).get(list_goals))
         .route("/goals/{id}", delete(cancel_goal))
+        // F21 plans
+        .route("/plans", post(create_plan).get(list_plans))
+        .route("/plans/{id}/advance", post(plan_advance))
         // Shared memory KV
         .route("/memory/{channel}", get(memory_list))
         .route("/memory/{channel}/{key}",

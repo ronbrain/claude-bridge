@@ -432,6 +432,40 @@ pub const GOAL_METRICS: &[&str] = &[
 pub const GOAL_COMPARATORS: &[&str] = &[">=", "<=", "=="];
 pub const GOAL_STATUSES: &[&str] = &["pending", "met", "missed", "cancelled"];
 
+// ─── F21 — Plans (roadmap-v2) ──────────────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Plan {
+    pub id: String,
+    pub channel: String,
+    pub title: String,
+    pub description: String,
+    /// JSON serialization of `Vec<PlanStep>` — stored opaque in
+    /// sqlite, parsed at read/advance time.
+    pub steps_json: String,
+    /// `active` | `done` | `cancelled`.
+    pub status: String,
+    pub owner: String,
+    pub created_by: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlanStep {
+    pub id: String,
+    pub title: String,
+    /// Other step ids in the same plan that must be `done` before
+    /// this step can advance. Empty = no deps.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// `todo` | `in_progress` | `done` | `cancelled`.
+    pub status: String,
+}
+
+pub const PLAN_STATUSES: &[&str] = &["active", "done", "cancelled"];
+pub const PLAN_STEP_STATUSES: &[&str] = &["todo", "in_progress", "done", "cancelled"];
+
 // ─── F26 — Background watcher (roadmap-v2) ─────────────────────────
 
 /// One row in `peer_watchers`. Tracks a bg `claude --bg` subprocess

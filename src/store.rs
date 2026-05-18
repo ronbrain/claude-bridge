@@ -549,6 +549,89 @@ impl Store {
         Ok(n)
     }
 
+    // ── Plans (F21) ────────────────────────────────────────────────
+
+    pub fn insert_plan(&self, p: &crate::Plan) -> SqliteResult<()> {
+        self.conn.lock().execute(
+            "INSERT INTO plans
+             (id, channel, title, description, steps_json, status,
+              owner, created_by, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                p.id, p.channel, p.title, p.description, p.steps_json,
+                p.status, p.owner, p.created_by,
+                p.created_at as i64, p.updated_at as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_plan(&self, id: &str) -> SqliteResult<Option<crate::Plan>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, channel, title, description, steps_json, status,
+                    owner, created_by, created_at, updated_at
+             FROM plans WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(r) = rows.next()? {
+            Ok(Some(crate::Plan {
+                id: r.get(0)?, channel: r.get(1)?, title: r.get(2)?,
+                description: r.get(3)?, steps_json: r.get(4)?,
+                status: r.get(5)?, owner: r.get(6)?, created_by: r.get(7)?,
+                created_at: r.get::<_, i64>(8)? as u64,
+                updated_at: r.get::<_, i64>(9)? as u64,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_plans(&self) -> SqliteResult<Vec<crate::Plan>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, channel, title, description, steps_json, status,
+                    owner, created_by, created_at, updated_at
+             FROM plans ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(crate::Plan {
+                id: r.get(0)?, channel: r.get(1)?, title: r.get(2)?,
+                description: r.get(3)?, steps_json: r.get(4)?,
+                status: r.get(5)?, owner: r.get(6)?, created_by: r.get(7)?,
+                created_at: r.get::<_, i64>(8)? as u64,
+                updated_at: r.get::<_, i64>(9)? as u64,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Replace the steps_json + bump updated_at. Used by
+    /// plan_advance after walking + validating the step transition.
+    pub fn write_plan_steps(&self, id: &str, steps_json: &str, now: u64) -> SqliteResult<usize> {
+        let n = self.conn.lock().execute(
+            "UPDATE plans SET steps_json = ?1, updated_at = ?2 WHERE id = ?3",
+            params![steps_json, now as i64, id],
+        )?;
+        Ok(n)
+    }
+
+    pub fn set_plan_status(&self, id: &str, status: &str, now: u64) -> SqliteResult<usize> {
+        let n = self.conn.lock().execute(
+            "UPDATE plans SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![status, now as i64, id],
+        )?;
+        Ok(n)
+    }
+
+    pub fn delete_plan(&self, id: &str) -> SqliteResult<usize> {
+        let n = self.conn.lock().execute(
+            "DELETE FROM plans WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(n)
+    }
+
     // ── Goals (F20) ────────────────────────────────────────────────
 
     pub fn insert_goal(&self, g: &crate::Goal) -> SqliteResult<()> {
@@ -1984,6 +2067,32 @@ const MIGRATIONS: &[Migration] = &[
                 ON goals (status);
         "#,
     },
+    Migration {
+        version: 15,
+        name: "v15_plans",
+        // F21 — Plan = an ordered tree of steps with intra-plan
+        // dependencies. Distinct from `tasks` because plans express
+        // "multi-step work for ONE owner" while tasks are unit-of-
+        // work claimable across peers. steps_json is a JSON array
+        // of {id, title, depends_on, status} — opaque to sqlite,
+        // walked Rust-side at plan_advance + render time.
+        up: r#"
+            CREATE TABLE IF NOT EXISTS plans (
+                id          TEXT PRIMARY KEY,
+                channel     TEXT NOT NULL DEFAULT '',
+                title       TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                steps_json  TEXT NOT NULL DEFAULT '[]',
+                status      TEXT NOT NULL DEFAULT 'active',
+                owner       TEXT NOT NULL DEFAULT '',
+                created_by  TEXT NOT NULL DEFAULT '',
+                created_at  INTEGER NOT NULL,
+                updated_at  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS plans_status
+                ON plans (status);
+        "#,
+    },
 ];
 
 /// Best-effort column adds for pre-runner DBs. `CREATE TABLE IF
@@ -2495,6 +2604,43 @@ mod tests {
             .unwrap();
         s.checkpoint_wal_on_shutdown().expect("first checkpoint");
         s.checkpoint_wal_on_shutdown().expect("second checkpoint idempotent");
+    }
+
+    #[test]
+    fn f21_plan_crud_and_status_roundtrip() {
+        let s = temp_store();
+        let now = crate::now_secs();
+        let steps = vec![
+            crate::PlanStep { id: "a".into(), title: "A".into(), depends_on: vec![], status: "todo".into() },
+            crate::PlanStep { id: "b".into(), title: "B".into(), depends_on: vec!["a".into()], status: "todo".into() },
+        ];
+        let p = crate::Plan {
+            id: "p1".into(), channel: "c1".into(), title: "ship F21".into(),
+            description: "".into(),
+            steps_json: serde_json::to_string(&steps).unwrap(),
+            status: "active".into(), owner: "alice".into(), created_by: "ops".into(),
+            created_at: now, updated_at: now,
+        };
+        s.insert_plan(&p).unwrap();
+        let got = s.get_plan("p1").unwrap().expect("present");
+        assert_eq!(got.title, "ship F21");
+        assert_eq!(got.owner, "alice");
+        let parsed: Vec<crate::PlanStep> = serde_json::from_str(&got.steps_json).unwrap();
+        assert_eq!(parsed.len(), 2);
+        // Mutate steps via write_plan_steps.
+        let mut updated = parsed.clone();
+        updated[0].status = "done".into();
+        let new_json = serde_json::to_string(&updated).unwrap();
+        let n = s.write_plan_steps("p1", &new_json, now + 1).unwrap();
+        assert_eq!(n, 1);
+        let after = s.get_plan("p1").unwrap().unwrap();
+        let after_steps: Vec<crate::PlanStep> = serde_json::from_str(&after.steps_json).unwrap();
+        assert_eq!(after_steps[0].status, "done");
+        // set_plan_status closes the plan.
+        s.set_plan_status("p1", "done", now + 2).unwrap();
+        assert_eq!(s.get_plan("p1").unwrap().unwrap().status, "done");
+        // list returns 1.
+        assert_eq!(s.list_plans().unwrap().len(), 1);
     }
 
     #[test]
