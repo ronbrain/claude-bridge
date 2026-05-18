@@ -1020,28 +1020,76 @@ async fn main() {
             }
         }
     }
+    // Fast-path: build the reqwest client BEFORE the loop but defer
+    // the heartbeat spawn until AFTER `initialize` responds. The
+    // observed failure on `claude --resume` is the harness marking
+    // the MCP server as "disconnected" when it doesn't see an
+    // `initialize` response within ~few seconds; any extra work on
+    // the boot path (TLS warmup, presence POST, peer registry hit)
+    // eats into that budget. Heartbeat fires immediately after the
+    // first `initialize` reply, so peer registration is delayed by
+    // the round-trip time of one stdio message — negligible.
     let client = reqwest::Client::builder()
         .default_headers(headers)
         .build()
         .expect("reqwest client construction");
 
-    // Mark ourselves online before serving the first request — the
-    // peer's `list_peers` call right after we boot should see us.
-    // Hold the abort handle so we can shut the background loop down
-    // cleanly when stdin closes (Claude Code is shutting us down).
-    let heartbeat = spawn_heartbeat(args.clone(), client.clone());
+    // Install signal handlers so a resume-induced SIGTERM/SIGINT
+    // doesn't kill us mid-write. The harness sends SIGTERM when it
+    // tears down the old MCP child during resume; without an
+    // explicit handler we exit with status 143 and the client logs
+    // "disconnected (signal 15)". Ignoring SIGHUP is also helpful:
+    // when the parent claude gets SIGHUP'd from a terminal close,
+    // the process-group default would propagate it to us and abort
+    // any in-flight stdout write. The stdin EOF path remains the
+    // canonical shutdown — these handlers just race-protect it.
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM");
+            let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT");
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = sigint.recv() => {}
+            }
+            shutdown.notify_waiters();
+        });
+        // SIGHUP: re-attach is normal on resume — ignore rather
+        // than die. We still exit on stdin EOF / explicit SIGTERM.
+        unsafe {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        }
+    }
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
     let mut writer = stdout;
     let mut line = String::new();
+    let mut heartbeat: Option<tokio::task::AbortHandle> = None;
 
     loop {
         line.clear();
-        match reader.read_line(&mut line).await {
+        let read = tokio::select! {
+            r = reader.read_line(&mut line) => r,
+            _ = shutdown.notified() => {
+                // SIGTERM/SIGINT path: flush whatever's pending
+                // and exit clean (status 0) instead of getting
+                // signal-killed mid-write.
+                let _ = writer.flush().await;
+                if let Some(h) = heartbeat.take() {
+                    h.abort();
+                }
+                break;
+            }
+        };
+        match read {
             Ok(0) | Err(_) => {
-                heartbeat.abort();
+                if let Some(h) = heartbeat.take() {
+                    h.abort();
+                }
                 break;
             }
             Ok(_) => {}
@@ -1060,11 +1108,19 @@ async fn main() {
         let id = req.id.clone().unwrap_or(Value::Null);
 
         let response = match req.method.as_str() {
-            "initialize" => ok(id, json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": { "tools": {} },
-                "serverInfo": { "name": "claude-bridge", "version": "0.2.0" }
-            })),
+            "initialize" => {
+                // Spawn the heartbeat lazily on first `initialize` so
+                // the registration POST doesn't sit in flight when the
+                // harness is still waiting for the handshake reply.
+                if heartbeat.is_none() {
+                    heartbeat = Some(spawn_heartbeat(args.clone(), client.clone()));
+                }
+                ok(id, json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "claude-bridge", "version": "0.2.0" }
+                }))
+            }
 
             "notifications/initialized" => continue,
 
