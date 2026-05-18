@@ -2515,6 +2515,100 @@ async fn metrics_prometheus(State(state): State<AppState>) -> impl IntoResponse 
     )
 }
 
+// ── Peer recovery webhook (F23) ─────────────────────────────────────
+
+/// SSRF guard for routine URLs. Refuses anything that isn't an
+/// https:// scheme or localhost http for dev. Blocks RFC 1918 +
+/// loopback v6 + link-local + multicast hosts (operator can still
+/// bypass by IP literal embedded in a public hostname, but the
+/// common-case attack vectors are closed).
+fn validate_routine_url(url: &str) -> Result<(), String> {
+    if url.len() > 2048 {
+        return Err("routine_url too long (max 2048)".into());
+    }
+    let lower = url.to_ascii_lowercase();
+    if !lower.starts_with("https://") && !lower.starts_with("http://localhost") && !lower.starts_with("http://127.0.0.1") {
+        return Err("routine_url must be https:// (or http://localhost for dev)".into());
+    }
+    // Reject obvious private-range hostnames in plain http or https.
+    // Imperfect — does NOT resolve DNS — but catches the common case
+    // of an operator pasting an internal IP literal by mistake.
+    for needle in &["://10.", "://172.16.", "://172.17.", "://172.18.", "://172.19.",
+                     "://172.20.", "://172.21.", "://172.22.", "://172.23.",
+                     "://172.24.", "://172.25.", "://172.26.", "://172.27.",
+                     "://172.28.", "://172.29.", "://172.30.", "://172.31.",
+                     "://192.168.", "://169.254.", "://[fc", "://[fd",
+                     "://[fe80", "://[::1"] {
+        if lower.contains(needle) {
+            return Err(format!("routine_url contains private-range host '{needle}' — refusing"));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct PeerRecoveryReq {
+    peer: String,
+    routine_url: String,
+}
+
+async fn recovery_config_upsert(
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
+    State(state): State<AppState>,
+    Json(req): Json<PeerRecoveryReq>,
+) -> Result<Json<claude_bridge::PeerRecoveryConfig>, (StatusCode, String)> {
+    let actor = effective_actor(&headers, ext.as_deref());
+    let is_admin = auth_ext.as_deref().map(|a| a.is_memory_admin(&actor)).unwrap_or(false);
+    if !is_admin {
+        return Err((StatusCode::FORBIDDEN, "recovery_config requires BRIDGE_MEMORY_ADMINS".into()));
+    }
+    if let Err(e) = validate_routine_url(&req.routine_url) {
+        return Err((StatusCode::BAD_REQUEST, e));
+    }
+    cap!(req.peer, MAX_WATCHER_PEER_LEN, "peer");
+    let store = state.store.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE, "persistence disabled".into()))?;
+    let cfg = claude_bridge::PeerRecoveryConfig {
+        peer: req.peer, routine_url: req.routine_url, created_by: actor.clone(),
+        created_at: now_secs(), last_fired_at: 0, fire_count: 0,
+    };
+    store.upsert_peer_recovery_config(&cfg).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("persist failed: {e}")))?;
+    write_audit(store, &actor, "upsert", "peer_recovery_config", &cfg.peer,
+                None::<&claude_bridge::PeerRecoveryConfig>, Some(&cfg));
+    Ok(Json(cfg))
+}
+
+async fn recovery_config_list(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<claude_bridge::PeerRecoveryConfig>>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE, "persistence disabled".into()))?;
+    let cfgs = store.list_peer_recovery_configs().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list failed: {e}")))?;
+    Ok(Json(cfgs))
+}
+
+async fn recovery_config_delete(
+    Path(peer): Path<String>,
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let actor = effective_actor(&headers, ext.as_deref());
+    let is_admin = auth_ext.as_deref().map(|a| a.is_memory_admin(&actor)).unwrap_or(false);
+    if !is_admin {
+        return Err((StatusCode::FORBIDDEN, "admin only".into()));
+    }
+    let store = state.store.as_ref().ok_or((StatusCode::SERVICE_UNAVAILABLE, "persistence disabled".into()))?;
+    let n = store.delete_peer_recovery_config(&peer).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("delete failed: {e}")))?;
+    if n == 0 {
+        return Err((StatusCode::NOT_FOUND, format!("no config for peer '{peer}'")));
+    }
+    write_audit(store, &actor, "delete", "peer_recovery_config", &peer,
+                None::<&claude_bridge::PeerRecoveryConfig>, None::<&claude_bridge::PeerRecoveryConfig>);
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ── Plans (F21) ─────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -4245,6 +4339,37 @@ async fn main() {
             flush: auto_batch_flush,
         }),
         Arc::new(claude_bridge::automation::TaskReadyScanner::default()),
+        Arc::new(claude_bridge::automation::PeerRecoveryScanner {
+            fire: Arc::new(|peer: &str, url: &str, payload: &serde_json::Value| {
+                // Fire-and-forget POST. tokio::spawn so the scanner
+                // tick doesn't block on a slow remote. Best-effort:
+                // errors logged, no retry (the next drop cycle will
+                // re-fire after the cooldown).
+                let url = url.to_string();
+                let peer = peer.to_string();
+                let body = payload.clone();
+                tokio::spawn(async move {
+                    let client = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(10))
+                        .build()
+                        .expect("reqwest client");
+                    match client.post(&url).json(&body).send().await {
+                        Ok(r) if r.status().is_success() => {
+                            tracing::info!(peer = %peer, status = %r.status(),
+                                "peer_recovery: routine fired");
+                        }
+                        Ok(r) => {
+                            tracing::warn!(peer = %peer, status = %r.status(),
+                                "peer_recovery: routine returned non-2xx");
+                        }
+                        Err(e) => {
+                            tracing::warn!(peer = %peer, error = %e,
+                                "peer_recovery: routine POST failed");
+                        }
+                    }
+                });
+            }),
+        }),
         Arc::new(claude_bridge::automation::GoalScanner {
             metrics_provider: {
                 let state_for_metrics = state.clone();
@@ -4444,6 +4569,9 @@ async fn main() {
         // F21 plans
         .route("/plans", post(create_plan).get(list_plans))
         .route("/plans/{id}/advance", post(plan_advance))
+        // F23 peer recovery webhook config (admin-only mutations)
+        .route("/recovery-config", post(recovery_config_upsert).get(recovery_config_list))
+        .route("/recovery-config/{peer}", delete(recovery_config_delete))
         // Shared memory KV
         .route("/memory/{channel}", get(memory_list))
         .route("/memory/{channel}/{key}",
@@ -4603,6 +4731,36 @@ mod tests {
         assert!(!channel_name_valid("under_score"));
         assert!(!channel_name_valid("a,b,c"));
         assert!(!channel_name_valid(&"x".repeat(64)));
+    }
+
+    #[test]
+    fn validate_routine_url_blocks_private_ranges_and_bad_schemes() {
+        // Allowed.
+        assert!(validate_routine_url("https://example.com/fire").is_ok());
+        assert!(validate_routine_url("https://api.example.com/v2/wake?peer=alice").is_ok());
+        assert!(validate_routine_url("http://localhost:8080/fire").is_ok());
+        assert!(validate_routine_url("http://127.0.0.1:9000/fire").is_ok());
+        // Rejected: schemes.
+        assert!(validate_routine_url("file:///etc/passwd").is_err());
+        assert!(validate_routine_url("ftp://example.com/").is_err());
+        assert!(validate_routine_url("http://evil.com/").is_err());
+        // Rejected: private-range IP literals.
+        for url in [
+            "https://10.0.0.1/fire",
+            "https://10.255.255.255/fire",
+            "https://172.16.0.1/fire",
+            "https://172.31.255.255/fire",
+            "https://192.168.1.1/fire",
+            "https://169.254.169.254/", // AWS IMDS
+            "https://[fc00::1]/fire",
+            "https://[fe80::1]/fire",
+            "https://[::1]/fire",
+        ] {
+            assert!(validate_routine_url(url).is_err(), "should reject {url}");
+        }
+        // Length cap.
+        let too_long = format!("https://{}.example.com/", "a".repeat(3000));
+        assert!(validate_routine_url(&too_long).is_err());
     }
 
     #[test]

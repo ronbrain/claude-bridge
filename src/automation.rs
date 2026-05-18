@@ -237,6 +237,80 @@ impl Scanner for DispatchEscalationScanner {
     }
 }
 
+/// PeerRecoveryScanner (F23) — when a peer drops off (last_seen
+/// lag > threshold, default 5min) AND has pending dispatches AND
+/// has a configured recovery routine URL, POST to that URL with
+/// the dispatch context. De-dup via `last_fired_at` so a single
+/// drop episode triggers one POST per cooldown window (15 min).
+pub struct PeerRecoveryScanner {
+    /// Fires the POST. Wired from main() with a state-clone capture
+    /// so the scanner stays decoupled from server.rs internals.
+    /// The closure is responsible for SSRF guards on the URL.
+    pub fire: Arc<dyn Fn(&str, &str, &serde_json::Value) + Send + Sync>,
+}
+
+#[async_trait::async_trait]
+impl Scanner for PeerRecoveryScanner {
+    fn name(&self) -> &'static str {
+        "peer_recovery"
+    }
+    fn every(&self) -> u64 {
+        1
+    }
+    async fn tick(&self, ctx: &AutomationCtx) {
+        let Some(store) = &ctx.store else { return };
+        let configs = match store.list_peer_recovery_configs() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "peer recovery config read failed");
+                return;
+            }
+        };
+        if configs.is_empty() {
+            return;
+        }
+        let now = crate::now_secs();
+        const DROP_THRESHOLD_SECS: u64 = 5 * 60;
+        const FIRE_COOLDOWN_SECS: u64 = 15 * 60;
+        let peers = (ctx.peers_snapshot)();
+        // Map peer name → idle_secs for quick lookup.
+        let peer_idles: std::collections::HashMap<String, u64> = peers
+            .iter()
+            .map(|(n, last_seen, _ch)| (n.clone(), now.saturating_sub(*last_seen)))
+            .collect();
+        for cfg in configs {
+            let idle = peer_idles.get(&cfg.peer).copied().unwrap_or(u64::MAX);
+            if idle < DROP_THRESHOLD_SECS {
+                continue;
+            }
+            if now.saturating_sub(cfg.last_fired_at) < FIRE_COOLDOWN_SECS {
+                continue;
+            }
+            let pending = store
+                .open_dispatches_for_peer(&cfg.peer, 50)
+                .unwrap_or_default();
+            if pending.is_empty() {
+                continue;
+            }
+            let payload = serde_json::json!({
+                "peer": cfg.peer,
+                "idle_secs": idle,
+                "dispatches": pending.iter().map(|d| serde_json::json!({
+                    "message_id": d.message_id,
+                    "from": d.from,
+                    "to": d.to,
+                    "channel": d.channel,
+                    "sent_at": d.sent_at,
+                })).collect::<Vec<_>>(),
+            });
+            tracing::info!(peer = %cfg.peer, url = %cfg.routine_url,
+                "peer_recovery: firing routine webhook");
+            (self.fire)(&cfg.peer, &cfg.routine_url, &payload);
+            let _ = store.mark_recovery_fired(&cfg.peer, now);
+        }
+    }
+}
+
 /// GoalScanner (F20) — every base tick, walks pending goals,
 /// recomputes current_value from the requested metric, fires
 /// `goal_achieved` routing trigger on the pending→met transition

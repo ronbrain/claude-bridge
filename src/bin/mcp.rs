@@ -456,6 +456,32 @@ fn tools_list() -> Value {
                 }
             },
             {
+                "name": "recovery_config_set",
+                "description": "Configure a routine URL the bridge POSTs to when `peer` drops off (idle >5min) AND has pending unread dispatches. Body shape: `{peer, dispatches:[...], idle_secs}`. SSRF-guarded: URL must be https:// or http://localhost; private-range IP literals refused. Admin-only.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "peer":        { "type": "string" },
+                        "routine_url": { "type": "string", "description": "https://… or http://localhost…" }
+                    },
+                    "required": ["peer", "routine_url"]
+                }
+            },
+            {
+                "name": "recovery_config_list",
+                "description": "List every configured recovery webhook with last_fired_at + fire_count.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "recovery_config_delete",
+                "description": "Delete the recovery webhook config for `peer`. Admin-only.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "peer": { "type": "string" } },
+                    "required": ["peer"]
+                }
+            },
+            {
                 "name": "plan_create",
                 "description": "Create a multi-step plan. `steps` is an array of {id, title, depends_on?, status?} — step ids must be unique within the plan; depends_on refs must point to other step ids in the same plan. Status defaults to 'todo' if omitted. Plan auto-closes when all steps are done/cancelled (via plan_advance).",
                 "inputSchema": {
@@ -1923,6 +1949,49 @@ async fn main() {
                         }
                     }
 
+                    "recovery_config_set" => {
+                        let res = client.post(format!("{}/recovery-config", args.server))
+                            .json(&args_val).send().await;
+                        match res {
+                            Ok(r) if r.status().is_success() => text(id, "[bridge] recovery_config set"),
+                            Ok(r) => {
+                                let s = r.status();
+                                let b = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] ERROR {s}: {b}"))
+                            }
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+                    "recovery_config_list" => {
+                        let res = client.get(format!("{}/recovery-config", args.server)).send().await;
+                        match res {
+                            Ok(r) if r.status().is_success() => {
+                                let b = r.text().await.unwrap_or_default();
+                                text(id, format!("[bridge] recovery configs:\n{b}"))
+                            }
+                            Ok(r) => text(id, format!("[bridge] ERROR {}", r.status())),
+                            _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                        }
+                    }
+                    "recovery_config_delete" => {
+                        let p = args_val["peer"].as_str().unwrap_or("").to_string();
+                        if p.is_empty() {
+                            text(id, "[bridge] ERROR: peer required")
+                        } else {
+                            let res = client.delete(format!("{}/recovery-config/{}", args.server, encode_path_segment(&p)))
+                                .send().await;
+                            match res {
+                                Ok(r) if r.status().is_success() => text(id, format!("[bridge] recovery config for '{p}' deleted")),
+                                Ok(r) => {
+                                    let s = r.status();
+                                    let b = r.text().await.unwrap_or_default();
+                                    text(id, format!("[bridge] ERROR {s}: {b}"))
+                                }
+                                _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                            }
+                        }
+                    }
+
                     "plan_create" => {
                         let res = client.post(format!("{}/plans", args.server))
                             .json(&args_val).send().await;
@@ -2348,6 +2417,10 @@ mod tests {
             "plan_create",
             "plan_list",
             "plan_advance",
+            // F23 peer recovery webhook:
+            "recovery_config_set",
+            "recovery_config_list",
+            "recovery_config_delete",
         ];
         let expected: std::collections::BTreeSet<String> =
             EXPECTED_TOOL_NAMES.iter().map(|s| s.to_string()).collect();

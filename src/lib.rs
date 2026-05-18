@@ -432,6 +432,18 @@ pub const GOAL_METRICS: &[&str] = &[
 pub const GOAL_COMPARATORS: &[&str] = &[">=", "<=", "=="];
 pub const GOAL_STATUSES: &[&str] = &["pending", "met", "missed", "cancelled"];
 
+// ─── F23 — External recovery webhook (roadmap-v2) ──────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerRecoveryConfig {
+    pub peer: String,
+    pub routine_url: String,
+    pub created_by: String,
+    pub created_at: u64,
+    pub last_fired_at: u64,
+    pub fire_count: u64,
+}
+
 // ─── F21 — Plans (roadmap-v2) ──────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

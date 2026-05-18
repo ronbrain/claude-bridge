@@ -549,6 +549,56 @@ impl Store {
         Ok(n)
     }
 
+    // ── Peer recovery config (F23) ─────────────────────────────────
+
+    pub fn upsert_peer_recovery_config(&self, c: &crate::PeerRecoveryConfig) -> SqliteResult<()> {
+        self.conn.lock().execute(
+            "INSERT OR REPLACE INTO peer_recovery_config
+             (peer, routine_url, created_by, created_at, last_fired_at, fire_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                c.peer, c.routine_url, c.created_by,
+                c.created_at as i64, c.last_fired_at as i64, c.fire_count as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_peer_recovery_configs(&self) -> SqliteResult<Vec<crate::PeerRecoveryConfig>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT peer, routine_url, created_by, created_at, last_fired_at, fire_count
+             FROM peer_recovery_config ORDER BY peer",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(crate::PeerRecoveryConfig {
+                peer: r.get(0)?, routine_url: r.get(1)?, created_by: r.get(2)?,
+                created_at: r.get::<_, i64>(3)? as u64,
+                last_fired_at: r.get::<_, i64>(4)? as u64,
+                fire_count: r.get::<_, i64>(5)? as u64,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn mark_recovery_fired(&self, peer: &str, now: u64) -> SqliteResult<usize> {
+        let n = self.conn.lock().execute(
+            "UPDATE peer_recovery_config
+             SET last_fired_at = ?1, fire_count = fire_count + 1
+             WHERE peer = ?2",
+            params![now as i64, peer],
+        )?;
+        Ok(n)
+    }
+
+    pub fn delete_peer_recovery_config(&self, peer: &str) -> SqliteResult<usize> {
+        let n = self.conn.lock().execute(
+            "DELETE FROM peer_recovery_config WHERE peer = ?1",
+            params![peer],
+        )?;
+        Ok(n)
+    }
+
     // ── Plans (F21) ────────────────────────────────────────────────
 
     pub fn insert_plan(&self, p: &crate::Plan) -> SqliteResult<()> {
@@ -2091,6 +2141,26 @@ const MIGRATIONS: &[Migration] = &[
             );
             CREATE INDEX IF NOT EXISTS plans_status
                 ON plans (status);
+        "#,
+    },
+    Migration {
+        version: 16,
+        name: "v16_peer_recovery_config",
+        // F23 — Per-peer recovery webhook config. When a peer drops
+        // off /peers (>5min no heartbeat) AND has pending unread
+        // dispatches, the PeerRecoveryScanner POSTs the routine URL
+        // configured here with {peer, dispatches, channel}.
+        // last_fired_at de-dups so the scanner doesn't re-fire on
+        // every tick during the drop window.
+        up: r#"
+            CREATE TABLE IF NOT EXISTS peer_recovery_config (
+                peer           TEXT PRIMARY KEY,
+                routine_url    TEXT NOT NULL,
+                created_by     TEXT NOT NULL DEFAULT '',
+                created_at     INTEGER NOT NULL,
+                last_fired_at  INTEGER NOT NULL DEFAULT 0,
+                fire_count     INTEGER NOT NULL DEFAULT 0
+            );
         "#,
     },
 ];
