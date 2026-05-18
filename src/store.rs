@@ -160,6 +160,30 @@ impl Store {
         Ok(())
     }
 
+    /// Force a WAL checkpoint — flushes the wal file's pending
+    /// frames into the main sqlite db so a subsequent restart can
+    /// read the latest state. Called from the SIGTERM/SIGINT
+    /// handler in `main()` BEFORE the tokio runtime drops the
+    /// Store. Per ops dispatch 1779063832 + state-loss incident:
+    /// without an explicit checkpoint, a graceful shutdown leaves
+    /// the WAL un-merged and the next boot rehydrates a stale
+    /// snapshot (decision keys, memory rows, routing rules,
+    /// peer_watchers state all rolled back to the prior
+    /// checkpoint, which can be hours/days old under WAL+`synchronous=NORMAL`).
+    ///
+    /// `PRAGMA wal_checkpoint(TRUNCATE)` is the strongest variant —
+    /// merges all frames + truncates the wal file to zero. Slightly
+    /// slower than PASSIVE, but the restart path needs the
+    /// guarantee. Bridge shutdown is a low-frequency event, the
+    /// extra ms is irrelevant.
+    pub fn checkpoint_wal_on_shutdown(&self) -> SqliteResult<()> {
+        let conn = self.conn.lock();
+        // wal_checkpoint returns a row with (busy, log, checkpointed)
+        // — we don't care about the values, only success.
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
+
     /// Drop messages from a channel that fall outside the in-memory
     /// retention window (the oldest beyond `keep` rows). Mirrors the
     /// in-memory drain so the DB doesn't grow unbounded.
@@ -2141,6 +2165,25 @@ mod tests {
         // Two rows had non-empty owners and get rewritten; the
         // empty one was already ownerless.
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn checkpoint_wal_on_shutdown_is_callable_and_idempotent() {
+        // The actual file-level WAL flush is sqlite's responsibility;
+        // we only assert the call shape doesn't error AND can be
+        // invoked repeatedly (defensive — a SIGTERM might fire
+        // twice if systemd is impatient).
+        let s = temp_store();
+        // Write something so there's wal content to checkpoint.
+        s.conn
+            .lock()
+            .execute(
+                "INSERT INTO memory (channel, key_, value_, updated_at) VALUES ('c1','k','v',0)",
+                [],
+            )
+            .unwrap();
+        s.checkpoint_wal_on_shutdown().expect("first checkpoint");
+        s.checkpoint_wal_on_shutdown().expect("second checkpoint idempotent");
     }
 
     #[test]

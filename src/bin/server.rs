@@ -3592,7 +3592,35 @@ async fn main() {
 
     tracing::info!("claude-bridge server on {}", cfg.bind);
     let listener = tokio::net::TcpListener::bind(&cfg.bind).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    // F23.0 — graceful shutdown that checkpoints the WAL before
+    // exit. Without this, sqlite leaves un-merged WAL frames on
+    // disk and the next boot rehydrates a stale snapshot (decision
+    // keys, memory rows, routing rules, peer_watchers state all
+    // roll back). Listen on SIGTERM (systemd) + SIGINT (Ctrl-C).
+    // Per ops dispatch 1779063832 + state-loss incident from the
+    // PID 3330476 restart.
+    let store_for_shutdown = store.clone();
+    let shutdown = async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        let mut intr = signal(SignalKind::interrupt()).expect("SIGINT handler");
+        tokio::select! {
+            _ = term.recv() => tracing::info!("SIGTERM received; checkpointing WAL"),
+            _ = intr.recv() => tracing::info!("SIGINT received; checkpointing WAL"),
+        }
+        if let Some(s) = store_for_shutdown {
+            match s.checkpoint_wal_on_shutdown() {
+                Ok(()) => tracing::info!("WAL checkpoint complete; shutdown clean"),
+                Err(e) => tracing::error!(error = %e, "WAL checkpoint FAILED — next boot may rehydrate stale state"),
+            }
+        } else {
+            tracing::info!("no persistent store — no WAL to checkpoint");
+        }
+    };
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+        .unwrap();
 }
 
 #[cfg(test)]
