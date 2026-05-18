@@ -267,18 +267,70 @@ After=network.target
 [Service]
 ExecStart=/usr/local/bin/bridge-server
 Environment=PORT=3001
+# Required by fail-closed default (finding c9d0bfd9):
+Environment=BRIDGE_DB_PATH=/var/lib/claude-bridge/bridge.db
+# Required by fail-closed default (finding dc633d7c) — either set
+# BRIDGE_AUTH_TOKENS for enforce mode OR BRIDGE_AUTH_PERMISSIVE=1.
+Environment=BRIDGE_AUTH_PERMISSIVE=1
 Restart=always
 RestartSec=2
 User=ubuntu
+# Sandboxing — recommended for prod.
+ProtectHome=read-only
+ProtectSystem=strict
+PrivateTmp=yes
+# Writable paths the bridge actually needs:
+ReadWritePaths=/var/lib/claude-bridge
 
 [Install]
 WantedBy=multi-user.target
+```
+
+If you'll use F26 background watchers (`watcher_spawn`), the watcher
+subprocess needs the `claude` CLI in `PATH` and write access to its
+state dirs. Add to the `[Service]` block:
+
+```ini
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Watchers write here:
+ReadWritePaths=/var/lib/claude-bridge /home/ubuntu/.cache/bridge
+# Claude versions + per-session config (read by the spawned subprocess):
+ReadWritePaths=/home/ubuntu/.cache/bridge /home/ubuntu/.local/share/claude /home/ubuntu/.claude
+```
+
+Adjust paths to match where `claude` lives on your host (`which claude`).
+Without these, `watcher_spawn` returns 500 `No such file or directory`
+or `Read-only file system` from the subprocess.
+
+For enforce mode, replace the permissive line with the tokens registry:
+
+```ini
+Environment=BRIDGE_AUTH_TOKENS=<hash1>:peer1,<hash2>:peer2,...
+Environment=BRIDGE_MEMORY_ADMINS=peer-ops,peer-rust-dev
+```
+
+You can keep BOTH `BRIDGE_AUTH_PERMISSIVE=1` AND `BRIDGE_AUTH_TOKENS`
+set during a cutover — peers with bearer auth as their identity, peers
+without bearer fall back to `anonymous` via permissive (no brick). Once
+all peers have tokens, drop the `BRIDGE_AUTH_PERMISSIVE` line and
+restart.
+
+**Drop-in overrides** (the recommended way to layer env onto a packaged
+unit without editing the base file):
+
+```sh
+sudo systemctl edit claude-bridge.service
+# opens an empty drop-in at /etc/systemd/system/claude-bridge.service.d/override.conf
+# IMPORTANT: must start with [Service] section header, or systemd silently
+# ignores every Environment= line ("Assignment outside of section").
 ```
 
 ```sh
 sudo systemctl daemon-reload
 sudo systemctl enable --now claude-bridge
 systemctl is-active claude-bridge   # → active
+journalctl -u claude-bridge -n 20 --no-pager | grep -E 'auth registry|on 0.0.0.0|FATAL'
+# Expect: "auth registry loaded tokens=N permissive=BOOL admins=K"
 ```
 
 ## Register the MCP client in Claude Code
@@ -873,6 +925,70 @@ echo '{"session_id":"'"$CLAUDE_CODE_SESSION_ID"'"}' | \
   ~/.claude/hooks/bridge-drain-unread.sh
 # Should print the message and advance ~/.cache/bridge/offsets/<sid>
 ```
+
+## Background watchers (F26)
+
+The local `Stop` hook (`bridge-watch.sh`) can silently die during long
+sessions — the MCP shim stays up but the heartbeat-relay hook stops
+firing, so the peer drops off `list_peers` and `bridge-auto` SLA pings
+start firing on every dispatch (finding `e2b0d77a`).
+
+F26 fixes this by spawning a centralized server-side `claude --bg`
+subprocess per peer. The subprocess runs a small loop that re-emits
+presence + relays addressed dispatches to the peer's foreground
+session. It survives session hangs because it's its own process group.
+
+**Prereqs**:
+
+- systemd unit has the watcher paths writable + `PATH` to `claude`
+  (see [systemd unit](#systemd-unit)).
+- Caller is in `BRIDGE_MEMORY_ADMINS` — `watcher_spawn` is privileged
+  (it spawns subprocesses on the bridge host).
+
+**Spawn a watcher** (from any admin's MCP shim):
+
+```
+mcp__bridge__watcher_spawn(peer="0f4543", ttl_secs=3600)
+→ {"peer":"0f4543","pid":613257,"ttl_secs":3600,"status":"running",...}
+```
+
+**List + verify**:
+
+```
+mcp__bridge__watcher_list
+→ [{ peer, pid, spawned_at, last_seen, ttl_secs, status, session_id }, ...]
+```
+
+The watcher self-exits after `ttl_secs` (default 3600). Re-spawn to
+extend.
+
+**Stop a watcher manually**:
+
+```
+mcp__bridge__watcher_stop(peer="0f4543")
+```
+
+**Boot reconcile**: at `bridge-server` start, the table is walked,
+any row with `status='running'` and a dead PID (or a PID that's been
+reassigned to an unrelated process — verified via `/proc/<pid>/cmdline`
+match against the row's `session_id`) flips to `status='crashed'`.
+No duplicate spawns.
+
+**Identity scoping**: the spawned subprocess gets identity
+`<peer>-watcher` (e.g. `0f4543-watcher`). `effective_actor()` recognises
+the suffix via `AuthIdentity::is_watcher()` so future per-watcher
+restrictions can be layered without breaking the existing flow. Watcher
+heartbeat endpoint (`POST /watchers/{peer}/heartbeat`) cross-validates
+that the caller's identity matches `<peer>-watcher` — peer X can't
+keep peer Y's watcher alive.
+
+**Common 500s seen during initial setup**:
+
+- `spawn failed: Read-only file system (os error 30)` → add
+  `ReadWritePaths=/home/ubuntu/.cache/bridge` to the systemd unit.
+- `spawn failed: No such file or directory (os error 2)` → `claude`
+  isn't in the subprocess `PATH`. Set
+  `Environment=PATH=/home/ubuntu/.local/bin:...` in the unit.
 
 ## Suggested usage outside pentesting
 
