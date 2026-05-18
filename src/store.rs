@@ -549,6 +549,138 @@ impl Store {
         Ok(n)
     }
 
+    // ── Tasks (F29 additions) ──────────────────────────────────────
+
+    /// Atomic claim of an unowned task — pattern-atomic-status-flip.
+    /// UPDATE WHERE owner='' AND status='todo' ensures concurrent
+    /// callers race fairly: exactly one rows_affected=1, the rest
+    /// rows_affected=0. Caller maps 0 → 403/409 and 1 → success.
+    /// Also bumps `claim_count` for observability.
+    pub fn claim_task(&self, task_id: &str, owner: &str, now: u64) -> SqliteResult<usize> {
+        let n = self.conn.lock().execute(
+            "UPDATE tasks SET owner = ?1, updated_at = ?2,
+                              claim_count = claim_count + 1
+             WHERE id = ?3 AND owner = '' AND status = 'todo'",
+            params![owner, now as i64, task_id],
+        )?;
+        Ok(n)
+    }
+
+    /// Submit a plan for `task_id`. Sets plan_status='pending' +
+    /// plan_text. Caller must be task owner (handler enforces);
+    /// store stays generic. Refuses if task isn't in `todo`/`open`
+    /// status (no plan submission on in-flight/completed tasks).
+    pub fn submit_plan(
+        &self,
+        task_id: &str,
+        plan: &str,
+        now: u64,
+    ) -> SqliteResult<usize> {
+        let n = self.conn.lock().execute(
+            "UPDATE tasks SET plan_status = 'pending', plan_text = ?1,
+                              plan_decided_at = 0, plan_reviewer = '',
+                              updated_at = ?2
+             WHERE id = ?3 AND status IN ('todo', 'open')
+               AND plan_status IN ('none', 'rejected')",
+            params![plan, now as i64, task_id],
+        )?;
+        Ok(n)
+    }
+
+    /// Approve a pending plan. Reviewer recorded for audit; status
+    /// flip enables todo → in_progress transition.
+    pub fn approve_plan(
+        &self,
+        task_id: &str,
+        reviewer: &str,
+        now: u64,
+    ) -> SqliteResult<usize> {
+        let n = self.conn.lock().execute(
+            "UPDATE tasks SET plan_status = 'approved', plan_reviewer = ?1,
+                              plan_decided_at = ?2, updated_at = ?2
+             WHERE id = ?3 AND plan_status = 'pending'",
+            params![reviewer, now as i64, task_id],
+        )?;
+        Ok(n)
+    }
+
+    /// Reject a pending plan. Sets plan_status='rejected', task
+    /// remains in todo; owner can re-submit via submit_plan (the
+    /// submit query allows 'rejected' → 'pending' transition).
+    pub fn reject_plan(
+        &self,
+        task_id: &str,
+        reviewer: &str,
+        reason: &str,
+        now: u64,
+    ) -> SqliteResult<usize> {
+        let n = self.conn.lock().execute(
+            "UPDATE tasks SET plan_status = 'rejected', plan_reviewer = ?1,
+                              plan_decided_at = ?2, note = ?3,
+                              updated_at = ?2
+             WHERE id = ?4 AND plan_status = 'pending'",
+            params![reviewer, now as i64, reason, task_id],
+        )?;
+        Ok(n)
+    }
+
+    /// Complete a task atomically: status='done' + completed_at + note.
+    /// Refuses transition if plan_status='pending' (can't complete a
+    /// task whose plan hasn't been resolved). Returns rows-touched
+    /// for 404 / 409 semantics at the handler.
+    pub fn complete_task(
+        &self,
+        task_id: &str,
+        outcome: &str,
+        now: u64,
+    ) -> SqliteResult<usize> {
+        let n = self.conn.lock().execute(
+            "UPDATE tasks SET status = 'done', completed_at = ?1,
+                              note = ?2, updated_at = ?1
+             WHERE id = ?3 AND status != 'done' AND status != 'cancelled'
+               AND plan_status != 'pending'",
+            params![now as i64, outcome, task_id],
+        )?;
+        Ok(n)
+    }
+
+    /// All tasks ready to progress — depends_on entries are all in
+    /// the `done` or `fixed` set. Used by the dep-resolution scanner
+    /// to emit `task_ready` triggers.
+    ///
+    /// Implementation: in-memory scan since dependency lists are
+    /// JSON arrays (not relationally normalised). For the typical
+    /// bridge scale (~hundreds of tasks max) this is fine; a
+    /// proper join would require splitting depends_on into a
+    /// task_deps table — deferred to F29.1 if scan cost surfaces.
+    pub fn tasks_ready_to_unblock(
+        &self,
+    ) -> SqliteResult<Vec<(crate::Task, Vec<String>)>> {
+        let all = self.load_tasks()?;
+        let done_ids: std::collections::HashSet<String> = all
+            .iter()
+            .filter(|t| t.status == "done" || t.status == "fixed")
+            .map(|t| t.id.clone())
+            .collect();
+        let mut out = Vec::new();
+        for t in &all {
+            // Only consider tasks that haven't started + have deps.
+            if !(t.status == "todo" || t.status == "open") || t.depends_on.is_empty() {
+                continue;
+            }
+            let unmet: Vec<String> = t
+                .depends_on
+                .iter()
+                .filter(|d| !done_ids.contains(*d))
+                .cloned()
+                .collect();
+            if unmet.is_empty() {
+                out.push((t.clone(), Vec::<String>::new()));
+            }
+        }
+        Ok(out)
+    }
+
     // ── Peer watchers (F26) ────────────────────────────────────────
 
     /// Insert a freshly-spawned watcher row. Replaces any prior row
@@ -1673,6 +1805,27 @@ const MIGRATIONS: &[Migration] = &[
                 ON peer_watchers (status);
         "#,
     },
+    Migration {
+        version: 13,
+        name: "v13_task_plan_status",
+        // F29 — Agent-Teams task coordination columns.
+        // plan_status: 'none' (default, free transitions) | 'pending'
+        // (awaiting approve_plan, blocks todo→in_progress) |
+        // 'approved' (allowed to advance) | 'rejected' (terminal).
+        // completed_at: filled by complete_task → fires task_completed
+        // routing trigger via fire_routing_actions.
+        // claim_count: observability for orphan reclaim cycles.
+        up: r#"
+            ALTER TABLE tasks ADD COLUMN plan_status TEXT NOT NULL DEFAULT 'none';
+            ALTER TABLE tasks ADD COLUMN plan_text TEXT NOT NULL DEFAULT '';
+            ALTER TABLE tasks ADD COLUMN plan_reviewer TEXT NOT NULL DEFAULT '';
+            ALTER TABLE tasks ADD COLUMN plan_decided_at INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE tasks ADD COLUMN completed_at INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE tasks ADD COLUMN claim_count INTEGER NOT NULL DEFAULT 0;
+            CREATE INDEX IF NOT EXISTS tasks_plan_status
+                ON tasks (channel, plan_status);
+        "#,
+    },
 ];
 
 /// Best-effort column adds for pre-runner DBs. `CREATE TABLE IF
@@ -2184,6 +2337,104 @@ mod tests {
             .unwrap();
         s.checkpoint_wal_on_shutdown().expect("first checkpoint");
         s.checkpoint_wal_on_shutdown().expect("second checkpoint idempotent");
+    }
+
+    #[test]
+    fn f29_task_lifecycle_full_path() {
+        // F29 — claim → submit_plan → approve_plan → complete_task
+        // chain. Verifies status-transition guards + atomic UPDATE
+        // semantics fire correctly on each step.
+        let s = temp_store();
+        let now = crate::now_secs();
+        let t = crate::Task {
+            id: "t1".into(),
+            channel: "c1".into(),
+            from: "alice".into(),
+            title: "fix the thing".into(),
+            description: String::new(),
+            owner: String::new(),
+            status: "todo".into(),
+            created_at: now,
+            updated_at: now,
+            note: String::new(),
+            blocks: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        s.upsert_task(&t).unwrap();
+        // Claim: first wins.
+        assert_eq!(s.claim_task("t1", "bob", now).unwrap(), 1);
+        assert_eq!(s.claim_task("t1", "carol", now).unwrap(), 0);
+        // Submit plan: allowed (status=todo, plan_status=none).
+        assert_eq!(s.submit_plan("t1", "step 1; step 2", now).unwrap(), 1);
+        // Approve: flips status.
+        assert_eq!(s.approve_plan("t1", "ops", now + 1).unwrap(), 1);
+        // Approve a second time → 0 (no longer pending).
+        assert_eq!(s.approve_plan("t1", "ops", now + 2).unwrap(), 0);
+        // Complete: now allowed (plan approved).
+        assert_eq!(s.complete_task("t1", "shipped", now + 10).unwrap(), 1);
+        // Re-complete is a no-op.
+        assert_eq!(s.complete_task("t1", "again", now + 11).unwrap(), 0);
+    }
+
+    #[test]
+    fn f29_complete_refuses_while_plan_pending() {
+        let s = temp_store();
+        let now = crate::now_secs();
+        let t = crate::Task {
+            id: "t2".into(),
+            channel: "c1".into(),
+            from: "alice".into(),
+            title: "x".into(),
+            description: String::new(),
+            owner: "bob".into(),
+            status: "todo".into(),
+            created_at: now,
+            updated_at: now,
+            note: String::new(),
+            blocks: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        s.upsert_task(&t).unwrap();
+        // Submit plan (still pending), then try to complete.
+        s.submit_plan("t2", "draft", now).unwrap();
+        let n = s.complete_task("t2", "ship anyway", now + 1).unwrap();
+        assert_eq!(n, 0, "complete must refuse while plan pending");
+        // After reject (plan back to non-pending), complete still
+        // refuses because status moved... wait, reject doesn't move
+        // status. So complete should now SUCCEED.
+        s.reject_plan("t2", "ops", "needs more detail", now + 2).unwrap();
+        let n = s.complete_task("t2", "shipped", now + 3).unwrap();
+        assert_eq!(n, 1, "complete allowed after plan rejected (status guard)");
+    }
+
+    #[test]
+    fn f29_tasks_ready_to_unblock_resolves_dependencies() {
+        let s = temp_store();
+        let now = crate::now_secs();
+        let mk = |id: &str, status: &str, deps: Vec<String>| crate::Task {
+            id: id.into(),
+            channel: "c1".into(),
+            from: "alice".into(),
+            title: id.into(),
+            description: String::new(),
+            owner: String::new(),
+            status: status.into(),
+            created_at: now,
+            updated_at: now,
+            note: String::new(),
+            blocks: Vec::new(),
+            depends_on: deps,
+        };
+        s.upsert_task(&mk("a", "done", vec![])).unwrap();
+        s.upsert_task(&mk("b", "done", vec![])).unwrap();
+        s.upsert_task(&mk("c", "todo", vec!["a".into(), "b".into()])).unwrap();
+        s.upsert_task(&mk("d", "todo", vec!["a".into(), "missing".into()])).unwrap();
+        s.upsert_task(&mk("e", "in_progress", vec!["a".into()])).unwrap();
+        let ready = s.tasks_ready_to_unblock().unwrap();
+        let ids: Vec<String> = ready.iter().map(|(t, _)| t.id.clone()).collect();
+        // c is ready (all deps done); d has unmet "missing"; e is
+        // already in_progress so not a candidate.
+        assert_eq!(ids, vec!["c".to_string()]);
     }
 
     #[test]

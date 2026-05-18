@@ -1,3 +1,4 @@
+#![recursion_limit = "512"]
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -452,6 +453,69 @@ fn tools_list() -> Value {
                         "enabled": { "type": "boolean" }
                     },
                     "required": ["id","enabled"]
+                }
+            },
+            {
+                "name": "claim_task",
+                "description": "Atomic claim of an unowned task — first-wins via UPDATE WHERE owner='' AND status='todo'. Returns 204 on success, 409 if task is already owned / wrong status / missing. Bumps the row's claim_count counter for observability.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channel": { "type": "string" },
+                        "id":      { "type": "string", "description": "Task id" }
+                    },
+                    "required": ["channel", "id"]
+                }
+            },
+            {
+                "name": "complete_task",
+                "description": "Mark a task done. Refuses if plan_status='pending' (closes the can't-bypass-plan-approval invariant). Fires the `task_completed` routing trigger so operator rules can chain follow-ups.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channel": { "type": "string" },
+                        "id":      { "type": "string" },
+                        "outcome": { "type": "string", "description": "Free-form completion note (≤4 KB)" }
+                    },
+                    "required": ["channel", "id"]
+                }
+            },
+            {
+                "name": "submit_plan",
+                "description": "Submit a plan for `id`. Flips plan_status to 'pending'; task can't advance to in_progress until approved. Only allowed when task is in 'todo'/'open' and plan_status is 'none' or 'rejected' (can re-submit after rejection).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channel": { "type": "string" },
+                        "id":      { "type": "string" },
+                        "plan":    { "type": "string", "description": "Plan body (markdown, ≤16 KB)" }
+                    },
+                    "required": ["channel", "id", "plan"]
+                }
+            },
+            {
+                "name": "approve_plan",
+                "description": "Approve a pending plan. Requires BRIDGE_MEMORY_ADMINS membership. Plan must be in 'pending' state. After approve, owner can advance the task via update_task status=in_progress.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channel": { "type": "string" },
+                        "id":      { "type": "string" }
+                    },
+                    "required": ["channel", "id"]
+                }
+            },
+            {
+                "name": "reject_plan",
+                "description": "Reject a pending plan with a reason. Requires BRIDGE_MEMORY_ADMINS. Plan flips to 'rejected'; owner can re-submit via submit_plan.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channel": { "type": "string" },
+                        "id":      { "type": "string" },
+                        "reason":  { "type": "string", "description": "Why rejected (≤1 KB)" }
+                    },
+                    "required": ["channel", "id", "reason"]
                 }
             },
             {
@@ -1795,6 +1859,56 @@ async fn main() {
                         }
                     }
 
+                    "claim_task" | "complete_task" | "submit_plan" | "approve_plan" | "reject_plan" => {
+                        let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
+                        let task_id = args_val["id"].as_str().unwrap_or("").to_string();
+                        if task_id.is_empty() {
+                            text(id, "[bridge] ERROR: id required")
+                        } else {
+                            let path_suffix = match name {
+                                "claim_task" => "claim".to_string(),
+                                "complete_task" => "complete".to_string(),
+                                "submit_plan" => "plan".to_string(),
+                                "approve_plan" => "plan/approve".to_string(),
+                                "reject_plan" => "plan/reject".to_string(),
+                                _ => unreachable!(),
+                            };
+                            let url = format!(
+                                "{}/tasks/{}/{}/{}",
+                                args.server,
+                                encode_path_segment(&channel),
+                                encode_path_segment(&task_id),
+                                path_suffix,
+                            );
+                            // Body shape varies — pass through whatever
+                            // the tool args carried (plan/outcome/reason).
+                            let body = match name {
+                                "claim_task" | "approve_plan" => serde_json::json!({}),
+                                "complete_task" => serde_json::json!({
+                                    "outcome": args_val["outcome"].as_str().unwrap_or("")
+                                }),
+                                "submit_plan" => serde_json::json!({
+                                    "plan": args_val["plan"].as_str().unwrap_or("")
+                                }),
+                                "reject_plan" => serde_json::json!({
+                                    "reason": args_val["reason"].as_str().unwrap_or("")
+                                }),
+                                _ => serde_json::json!({}),
+                            };
+                            let res = client.post(url).json(&body).send().await;
+                            match res {
+                                Ok(r) if r.status().is_success() =>
+                                    text(id, format!("[bridge] {name} OK for {task_id}")),
+                                Ok(r) => {
+                                    let s = r.status();
+                                    let b = r.text().await.unwrap_or_default();
+                                    text(id, format!("[bridge] ERROR {s}: {b}"))
+                                }
+                                _ => text(id, "[bridge] ERROR: bridge server unreachable"),
+                            }
+                        }
+                    }
+
                     "watcher_spawn" => {
                         let res = client
                             .post(format!("{}/watchers", args.server))
@@ -2060,6 +2174,12 @@ mod tests {
             "watcher_spawn",
             "watcher_list",
             "watcher_stop",
+            // F29 task-coordination additions:
+            "claim_task",
+            "complete_task",
+            "submit_plan",
+            "approve_plan",
+            "reject_plan",
         ];
         let expected: std::collections::BTreeSet<String> =
             EXPECTED_TOOL_NAMES.iter().map(|s| s.to_string()).collect();

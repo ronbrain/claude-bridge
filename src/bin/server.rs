@@ -2515,6 +2515,276 @@ async fn metrics_prometheus(State(state): State<AppState>) -> impl IntoResponse 
     )
 }
 
+// ── Task coordination (F29) ─────────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+struct ClaimTaskReq {}
+
+async fn claim_task(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    State(state): State<AppState>,
+    Json(_req): Json<ClaimTaskReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let actor = effective_actor(&headers, ext.as_deref());
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "persistence disabled".into(),
+    ))?;
+    let n = store
+        .claim_task(&id, &actor, now_secs())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("claim failed: {e}")))?;
+    if n == 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("task '{id}' not claimable — either missing, already owned, or not in status='todo'"),
+        ));
+    }
+    write_audit(
+        store,
+        &actor,
+        "claim",
+        "task",
+        &id,
+        None::<&Task>,
+        None::<&Task>,
+    );
+    dashboard_event(
+        &state,
+        "task_claimed",
+        serde_json::json!({ "id": id, "owner": actor }),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct CompleteTaskReq {
+    #[serde(default)]
+    outcome: String,
+}
+
+const MAX_TASK_OUTCOME_LEN: usize = 4096;
+
+async fn complete_task_handler(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    State(state): State<AppState>,
+    Json(req): Json<CompleteTaskReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    cap!(req.outcome, MAX_TASK_OUTCOME_LEN, "outcome");
+    let actor = effective_actor(&headers, ext.as_deref());
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "persistence disabled".into(),
+    ))?;
+    let now = now_secs();
+    let n = store
+        .complete_task(&id, &req.outcome, now)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("complete failed: {e}")))?;
+    if n == 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "task '{id}' not completable — already done/cancelled OR plan_status='pending'"
+            ),
+        ));
+    }
+    write_audit(
+        store,
+        &actor,
+        "complete",
+        "task",
+        &id,
+        None::<&Task>,
+        None::<&Task>,
+    );
+    dashboard_event(
+        &state,
+        "task_completed",
+        serde_json::json!({ "id": id, "completed_at": now, "outcome": req.outcome }),
+    );
+    // F29 task_completed routing trigger — operator rules can chain
+    // follow-up tasks / notifications when a task closes.
+    fire_routing_actions(
+        &state,
+        "task_completed",
+        &serde_json::json!({
+            "task_id": id,
+            "owner": actor,
+            "completed_at": now,
+        }),
+        state.routing_max_depth,
+        0,
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct SubmitPlanReq {
+    plan: String,
+}
+
+const MAX_PLAN_LEN: usize = 16 * 1024;
+
+async fn submit_plan(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    State(state): State<AppState>,
+    Json(req): Json<SubmitPlanReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    cap!(req.plan, MAX_PLAN_LEN, "plan");
+    if req.plan.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "plan body required".into()));
+    }
+    let actor = effective_actor(&headers, ext.as_deref());
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "persistence disabled".into(),
+    ))?;
+    let n = store
+        .submit_plan(&id, &req.plan, now_secs())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("submit failed: {e}")))?;
+    if n == 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "plan for '{id}' not submittable — task missing, not in status='todo'/'open', \
+                 OR plan already 'pending'/'approved'"
+            ),
+        ));
+    }
+    write_audit(
+        store,
+        &actor,
+        "submit_plan",
+        "task",
+        &id,
+        None::<&Task>,
+        None::<&Task>,
+    );
+    dashboard_event(
+        &state,
+        "task_plan_submitted",
+        serde_json::json!({ "id": id, "submitted_by": actor }),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize, Default)]
+struct ApprovePlanReq {
+    // No fields needed — approver identity comes from the auth
+    // bundle. Keeping the struct so the handler signature accepts
+    // an empty `{}` body uniformly with the other plan endpoints.
+}
+
+async fn approve_plan(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
+    State(state): State<AppState>,
+    Json(_req): Json<ApprovePlanReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let actor = effective_actor(&headers, ext.as_deref());
+    // Plan approval is privileged — only memory-admins can approve
+    // (operator role). Bypass for ops cleanup.
+    let is_admin = auth_ext
+        .as_deref()
+        .map(|a| a.is_memory_admin(&actor))
+        .unwrap_or(false);
+    if !is_admin {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "approve_plan requires BRIDGE_MEMORY_ADMINS membership; \
+                 '{actor}' is not on the allowlist."
+            ),
+        ));
+    }
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "persistence disabled".into(),
+    ))?;
+    let n = store
+        .approve_plan(&id, &actor, now_secs())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("approve failed: {e}")))?;
+    if n == 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("plan for '{id}' not approvable — not in 'pending' state"),
+        ));
+    }
+    write_audit(
+        store,
+        &actor,
+        "approve_plan",
+        "task",
+        &id,
+        None::<&Task>,
+        None::<&Task>,
+    );
+    dashboard_event(
+        &state,
+        "task_plan_approved",
+        serde_json::json!({ "id": id, "reviewer": actor }),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct RejectPlanReq {
+    reason: String,
+}
+
+const MAX_REJECT_REASON_LEN: usize = 1024;
+
+async fn reject_plan(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
+    auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
+    State(state): State<AppState>,
+    Json(req): Json<RejectPlanReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    cap!(req.reason, MAX_REJECT_REASON_LEN, "reason");
+    let actor = effective_actor(&headers, ext.as_deref());
+    let is_admin = auth_ext
+        .as_deref()
+        .map(|a| a.is_memory_admin(&actor))
+        .unwrap_or(false);
+    if !is_admin {
+        return Err((StatusCode::FORBIDDEN, "reject_plan requires admin".into()));
+    }
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "persistence disabled".into(),
+    ))?;
+    let n = store
+        .reject_plan(&id, &actor, &req.reason, now_secs())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("reject failed: {e}")))?;
+    if n == 0 {
+        return Err((StatusCode::CONFLICT, "plan not in 'pending' state".into()));
+    }
+    write_audit(
+        store,
+        &actor,
+        "reject_plan",
+        "task",
+        &id,
+        None::<&Task>,
+        None::<&Task>,
+    );
+    dashboard_event(
+        &state,
+        "task_plan_rejected",
+        serde_json::json!({ "id": id, "reviewer": actor, "reason": req.reason }),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ── Dashboard (F19) ─────────────────────────────────────────────────
 
 /// Admin guard for dashboard routes. Returns Err if the request's
@@ -3718,6 +3988,7 @@ async fn main() {
         Arc::new(claude_bridge::automation::AutoBatchScanner {
             flush: auto_batch_flush,
         }),
+        Arc::new(claude_bridge::automation::TaskReadyScanner::default()),
     ];
     let _automation_handle = claude_bridge::automation::spawn_loop(
         Duration::from_secs(60),
@@ -3865,6 +4136,13 @@ async fn main() {
         // Tasks (work queue, distinct from findings)
         .route("/tasks/{channel}", post(create_task).get(list_tasks))
         .route("/tasks/{channel}/{id}", patch(update_task).delete(delete_task))
+        // F29 task coordination — claim/complete/plan workflow.
+        // Plan approve/reject require BRIDGE_MEMORY_ADMINS membership.
+        .route("/tasks/{channel}/{id}/claim", post(claim_task))
+        .route("/tasks/{channel}/{id}/complete", post(complete_task_handler))
+        .route("/tasks/{channel}/{id}/plan", post(submit_plan))
+        .route("/tasks/{channel}/{id}/plan/approve", post(approve_plan))
+        .route("/tasks/{channel}/{id}/plan/reject", post(reject_plan))
         // Shared memory KV
         .route("/memory/{channel}", get(memory_list))
         .route("/memory/{channel}/{key}",

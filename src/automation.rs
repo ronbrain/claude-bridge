@@ -237,6 +237,57 @@ impl Scanner for DispatchEscalationScanner {
     }
 }
 
+/// TaskReadyScanner (F29) — emits `task_ready` triggers when a
+/// task's `depends_on` chain transitions from "any unmet" to "all
+/// satisfied". Dedup via per-scanner DashSet so a single ready
+/// event fires once per task; cleared when the task moves past
+/// `todo` (it's been picked up by routing or by a peer).
+pub struct TaskReadyScanner {
+    pub seen: Arc<DashSet<String>>,
+}
+
+impl Default for TaskReadyScanner {
+    fn default() -> Self {
+        Self {
+            seen: Arc::new(DashSet::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Scanner for TaskReadyScanner {
+    fn name(&self) -> &'static str {
+        "task_ready"
+    }
+    fn every(&self) -> u64 {
+        1
+    }
+    async fn tick(&self, ctx: &AutomationCtx) {
+        let Some(store) = &ctx.store else { return };
+        let Some(emit) = &ctx.routing_emit else { return };
+        let ready = match store.tasks_ready_to_unblock() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "task_ready scan failed");
+                return;
+            }
+        };
+        for (task, _unmet) in ready {
+            if !self.seen.insert(task.id.clone()) {
+                continue;
+            }
+            let payload = serde_json::json!({
+                "task_id": task.id,
+                "title":   task.title,
+                "channel": task.channel,
+                "owner":   task.owner,
+                "from":    task.from,
+            });
+            emit("task_ready", payload);
+        }
+    }
+}
+
 /// PeerIdleScanner (F17 Phase 3) — emits `peer_idle` triggers
 /// through the routing engine when a peer's last_seen lag crosses
 /// the configured threshold. Distinct from `PeerDropScanner` which
