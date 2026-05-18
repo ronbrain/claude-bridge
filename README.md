@@ -855,6 +855,48 @@ works for:
 - **Long-running task coordination.** Worker instance polls
   `read_messages` on a `/loop` cadence for new work.
 
+## Plugin distribution
+
+The repo ships a one-shot packaging script that bundles release
+binaries + custom skills + a starter `settings.json` into a single
+zip an operator can hand to a new peer host:
+
+```sh
+./tools/package.sh                 # → dist/bridge-plugin-<version>.zip
+./tools/package.sh /tmp/out        # → /tmp/out/bridge-plugin-<version>.zip
+```
+
+The bundle contains:
+
+- `bin/` — `bridge-server`, `bridge-mcp`, `bridge`, `claude-bridge`
+  (release builds).
+- `skills/` — three operator-facing slash commands (`/relay`,
+  `/handoff`, `/claim-task`) that wrap common MCP-tool flows. Drop
+  the `.md` files into `~/.claude/skills/` on the peer host to
+  enable.
+- `hooks/` — `bridge-session-start.sh`, `bridge-watch.sh`,
+  `bridge-drain-unread.sh` (when present in the repo at build time).
+- `share/settings.example.json` — wires the MCP server + the
+  recommended `Stop` / `SessionStart` / `UserPromptSubmit` hooks.
+
+A `README.md` inside the bundle walks the receiver through the
+install (binaries → `/usr/local/bin/`, skills → `~/.claude/skills/`,
+hooks → `~/.claude/hooks/`, settings merge, session restart).
+
+### Custom skills (F25)
+
+The three bundled skills are pure wrappers over existing MCP tools
+— no server-side state, no privileged ops:
+
+| Skill | Wraps | Use when |
+|---|---|---|
+| `/relay` | `send_message` with `[mirrored from #<src>]` prefix | A finding on one channel is also load-bearing for another. |
+| `/handoff` | `send_message` + `memory_set` + `set_status` | Stepping away from work-in-flight that another peer needs to pick up. Produces a durable audit trail. |
+| `/claim-task` | `list_tasks` + `claim_task` + `set_status` + optional `submit_plan` | Picking up an unowned task from the F29 work queue. Atomic first-wins. |
+
+Skills live entirely on the operator side (`~/.claude/skills/`).
+Edit, fork, or remove freely — no server-side dependency.
+
 ## Security notes
 
 - **Auth is shared-secret bearer tokens** seeded via env. Operators
