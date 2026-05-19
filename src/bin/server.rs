@@ -1,7 +1,7 @@
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    extract::{Form, Path, Query, State},
+    http::{header::{self, HeaderMap}, StatusCode, HeaderValue},
     response::{sse::{Event, KeepAlive, Sse}, IntoResponse, Response},
     routing::{delete, get, patch, post},
     Json, Router,
@@ -709,12 +709,17 @@ struct AppState {
     /// is built with `--features embeddings`. Wrapped in Arc so
     /// background tasks + sync hooks share one model load.
     embedder: Arc<dyn claude_bridge::embeddings::Embedder>,
+    /// Dashboard login credentials (user → pass). Loaded from
+    /// `BRIDGE_DASHBOARD_USERS` at boot. Non-empty = login page
+    /// is shown; empty = dashboard requires BRIDGE_MEMORY_ADMINS.
+    dashboard_users: std::collections::HashMap<String, String>,
 }
 
 impl AppState {
-    fn new_with_routing(store: Option<Store>, routing_max_depth: u8) -> Self {
+    fn new_with_routing(store: Option<Store>, routing_max_depth: u8, dashboard_users: std::collections::HashMap<String, String>) -> Self {
         let mut s = Self::new(store);
         s.routing_max_depth = routing_max_depth;
+        s.dashboard_users = dashboard_users;
         s
     }
     fn new(store: Option<Store>) -> Self {
@@ -735,6 +740,7 @@ impl AppState {
             routing_batches: Arc::new(DashMap::new()),
             dashboard_events: Arc::new(tokio::sync::broadcast::channel(256).0),
             embedder: Arc::from(claude_bridge::embeddings::embedder_from_env()),
+            dashboard_users: std::collections::HashMap::new(),
         }
     }
 
@@ -3520,7 +3526,19 @@ async fn reject_plan(
 fn dashboard_admin_check(
     ext: Option<&claude_bridge::auth::AuthIdentity>,
     auth_ext: Option<&claude_bridge::auth::AuthState>,
+    state: &AppState,
+    cookies_header: &str,
 ) -> Result<String, (StatusCode, String)> {
+    // 1. Cookie-based dashboard session (set on successful login).
+    for pair in cookies_header.split(';') {
+        let pair = pair.trim();
+        if let Some(v) = pair.strip_prefix("bridge_session=") {
+            if state.dashboard_users.contains_key(v) {
+                return Ok(v.to_string());
+            }
+        }
+    }
+    // 2. Bearer token in BRIDGE_MEMORY_ADMINS (existing path).
     let identity = ext.cloned().unwrap_or(claude_bridge::auth::AuthIdentity::Anonymous);
     let actor = identity.as_actor().to_string();
     let is_admin = auth_ext
@@ -3538,6 +3556,87 @@ fn dashboard_admin_check(
     Ok(actor)
 }
 
+fn get_session_user(state: &AppState, cookies_header: &str) -> Option<String> {
+    for pair in cookies_header.split(';') {
+        let pair = pair.trim();
+        if let Some(v) = pair.strip_prefix("bridge_session=") {
+            if state.dashboard_users.contains_key(v) {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn session_cookie(username: &str, max_age_secs: usize) -> header::HeaderValue {
+    // Build a raw Set-Cookie header value manually to avoid cookie crate dep.
+    let cookie_str = format!(
+        "bridge_session={}; Path=/; Max-Age={}; HttpOnly; SameSite=Lax",
+        username, max_age_secs
+    );
+    header::HeaderValue::from_str(&cookie_str).unwrap_or_else(|_| header::HeaderValue::from_static(""))
+}
+
+fn clear_session_cookie() -> header::HeaderValue {
+    header::HeaderValue::from_static("bridge_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+}
+
+async fn dashboard_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let cookies = headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    // If already has valid session, redirect to /
+    if get_session_user(&state, cookies).is_some() {
+        return axum::response::Redirect::to("/dashboard").into_response();
+    }
+    if state.dashboard_users.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "dashboard login not configured",
+        ).into_response();
+    }
+    html_response(claude_bridge::dashboard::login_page(None)).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct LoginForm {
+    username: String,
+    password: String,
+}
+
+async fn dashboard_login_submit(
+    State(state): State<AppState>,
+    Form(form): Form<LoginForm>,
+) -> Result<Response, (StatusCode, String)> {
+    if state.dashboard_users.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "dashboard login not configured".into()));
+    }
+    if state.dashboard_users.get(&form.username) == Some(&form.password) {
+        let set_cookie = session_cookie(&form.username, 86400);
+        let mut resp = axum::response::Redirect::to("/dashboard").into_response();
+        resp.headers_mut().insert(header::SET_COOKIE, set_cookie);
+        Ok(resp)
+    } else {
+        Ok(html_response(claude_bridge::dashboard::login_page(Some("invalid credentials"))).into_response())
+    }
+}
+
+async fn dashboard_logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let _ = state;
+    let _ = headers;
+    let mut resp = axum::response::Redirect::to("/dashboard/login").into_response();
+    resp.headers_mut().insert(header::SET_COOKIE, clear_session_cookie());
+    resp
+}
+
 fn html_response(markup: maud::Markup) -> Response {
     let body = markup.into_string();
     (
@@ -3553,9 +3652,11 @@ async fn dashboard_landing(
     ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
     auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
     State(state): State<AppState>,
+    cookies: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
     let _ = headers; // bearer already validated upstream
-    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref())?;
+    let cookies_str = cookies.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("");
+    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref(), &state, cookies_str)?;
     let peers_active = state.peers.len();
     let mut sev_counts: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
@@ -3606,8 +3707,10 @@ async fn dashboard_peers(
     ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
     auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
     State(state): State<AppState>,
+    cookies: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
-    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref())?;
+    let cookies_str = cookies.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("");
+    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref(), &state, cookies_str)?;
     let now = now_secs();
     let mut rows: Vec<claude_bridge::dashboard::PeerRow> = state
         .peers
@@ -3646,8 +3749,10 @@ async fn dashboard_findings(
     ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
     auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
     State(state): State<AppState>,
+    cookies: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
-    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref())?;
+    let cookies_str = cookies.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("");
+    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref(), &state, cookies_str)?;
     let mut rows: Vec<claude_bridge::dashboard::FindingRow> = Vec::new();
     for kv in state.findings.iter() {
         for f in kv.value() {
@@ -3684,8 +3789,10 @@ async fn dashboard_tasks(
     ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
     auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
     State(state): State<AppState>,
+    cookies: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
-    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref())?;
+    let cookies_str = cookies.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("");
+    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref(), &state, cookies_str)?;
     let mut rows: Vec<claude_bridge::dashboard::TaskRow> = Vec::new();
     for kv in state.tasks.iter() {
         for t in kv.value() {
@@ -3705,8 +3812,10 @@ async fn dashboard_dispatches(
     ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
     auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
     State(state): State<AppState>,
+    cookies: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
-    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref())?;
+    let cookies_str = cookies.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("");
+    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref(), &state, cookies_str)?;
     let now = now_secs();
     let rows: Vec<claude_bridge::dashboard::DispatchRow> = state
         .store
@@ -3733,8 +3842,10 @@ async fn dashboard_routing(
     ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
     auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
     State(state): State<AppState>,
+    cookies: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
-    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref())?;
+    let cookies_str = cookies.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("");
+    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref(), &state, cookies_str)?;
     let rows: Vec<claude_bridge::dashboard::RoutingRow> = state
         .store
         .as_ref()
@@ -3756,8 +3867,10 @@ async fn dashboard_watchers(
     ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
     auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
     State(state): State<AppState>,
+    cookies: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
-    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref())?;
+    let cookies_str = cookies.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("");
+    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref(), &state, cookies_str)?;
     let now = now_secs();
     let rows: Vec<claude_bridge::dashboard::WatcherRow> = state
         .store
@@ -3782,8 +3895,10 @@ async fn dashboard_sse(
     ext: Option<axum::extract::Extension<claude_bridge::auth::AuthIdentity>>,
     auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
     State(state): State<AppState>,
+    cookies: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
-    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref())?;
+    let cookies_str = cookies.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("");
+    dashboard_admin_check(ext.as_deref(), auth_ext.as_deref(), &state, cookies_str)?;
     let rx = state.dashboard_events.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|result| match result {
         Ok(v) => {
@@ -4638,7 +4753,7 @@ async fn main() {
         }
     };
 
-    let state = AppState::new_with_routing(store.clone(), routing_max_depth);
+    let state = AppState::new_with_routing(store.clone(), routing_max_depth, cfg.dashboard_users.clone());
     state.rehydrate();
 
     // F26 boot reconcile — flip stale `running` watcher rows whose
@@ -4991,6 +5106,9 @@ async fn main() {
         .route("/dashboard/routing", get(dashboard_routing))
         .route("/dashboard/watchers", get(dashboard_watchers))
         .route("/dashboard/sse", get(dashboard_sse))
+        .route("/dashboard/login", get(dashboard_login))
+        .route("/dashboard/login", post(dashboard_login_submit))
+        .route("/dashboard/logout", post(dashboard_logout))
         // Observability — authed per finding `cc3c33d6` (was world-
         // readable; identity is now needed for per-(requester,
         // target) rate-limit bucket on /resume).

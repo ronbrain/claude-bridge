@@ -134,6 +134,32 @@ const JS: &str = r#"
 "#;
 
 /// Common page shell — header + nav + footer + inline CSS/JS.
+/// Login page — only shown when `BRIDGE_DASHBOARD_USERS` is set.
+pub fn login_page(error: Option<&str>) -> Markup {
+    let body = html! {
+        div style="max-width:360px;margin:80px auto;text-align:center" {
+            h1 style="font-size:20px;color:#58a6ff;margin:0 0 24px" { "claude-bridge" }
+            div class="card" style="text-align:left" {
+                form method="post" action="/dashboard/login" {
+                    @if let Some(e) = error {
+                        p style="color:#b22222;margin:0 0 12px" { (e) }
+                    }
+                    label style="display:block;margin-bottom:4px;font-size:12px;color:#8b949e" { "user" }
+                    input type="text" name="username" required style="width:100%;margin-bottom:12px"
+                    label style="display:block;margin-bottom:4px;font-size:12px;color:#8b949e" { "password" }
+                    input type="password" name="password" required style="width:100%;margin-bottom:16px"
+                    button type="submit" class="primary" style="width:100%" { "sign in" }
+                }
+            }
+            p class="muted" style="font-size:11px;margin-top:16px" {
+                "operator: set " code { "BRIDGE_DASHBOARD_USERS=user:pass" }
+                " to enable"
+            }
+        }
+    };
+    shell("", "login", body)
+}
+
 pub fn shell(active: &str, title: &str, body: Markup) -> Markup {
     html! {
         (DOCTYPE)

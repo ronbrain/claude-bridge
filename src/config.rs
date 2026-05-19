@@ -69,12 +69,15 @@ pub struct Config {
     /// (default 300, range 60..=3600 per F17.4 / 0f4543 ask
     /// 1779053200; out-of-range refuses to start).
     pub routing_peer_idle_secs: u64,
+    /// Dashboard login credentials: CSV of `user:pass` pairs.
+    /// When non-empty, the dashboard exposes a login page.
+    /// From `BRIDGE_DASHBOARD_USERS` (default empty = disabled).
+    pub dashboard_users: std::collections::HashMap<String, String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            routing_peer_idle_secs: 300,
             // Default to loopback per pentest finding `dc633d7c`
             // (msg 1779042729). Operators wanting network exposure
             // must set `BRIDGE_BIND=0.0.0.0:<port>` explicitly,
@@ -90,6 +93,8 @@ impl Default for Config {
             peer_ttl: Duration::from_secs(120),
             peer_history_ttl: Duration::from_secs(30 * 24 * 60 * 60),
             memory_history_keep: 5,
+            routing_peer_idle_secs: 300,
+            dashboard_users: std::collections::HashMap::new(),
         }
     }
 }
@@ -212,6 +217,21 @@ impl Config {
                         n
                     }
                 }
+            },
+            dashboard_users: {
+                // CSV of user:pass pairs for dashboard login.
+                // Format: `BRIDGE_DASHBOARD_USERS=user1:pass1,user2:pass2`
+                let raw = std::env::var("BRIDGE_DASHBOARD_USERS").unwrap_or_default();
+                let mut users = std::collections::HashMap::new();
+                for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    if let Some((u, p)) = part.split_once(':') {
+                        users.insert(u.trim().to_string(), p.trim().to_string());
+                    }
+                }
+                if !users.is_empty() {
+                    tracing::info!(users = users.len(), "dashboard login enabled");
+                }
+                users
             },
         })
     }
