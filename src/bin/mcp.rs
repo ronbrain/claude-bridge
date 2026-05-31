@@ -757,6 +757,16 @@ fn encode_path_segment(s: &str) -> String {
     out
 }
 
+/// Normalize a channel name coming from tool args. The display form is
+/// "#name" (list_channels prints a leading '#'), but the server and URL path
+/// segments expect the bare "name". A leading '#' is parsed as a URL fragment
+/// by the client, silently dropping the channel from the path — which
+/// surfaced as a bogus "bridge server unreachable". Strip it so "#name" and
+/// "name" route identically.
+fn norm_channel(c: &str) -> String {
+    c.trim().trim_start_matches('#').trim().to_string()
+}
+
 /// Resolve the name to use right now. Explicit `--name foo` wins;
 /// otherwise derive `<host>/<short-sid>` (or hostname fallback).
 /// Called per-heartbeat and per-send so a delayed SessionStart
@@ -1117,8 +1127,16 @@ async fn main() {
                 }
                 ok(id, json!({
                     "protocolVersion": "2024-11-05",
-                    "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "claude-bridge", "version": "0.2.0" }
+                    "capabilities": {
+                        "tools": {}
+                    },
+                    "serverInfo": { "name": "claude-bridge", "version": "0.2.1" },
+                    "instructions": "You are connected to the Claude Bridge. This server allows multiple AI instances to coordinate on a shared project state.
+- Use `mcp_bridge_memory_list` to see project context, decisions, and patterns.
+- Use `mcp_bridge_send_message` to communicate with other instances or the operator.
+- The channel `pale-pentest` is reserved for security findings and integration work for the 'pale' project.
+- Always check `mcp_bridge_list_channels` before sending if you are unsure where a message belongs.
+- Findings are structured security reports; use `mcp_bridge_report_finding` instead of just chat for bugs."
                 }))
             }
 
@@ -1136,10 +1154,7 @@ async fn main() {
                 match name {
                     "send_message" => {
                         let content = args_val["content"].as_str().unwrap_or("").to_string();
-                        let channel = args_val["channel"]
-                            .as_str()
-                            .unwrap_or(&args.channel)
-                            .to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(&args.channel));
                         let to_raw: Vec<String> = args_val["to"]
                             .as_array()
                             .map(|a| {
@@ -1237,7 +1252,7 @@ async fn main() {
                     }
 
                     "set_channel_topic" => {
-                        let channel = args_val["channel"].as_str().unwrap_or("").to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(""));
                         let topic = args_val["topic"].as_str().unwrap_or("").to_string();
                         if channel.is_empty() {
                             text(id, "[bridge] ERROR: channel required")
@@ -1261,10 +1276,7 @@ async fn main() {
                     }
 
                     "read_messages" => {
-                        let channel = args_val["channel"]
-                            .as_str()
-                            .unwrap_or(&args.channel)
-                            .to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(&args.channel));
                         let mut qs: Vec<(&str, String)> = Vec::new();
                         if let Some(s) = args_val["since"].as_u64() {
                             qs.push(("since", s.to_string()));
@@ -1369,10 +1381,7 @@ async fn main() {
                         let url = args_val["url"].as_str().unwrap_or("").to_string();
                         let method = args_val["method"].as_str().unwrap_or("GET").to_string();
                         let notes = args_val["notes"].as_str().unwrap_or("").to_string();
-                        let channel = args_val["channel"]
-                            .as_str()
-                            .unwrap_or(&args.channel)
-                            .to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(&args.channel));
 
                         let content = format!(
                             "🎯 ENDPOINT\nURL: {}\nMethod: {}\nHeaders: {}\nBody: {}\nNotes: {}",
@@ -1397,10 +1406,7 @@ async fn main() {
                         let severity = args_val["severity"].as_str().unwrap_or("info").to_string();
                         let endpoint = args_val["endpoint"].as_str().unwrap_or("").to_string();
                         let detail = args_val["detail"].as_str().unwrap_or("").to_string();
-                        let channel = args_val["channel"]
-                            .as_str()
-                            .unwrap_or(&args.channel)
-                            .to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(&args.channel));
 
                         let res = client
                             .post(format!("{}/findings/{}", args.server, channel))
@@ -1442,10 +1448,7 @@ async fn main() {
                     }
 
                     "list_findings" => {
-                        let channel = args_val["channel"]
-                            .as_str()
-                            .unwrap_or(&args.channel)
-                            .to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(&args.channel));
                         let mut qs: Vec<(&str, String)> = Vec::new();
                         for k in ["severity", "status", "from"] {
                             if let Some(v) = args_val[k].as_str() {
@@ -1487,10 +1490,7 @@ async fn main() {
 
                     "delete_finding" => {
                         let id_param = args_val["id"].as_str().unwrap_or("").to_string();
-                        let channel = args_val["channel"]
-                            .as_str()
-                            .unwrap_or(&args.channel)
-                            .to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(&args.channel));
                         let res = client
                             .delete(format!("{}/findings/{}/{}", args.server, channel, id_param))
                             .send()
@@ -1511,10 +1511,7 @@ async fn main() {
                         let id_param = args_val["id"].as_str().unwrap_or("").to_string();
                         let status = args_val["status"].as_str().unwrap_or("").to_string();
                         let note = args_val["note"].as_str().unwrap_or("").to_string();
-                        let channel = args_val["channel"]
-                            .as_str()
-                            .unwrap_or(&args.channel)
-                            .to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(&args.channel));
                         let res = client
                             .patch(format!("{}/findings/{}/{}", args.server, channel, id_param))
                             .json(&json!({ "status": status, "note": note }))
@@ -1541,10 +1538,7 @@ async fn main() {
                             .unwrap_or(if is_b64 { "application/octet-stream" } else { "text/plain" })
                             .to_string();
                         let notes = args_val["notes"].as_str().unwrap_or("").to_string();
-                        let channel = args_val["channel"]
-                            .as_str()
-                            .unwrap_or(&args.channel)
-                            .to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(&args.channel));
 
                         // Decode if claimed base64; otherwise treat as raw text bytes.
                         let bytes: Vec<u8> = if is_b64 {
@@ -1663,7 +1657,7 @@ async fn main() {
 
                     "pin_message" | "unpin_message" => {
                         let msg_id = args_val["id"].as_str().unwrap_or("").to_string();
-                        let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(&args.channel));
                         if msg_id.is_empty() {
                             text(id, "[bridge] ERROR: id required")
                         } else {
@@ -1684,7 +1678,7 @@ async fn main() {
                     }
 
                     "create_task" => {
-                        let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(&args.channel));
                         let body = json!({
                             "from": current_name(&args.name),
                             "title": args_val["title"].as_str().unwrap_or(""),
@@ -1710,7 +1704,7 @@ async fn main() {
                     }
 
                     "list_tasks" => {
-                        let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(&args.channel));
                         let mut qs: Vec<(&str, String)> = Vec::new();
                         if let Some(s) = args_val["status"].as_str() { qs.push(("status", s.into())); }
                         if let Some(o) = args_val["owner"].as_str() { qs.push(("owner", o.into())); }
@@ -1737,7 +1731,7 @@ async fn main() {
                     }
 
                     "update_task" => {
-                        let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(&args.channel));
                         let task_id = args_val["id"].as_str().unwrap_or("").to_string();
                         let mut body = serde_json::Map::new();
                         if let Some(s) = args_val["status"].as_str() { body.insert("status".into(), json!(s)); }
@@ -1760,7 +1754,7 @@ async fn main() {
                     }
 
                     "delete_task" => {
-                        let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(&args.channel));
                         let task_id = args_val["id"].as_str().unwrap_or("").to_string();
                         let res = client.delete(format!("{}/tasks/{}/{}", args.server, channel, task_id))
                             .send().await;
@@ -1774,7 +1768,7 @@ async fn main() {
                     }
 
                     "memory_get" => {
-                        let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(&args.channel));
                         let key = args_val["key"].as_str().unwrap_or("").to_string();
                         let res = client.get(format!("{}/memory/{}/{}", args.server, channel, key))
                             .send().await;
@@ -1792,7 +1786,7 @@ async fn main() {
                     }
 
                     "memory_set" => {
-                        let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(&args.channel));
                         let key = args_val["key"].as_str().unwrap_or("").to_string();
                         let value = args_val["value"].as_str().unwrap_or("").to_string();
                         let ttl = args_val["ttl_secs"].as_u64().unwrap_or(0);
@@ -1811,7 +1805,7 @@ async fn main() {
                     }
 
                     "memory_delete" => {
-                        let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(&args.channel));
                         let key = args_val["key"].as_str().unwrap_or("").to_string();
                         let _ = client.delete(format!("{}/memory/{}/{}", args.server, channel, key))
                             .send().await;
@@ -1819,7 +1813,7 @@ async fn main() {
                     }
 
                     "memory_list" => {
-                        let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(&args.channel));
                         let res = client.get(format!("{}/memory/{}", args.server, channel))
                             .send().await;
                         match res {
@@ -1846,10 +1840,7 @@ async fn main() {
                     "memory_search_semantic" => {
                         let query = args_val["query"].as_str().unwrap_or("").to_string();
                         let k = args_val["k"].as_u64().unwrap_or(10);
-                        let channel = args_val["channel"]
-                            .as_str()
-                            .unwrap_or(&args.channel)
-                            .to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(&args.channel));
                         let body = serde_json::json!({
                             "query": query,
                             "k": k,
@@ -1894,10 +1885,7 @@ async fn main() {
                     }
 
                     "clear_channel" => {
-                        let channel = args_val["channel"]
-                            .as_str()
-                            .unwrap_or(&args.channel)
-                            .to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(&args.channel));
 
                         let _ = client
                             .delete(format!("{}/messages/{}", args.server, channel))
@@ -1908,10 +1896,7 @@ async fn main() {
                     }
 
                     "delete_channel" => {
-                        let channel = args_val["channel"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(""));
                         if channel.is_empty() {
                             text(id, "[bridge] ERROR: channel required")
                         } else {
@@ -2267,7 +2252,7 @@ async fn main() {
                     }
 
                     "claim_task" | "complete_task" | "submit_plan" | "approve_plan" | "reject_plan" => {
-                        let channel = args_val["channel"].as_str().unwrap_or(&args.channel).to_string();
+                        let channel = norm_channel(args_val["channel"].as_str().unwrap_or(&args.channel));
                         let task_id = args_val["id"].as_str().unwrap_or("").to_string();
                         if task_id.is_empty() {
                             text(id, "[bridge] ERROR: id required")
