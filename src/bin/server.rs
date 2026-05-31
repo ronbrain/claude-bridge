@@ -3528,7 +3528,7 @@ fn dashboard_admin_check(
     auth_ext: Option<&claude_bridge::auth::AuthState>,
     state: &AppState,
     cookies_header: &str,
-) -> Result<String, (StatusCode, String)> {
+) -> Result<String, Response> {
     // 1. Cookie-based dashboard session (set on successful login).
     for pair in cookies_header.split(';') {
         let pair = pair.trim();
@@ -3538,22 +3538,31 @@ fn dashboard_admin_check(
             }
         }
     }
-    // 2. Bearer token in BRIDGE_MEMORY_ADMINS (existing path).
+    // 2. Bearer token in BRIDGE_MEMORY_ADMINS (programmatic admin path). Only
+    //    populated when the request went through the bearer middleware. The
+    //    dashboard router is intentionally NOT behind that middleware (a browser
+    //    can't send `Authorization` on navigation), so for the browser flow
+    //    `ext` is None and we fall through to the cookie-login redirect below.
     let identity = ext.cloned().unwrap_or(claude_bridge::auth::AuthIdentity::Anonymous);
     let actor = identity.as_actor().to_string();
     let is_admin = auth_ext
         .map(|a| a.is_memory_admin(&actor))
         .unwrap_or(false);
-    if !is_admin {
-        return Err((
-            StatusCode::FORBIDDEN,
-            format!(
-                "dashboard requires BRIDGE_MEMORY_ADMINS membership; \
-                 '{actor}' is not on the allowlist."
-            ),
-        ));
+    if is_admin {
+        return Ok(actor);
     }
-    Ok(actor)
+    // 3. No valid session and not an admin bearer → send the browser to the
+    //    login form. If no dashboard users are configured there's nothing to
+    //    log in against, so surface a clear operator hint instead of looping
+    //    on the redirect.
+    if state.dashboard_users.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "dashboard login not configured — set BRIDGE_DASHBOARD_USERS=user:pass and restart claude-bridge",
+        )
+            .into_response());
+    }
+    Err(axum::response::Redirect::to("/dashboard/login").into_response())
 }
 
 fn get_session_user(state: &AppState, cookies_header: &str) -> Option<String> {
@@ -3653,7 +3662,7 @@ async fn dashboard_landing(
     auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
     State(state): State<AppState>,
     cookies: HeaderMap,
-) -> Result<Response, (StatusCode, String)> {
+) -> Result<Response, Response> {
     let _ = headers; // bearer already validated upstream
     let cookies_str = cookies.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("");
     dashboard_admin_check(ext.as_deref(), auth_ext.as_deref(), &state, cookies_str)?;
@@ -3708,7 +3717,7 @@ async fn dashboard_peers(
     auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
     State(state): State<AppState>,
     cookies: HeaderMap,
-) -> Result<Response, (StatusCode, String)> {
+) -> Result<Response, Response> {
     let cookies_str = cookies.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("");
     dashboard_admin_check(ext.as_deref(), auth_ext.as_deref(), &state, cookies_str)?;
     let now = now_secs();
@@ -3750,7 +3759,7 @@ async fn dashboard_findings(
     auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
     State(state): State<AppState>,
     cookies: HeaderMap,
-) -> Result<Response, (StatusCode, String)> {
+) -> Result<Response, Response> {
     let cookies_str = cookies.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("");
     dashboard_admin_check(ext.as_deref(), auth_ext.as_deref(), &state, cookies_str)?;
     let mut rows: Vec<claude_bridge::dashboard::FindingRow> = Vec::new();
@@ -3790,7 +3799,7 @@ async fn dashboard_tasks(
     auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
     State(state): State<AppState>,
     cookies: HeaderMap,
-) -> Result<Response, (StatusCode, String)> {
+) -> Result<Response, Response> {
     let cookies_str = cookies.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("");
     dashboard_admin_check(ext.as_deref(), auth_ext.as_deref(), &state, cookies_str)?;
     let mut rows: Vec<claude_bridge::dashboard::TaskRow> = Vec::new();
@@ -3813,7 +3822,7 @@ async fn dashboard_dispatches(
     auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
     State(state): State<AppState>,
     cookies: HeaderMap,
-) -> Result<Response, (StatusCode, String)> {
+) -> Result<Response, Response> {
     let cookies_str = cookies.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("");
     dashboard_admin_check(ext.as_deref(), auth_ext.as_deref(), &state, cookies_str)?;
     let now = now_secs();
@@ -3843,7 +3852,7 @@ async fn dashboard_routing(
     auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
     State(state): State<AppState>,
     cookies: HeaderMap,
-) -> Result<Response, (StatusCode, String)> {
+) -> Result<Response, Response> {
     let cookies_str = cookies.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("");
     dashboard_admin_check(ext.as_deref(), auth_ext.as_deref(), &state, cookies_str)?;
     let rows: Vec<claude_bridge::dashboard::RoutingRow> = state
@@ -3868,7 +3877,7 @@ async fn dashboard_watchers(
     auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
     State(state): State<AppState>,
     cookies: HeaderMap,
-) -> Result<Response, (StatusCode, String)> {
+) -> Result<Response, Response> {
     let cookies_str = cookies.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("");
     dashboard_admin_check(ext.as_deref(), auth_ext.as_deref(), &state, cookies_str)?;
     let now = now_secs();
@@ -3896,7 +3905,7 @@ async fn dashboard_sse(
     auth_ext: Option<axum::extract::Extension<claude_bridge::auth::AuthState>>,
     State(state): State<AppState>,
     cookies: HeaderMap,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, Response> {
     let cookies_str = cookies.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("");
     dashboard_admin_check(ext.as_deref(), auth_ext.as_deref(), &state, cookies_str)?;
     let rx = state.dashboard_events.subscribe();
@@ -5094,21 +5103,6 @@ async fn main() {
         .route("/watchers", post(watcher_spawn).get(watcher_list))
         .route("/watchers/{peer}", delete(watcher_stop))
         .route("/watchers/{peer}/heartbeat", post(watcher_heartbeat))
-        // F19 dashboard — operator-only surface. All routes go
-        // through dashboard_admin_check inside the handler (in
-        // addition to the bearer middleware), so a non-admin
-        // authed caller gets a 403 instead of a render.
-        .route("/dashboard", get(dashboard_landing))
-        .route("/dashboard/peers", get(dashboard_peers))
-        .route("/dashboard/findings", get(dashboard_findings))
-        .route("/dashboard/tasks", get(dashboard_tasks))
-        .route("/dashboard/dispatches", get(dashboard_dispatches))
-        .route("/dashboard/routing", get(dashboard_routing))
-        .route("/dashboard/watchers", get(dashboard_watchers))
-        .route("/dashboard/sse", get(dashboard_sse))
-        .route("/dashboard/login", get(dashboard_login))
-        .route("/dashboard/login", post(dashboard_login_submit))
-        .route("/dashboard/logout", post(dashboard_logout))
         // Observability — authed per finding `cc3c33d6` (was world-
         // readable; identity is now needed for per-(requester,
         // target) rate-limit bucket on /resume).
@@ -5150,9 +5144,31 @@ async fn main() {
     // /metrics/prometheus + everything else stays at 1 MB.
     use axum::extract::DefaultBodyLimit;
     const GLOBAL_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+    // F19 dashboard — browser-facing operator surface. Intentionally NOT behind
+    // the bearer `require_auth` middleware: a browser can't send `Authorization`
+    // on navigation, so each handler authenticates via `dashboard_admin_check`
+    // (a `bridge_session` cookie minted at /dashboard/login from
+    // BRIDGE_DASHBOARD_USERS). Unauthenticated requests get redirected to the
+    // login form. The `auth_state` Extension added on the merged app below keeps
+    // the optional bearer-admin path inside the check working for API callers.
+    let dashboard = Router::new()
+        .route("/dashboard", get(dashboard_landing))
+        .route("/dashboard/peers", get(dashboard_peers))
+        .route("/dashboard/findings", get(dashboard_findings))
+        .route("/dashboard/tasks", get(dashboard_tasks))
+        .route("/dashboard/dispatches", get(dashboard_dispatches))
+        .route("/dashboard/routing", get(dashboard_routing))
+        .route("/dashboard/watchers", get(dashboard_watchers))
+        .route("/dashboard/sse", get(dashboard_sse))
+        .route("/dashboard/login", get(dashboard_login))
+        .route("/dashboard/login", post(dashboard_login_submit))
+        .route("/dashboard/logout", post(dashboard_logout))
+        .with_state(state.clone());
+
     let app = Router::new()
         .merge(authed)
         .merge(public)
+        .merge(dashboard)
         .layer(axum::extract::Extension(auth_state))
         // Apply 1 MB default to everything…
         .layer(DefaultBodyLimit::max(GLOBAL_BODY_LIMIT_BYTES));
