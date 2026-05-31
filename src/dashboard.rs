@@ -145,9 +145,9 @@ pub fn login_page(error: Option<&str>) -> Markup {
                         p style="color:#b22222;margin:0 0 12px" { (e) }
                     }
                     label style="display:block;margin-bottom:4px;font-size:12px;color:#8b949e" { "user" }
-                    input type="text" name="username" required style="width:100%;margin-bottom:12px"
+                    input type="text" name="username" required style="width:100%;margin-bottom:12px";
                     label style="display:block;margin-bottom:4px;font-size:12px;color:#8b949e" { "password" }
-                    input type="password" name="password" required style="width:100%;margin-bottom:16px"
+                    input type="password" name="password" required style="width:100%;margin-bottom:16px";
                     button type="submit" class="primary" style="width:100%" { "sign in" }
                 }
             }
